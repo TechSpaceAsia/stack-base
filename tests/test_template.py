@@ -173,6 +173,49 @@ class TemplateUpScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), f"--infra-dir {infra_dir} up --plan")
 
+    def _fake_echo_source(self, tmp: str) -> Path:
+        source = Path(tmp) / "stack-base"
+        (source / "bin").mkdir(parents=True)
+        (source / "bin" / "up").write_text(
+            "import sys\nprint(' '.join(sys.argv[1:]))\n", encoding="utf-8"
+        )
+        return source
+
+    def test_the_documented_invocations_all_forward_to_the_up_subcommand(self) -> None:
+        """`./infra/up`, `./infra/up --plan`, `./infra/up --allow-purchase` are the
+
+        documented commands, but the CLI's subparsers are `required=True` --
+        without `up` inserted, every one of these exits 2 with an argparse
+        usage error and only `./infra/up ssh a` (which already names a real
+        subcommand) works.
+        """
+        with TemporaryDirectory() as tmp:
+            infra_dir = self._infra_dir(tmp)
+            source = self._fake_echo_source(tmp)
+
+            cases = [
+                ([], "up"),
+                (["--plan"], "up --plan"),
+                (["--allow-purchase"], "up --allow-purchase"),
+                (["ssh", "a"], "ssh a"),
+                (["up", "--plan"], "up --plan"),
+            ]
+            for args, expected_tail in cases:
+                with self.subTest(args=args):
+                    result = self._run_up(infra_dir, *args, env_extra={"STACKBASE_SRC": str(source)})
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), f"--infra-dir {infra_dir} {expected_tail}")
+
+    def test_help_is_passed_through_without_inserting_up(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = self._infra_dir(tmp)
+            source = self._fake_echo_source(tmp)
+
+            result = self._run_up(infra_dir, "--help", env_extra={"STACKBASE_SRC": str(source)})
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), f"--infra-dir {infra_dir} --help")
+
     def test_a_bad_stackbase_src_says_so_in_one_line(self) -> None:
         with TemporaryDirectory() as tmp:
             infra_dir = self._infra_dir(tmp)
@@ -373,6 +416,29 @@ class TemplateFilesTests(unittest.TestCase):
         for key in ("project", "domain", "owner", "datacenter", "plan", "price_item", "auto_patch", "admins"):
             self.assertIn(key, data)
         self.assertEqual(data["nodes"]["a"]["role"], "primary")
+
+    def test_the_example_stack_toml_has_no_real_vps_id_and_still_loads(self) -> None:
+        """The example must never carry a real Hostinger VPS id (Finding 7)."""
+        from stackbase.config import load_config
+
+        text = (_TEMPLATE_DIR / "stack.toml.example").read_text(encoding="utf-8")
+        self.assertNotIn("vps_id = 1984476", text, "a real VPS id must not ship in the example")
+
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp)
+            shutil.copy(_TEMPLATE_DIR / "stack.toml.example", infra_dir / "stack.toml")
+            (infra_dir / "keys").mkdir()
+            (infra_dir / "keys" / "your-name.pub").write_text(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForTemplateEval you@laptop\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(infra_dir)
+
+            # The example ships with `vps_id` commented out (buy-a-server branch)
+            # and `price_item` left blank -- both must round-trip cleanly.
+            self.assertIsNone(config.nodes["a"].vps_id)
+            self.assertIsNone(config.price_item)
 
     def test_the_upstream_flake_url_appears_only_in_the_template_and_the_readme(self) -> None:
         """The (unconfirmed) upstream URL is one constant, not a string scattered about."""

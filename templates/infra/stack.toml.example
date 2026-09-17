@@ -43,9 +43,10 @@ admins = ["your-name"]
 role = "primary"
 
 # The Hostinger id of a server you already own. You can read it off the URL
-# in hPanel. Leave this line out entirely if you want stack-base to buy the
-# server for you -- it will then ask you to confirm, in writing, first.
-vps_id = 1984476
+# in hPanel. Leave this line (and this comment) out entirely if you want
+# stack-base to buy the server for you -- it will then ask you to confirm,
+# in writing, first.
+# vps_id = 1234567
 
 # A second server would look like this:
 #

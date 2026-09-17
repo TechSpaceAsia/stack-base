@@ -195,11 +195,37 @@ def entry_point() -> Path:
     return fetch(url, rev) / "bin" / "up"
 
 
+def _with_implicit_up(args: list[str]) -> list[str]:
+    """Insert the `up` subcommand when the caller left it out.
+
+    stack-base's subparsers are `required=True`, so the documented shortcuts
+    -- `./infra/up`, `./infra/up --plan`, `./infra/up --allow-purchase` --
+    would otherwise exit 2 with an argparse usage error; only a command that
+    already names a real subcommand (`./infra/up ssh a`, `./infra/up up
+    --plan`) or asks for top-level help (`-h`/`--help`) works. Anything else
+    with no args, or whose first token looks like an option, gets `up`
+    inserted ahead of it.
+    """
+    if not args:
+        return ["up"]
+    if args[0] in ("-h", "--help"):
+        return args
+    if args[0].startswith("-"):
+        return ["up", *args]
+    return args
+
+
 def main() -> None:
     entry = entry_point()
     # --infra-dir goes first: it is a global option, and argparse wants
     # globals before the subcommand.
-    argv = [sys.executable, str(entry), "--infra-dir", str(INFRA_DIR), *sys.argv[1:]]
+    argv = [
+        sys.executable,
+        str(entry),
+        "--infra-dir",
+        str(INFRA_DIR),
+        *_with_implicit_up(sys.argv[1:]),
+    ]
     os.execv(sys.executable, argv)
 
 
