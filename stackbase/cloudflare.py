@@ -23,6 +23,7 @@ from typing import Any
 
 from stackbase.errors import StackError
 from stackbase.http import ApiError, request
+from stackbase.secrets import redact
 
 _DEFAULT_BASE_URL = "https://api.cloudflare.com/client/v4"
 
@@ -73,13 +74,13 @@ class CloudflareClient:
                 f"{method} {path} returned an unexpected response shape",
                 "the Cloudflare API response was not a JSON object -- check the API status",
                 status=200,
-                body=str(parsed)[:500],
+                body=redact(str(parsed)[:500], [self._token]),
             )
         if not parsed.get("success", False):
             errors = parsed.get("errors")
-            message = _format_cf_errors(errors if isinstance(errors, list) else [])
+            message = redact(_format_cf_errors(errors if isinstance(errors, list) else []), [self._token])
             raise ApiError(
-                f"Cloudflare API request failed: {message}",
+                redact(f"Cloudflare API request failed: {message}", [self._token]),
                 "check the Cloudflare API token's permissions and the request payload",
                 status=200,
                 body=message,
@@ -96,7 +97,7 @@ class CloudflareClient:
         the first zone found. Never queries a bare TLD -- the shortest
         candidate tried always has at least two labels.
         """
-        labels = domain.split(".")
+        labels = domain.rstrip(".").split(".")
         for start in range(len(labels) - 1):
             candidate = ".".join(labels[start:])
             zone = self._find_zone(candidate)

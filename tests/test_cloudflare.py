@@ -30,6 +30,25 @@ def _record(record_id: str, *, name: str, content: str, proxied: bool = True) ->
 
 
 class ZoneForTests(unittest.TestCase):
+    def test_strips_trailing_dot_before_building_candidates(self) -> None:
+        with FakeServer() as server:
+            server.script("GET", "/zones?name=a.example.com&page=1", 200, _envelope([], result_info=_page_info()))
+            server.script(
+                "GET",
+                "/zones?name=example.com&page=1",
+                200,
+                _envelope([_zone("zone1", "example.com")], result_info=_page_info()),
+            )
+            client = CloudflareClient("tok", base_url=server.url)
+
+            zone_id, zone_name = client.zone_for("a.example.com.")
+
+            self.assertEqual(zone_id, "zone1")
+            self.assertEqual(zone_name, "example.com")
+            queried_paths = [r["path"] for r in server.requests]
+            self.assertNotIn("/zones?name=com.&page=1", queried_paths)
+            self.assertNotIn("/zones?name=com&page=1", queried_paths)
+
     def test_picks_longest_suffix_match(self) -> None:
         with FakeServer() as server:
             server.script("GET", "/zones?name=a.b.example.com&page=1", 200, _envelope([], result_info=_page_info()))
@@ -313,7 +332,10 @@ class ApiSuccessFalseTests(unittest.TestCase):
                 200,
                 _envelope(None, success=False, errors=[{"code": 1000, "message": "Invalid API token"}]),
             )
-            client = CloudflareClient("tok", base_url=server.url)
+            # A short fake token like "tok" would itself be a substring of the word
+            # "token" in the message above and get partially redacted by the fix for
+            # the token-leak finding -- use a realistic, non-colliding fake token.
+            client = CloudflareClient("cf-fake-bearer-9f8e7d6c5b", base_url=server.url)
 
             with self.assertRaises(ApiError) as ctx:
                 client.ip_ranges()
@@ -327,6 +349,30 @@ class ApiSuccessFalseTests(unittest.TestCase):
 
             with self.assertRaises(ApiError):
                 client.ip_ranges()
+
+    def test_success_false_error_message_redacts_the_token(self) -> None:
+        token = "abc123secrettoken"
+        with FakeServer() as server:
+            server.script(
+                "GET",
+                "/ips",
+                200,
+                _envelope(
+                    None,
+                    success=False,
+                    errors=[{"code": 1000, "message": f"token {token} is invalid or expired"}],
+                ),
+            )
+            client = CloudflareClient(token, base_url=server.url)
+
+            with self.assertRaises(ApiError) as ctx:
+                client.ip_ranges()
+
+            exc = ctx.exception
+            self.assertNotIn(token, str(exc))
+            self.assertNotIn(token, exc.message)
+            self.assertNotIn(token, exc.hint)
+            self.assertNotIn(token, exc.body)
 
 
 if __name__ == "__main__":

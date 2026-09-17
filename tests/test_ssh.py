@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -37,6 +38,39 @@ def _cp_text(argv, *, returncode=0, stdout="", stderr="") -> subprocess.Complete
 
 def _cp_bytes(argv, *, returncode=0, stdout=b"", stderr=b"") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+class ConstructorValidationTests(unittest.TestCase):
+    def test_rejects_dash_leading_host(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(StackError):
+                Ssh(Path(tmp), "-oProxyCommand=evil")
+
+    def test_rejects_host_with_whitespace(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(StackError):
+                Ssh(Path(tmp), "1.2.3.4 extra")
+
+    def test_rejects_empty_host(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(StackError):
+                Ssh(Path(tmp), "")
+
+    def test_rejects_dash_leading_user(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(StackError):
+                Ssh(Path(tmp), _HOST, user="-oProxyCommand=evil")
+
+    def test_rejects_uppercase_user(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(StackError):
+                Ssh(Path(tmp), _HOST, user="Root")
+
+    def test_accepts_ipv4_ipv6_and_hostname(self) -> None:
+        with TemporaryDirectory() as tmp:
+            Ssh(Path(tmp), "1.2.3.4")
+            Ssh(Path(tmp), "2001:db8::1")
+            Ssh(Path(tmp), "a.example.com")
 
 
 class ArgvTests(unittest.TestCase):
@@ -216,6 +250,40 @@ class RsyncToTests(unittest.TestCase):
 
             self.assertIn("vanished", ctx.exception.hint)
 
+    def test_local_dir_is_resolved_to_an_absolute_path(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runner = FakeRunner()
+            runner.script(_cp_text(["rsync"], returncode=0))
+            ssh = Ssh(Path(tmp), _HOST, runner=runner)
+
+            ssh.rsync_to("relative/infra", "/etc/nixos/stack")
+
+            source = runner.calls[0]["argv"][-2]
+            self.assertTrue(os.path.isabs(source))
+            self.assertTrue(source.endswith("/"))
+
+    def test_dash_leading_local_dir_cannot_be_parsed_as_an_option(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runner = FakeRunner()
+            runner.script(_cp_text(["rsync"], returncode=0))
+            ssh = Ssh(Path(tmp), _HOST, runner=runner)
+
+            ssh.rsync_to("-rf", "/etc/nixos/stack")
+
+            source = runner.calls[0]["argv"][-2]
+            self.assertFalse(source.startswith("-"))
+            self.assertTrue(os.path.isabs(source))
+
+    def test_rejects_non_absolute_remote_dir(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runner = FakeRunner()
+            ssh = Ssh(Path(tmp), _HOST, runner=runner)
+
+            with self.assertRaises(StackError):
+                ssh.rsync_to("/local/infra", "etc/nixos/stack")
+
+            self.assertEqual(runner.calls, [], "must validate before ever invoking rsync")
+
     def test_missing_rsync_binary_raises_stack_error_naming_package(self) -> None:
         with TemporaryDirectory() as tmp:
             def missing_runner(argv, **kwargs):
@@ -245,7 +313,19 @@ class PinHostKeyTests(unittest.TestCase):
             self.assertEqual(content, f"{_HOST} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAImatchbody\n")
             self.assertEqual(known_hosts.stat().st_mode & 0o777, 0o644)
             call = runner.calls[0]
-            self.assertEqual(call["argv"], ["ssh-keyscan", "-t", "ed25519", "-T", "10", _HOST])
+            self.assertEqual(call["argv"], ["ssh-keyscan", "-t", "ed25519", "-T", "10", "--", _HOST])
+
+    def test_keyscan_argv_has_double_dash_immediately_before_the_host(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp)
+            runner = FakeRunner()
+            runner.script(_cp_text(["ssh-keyscan"], returncode=0, stdout=_KEYSCAN_LINE))
+            ssh = Ssh(infra_dir, _HOST, runner=runner)
+
+            ssh.pin_host_key()
+
+            argv = runner.calls[0]["argv"]
+            self.assertEqual(argv[-2:], ["--", _HOST])
 
     def test_ignores_comment_lines_from_keyscan_output(self) -> None:
         with TemporaryDirectory() as tmp:

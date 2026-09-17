@@ -16,6 +16,7 @@ All subprocess invocation goes through the injected `runner` (defaulting to
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -29,6 +30,13 @@ _KEY_TYPE = "ssh-ed25519"
 _WAIT_POLL_SECONDS = 5
 _STDERR_TAIL_LINES = 5
 _HPANEL_STATUS_HINT = "check the VPS's status in hPanel (https://hpanel.hostinger.com/)"
+
+# Conservative allowlist: IPv4, IPv6, or a DNS hostname -- letters, digits,
+# '.', '-', ':'. Must not start with '-' (a leading dash would let a
+# malicious/mistyped host string be parsed by ssh/ssh-keyscan/rsync as an
+# option rather than a hostname -- "option smuggling").
+_HOST_RE = re.compile(r"^(?!-)[A-Za-z0-9.:-]+$")
+_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]*$")
 
 _MISSING_BINARY_HINTS: dict[str, str] = {
     "ssh": "install openssh-client (e.g. `apt install openssh-client`, `brew install openssh`)",
@@ -46,6 +54,18 @@ class Ssh:
     """
 
     def __init__(self, infra_dir: str | Path, host: str, user: str = "root", runner: Any = subprocess.run) -> None:
+        if not host or not _HOST_RE.match(host):
+            raise StackError(
+                f"invalid SSH host '{host}'",
+                "host must be a non-empty IPv4/IPv6 address or DNS hostname (letters, digits, "
+                "'.', '-', ':') and must not start with '-'",
+            )
+        if not user or not _USER_RE.match(user):
+            raise StackError(
+                f"invalid SSH user '{user}'",
+                "user must match [a-z_][a-z0-9_-]* -- lowercase letters, digits, '_' or '-', "
+                "starting with a letter or underscore",
+            )
         self._infra_dir = Path(infra_dir)
         self._known_hosts = self._infra_dir / "known_hosts"
         self.host = host
@@ -96,7 +116,10 @@ class Ssh:
         and investigate) -- the hint spells out both so the operator isn't
         left guessing which one applies.
         """
-        argv = ["ssh-keyscan", "-t", "ed25519", "-T", "10", self.host]
+        # "--" tells ssh-keyscan's getopt-based parser that everything after
+        # it is a positional hostname, never an option -- defense in depth
+        # alongside the host-format validation in __init__.
+        argv = ["ssh-keyscan", "-t", "ed25519", "-T", "10", "--", self.host]
         result = self._exec(argv, text=True)
         if result.returncode != 0:
             stderr = result.stderr if isinstance(result.stderr, str) else ""
@@ -183,9 +206,23 @@ class Ssh:
         converges to exactly `local_dir`'s contents. `exclude` patterns are
         passed through as `--exclude=<pattern>` (the reconciler uses this to
         keep `secrets.age`/`keys/` off the wire).
+
+        `local_dir` is resolved to an absolute path before being handed to
+        rsync -- a relative, dash-leading path (e.g. "-rf") would otherwise
+        be parsed as an option rather than a source directory. `remote_dir`
+        must already be absolute; rsync's destination arg is always
+        "user@host:<remote_dir>" so it can't itself be parsed as an option,
+        but a relative remote path is ambiguous (relative to whatever the
+        remote shell's cwd happens to be) and stack-base never wants that.
         """
+        if not str(remote_dir).startswith("/"):
+            raise StackError(
+                f"remote_dir '{remote_dir}' must be an absolute path",
+                "pass an absolute path (e.g. '/etc/nixos/stack') -- a relative remote path "
+                "depends on the remote shell's working directory",
+            )
         ssh_cmd = shlex.join(["ssh", *self._ssh_options()])
-        local = str(local_dir)
+        local = os.path.abspath(local_dir)
         if not local.endswith("/"):
             local += "/"
 
