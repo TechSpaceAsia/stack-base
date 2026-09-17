@@ -244,6 +244,31 @@ class Ssh:
             )
         return result
 
+    def run_stream(self, cmd: str, stdin: Any, *, check: bool = True) -> subprocess.CompletedProcess:
+        """Like `run`, but streams `stdin` -- an already-open binary file object --
+        straight into the remote command instead of buffering the whole payload
+        through `input=`.
+
+        Used to upload a release tarball without ever holding the full archive
+        in memory: the caller opens the file and hands the file object here, and
+        the OS pipes its bytes directly into ssh's stdin. Builds the argv via the
+        same `_ssh_argv`/`_ssh_options` every other method uses, so this carries
+        the identical BatchMode/known_hosts/StrictHostKeyChecking options --
+        nothing about the connection's security posture is weakened to support
+        streaming.
+        """
+        argv = self._ssh_argv(cmd)
+        result = self._exec(argv, text=True, stdin=stdin)
+        if check and result.returncode != 0:
+            stderr = result.stderr if isinstance(result.stderr, str) else ""
+            if HOST_KEY_CHANGED_MARKER in stderr:
+                raise self._host_key_mismatch_error()
+            raise StackError(
+                f"command failed on {self.host} (exit {result.returncode}): {cmd}",
+                _tail(stderr) or "no stderr output was captured -- re-run with --debug for the full command",
+            )
+        return result
+
     def fetch(self, remote_path: str) -> bytes:
         """Read `remote_path` on the node and return its raw bytes."""
         cmd = f"cat -- {shlex.quote(remote_path)}"
@@ -326,11 +351,23 @@ class Ssh:
     def _ssh_argv(self, *extra: str) -> list[str]:
         return ["ssh", *self._ssh_options(), f"{self.user}@{self.host}", *extra]
 
-    def _exec(self, argv: list[str], *, text: bool, input_data: Any = None) -> subprocess.CompletedProcess:
+    def _exec(
+        self, argv: list[str], *, text: bool, input_data: Any = None, stdin: Any = None
+    ) -> subprocess.CompletedProcess:
+        # `stdin` (an open file object) and `input_data` (a str/bytes payload,
+        # or None) are mutually exclusive to subprocess.run -- callers only
+        # ever supply one. When `stdin` is given, the file's bytes stream
+        # straight through the OS pipe rather than being buffered in memory
+        # via `input=` (see run_stream).
+        kwargs: dict[str, Any] = {"capture_output": True, "check": False}
+        if text:
+            kwargs["text"] = True
+        if stdin is not None:
+            kwargs["stdin"] = stdin
+        else:
+            kwargs["input"] = input_data
         try:
-            if text:
-                return self._runner(argv, capture_output=True, text=True, input=input_data, check=False)
-            return self._runner(argv, capture_output=True, input=input_data, check=False)
+            return self._runner(argv, **kwargs)
         except FileNotFoundError as exc:
             binary = argv[0]
             raise StackError(

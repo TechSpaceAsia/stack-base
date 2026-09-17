@@ -27,6 +27,7 @@ from stackbase.config import load_config, load_state
 from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
 from stackbase.reconcile import SSH_USER, Context, Step, apply, local_facts, observe, plan, render_description
+from stackbase.release import run_deploy, run_rollback, run_status
 from stackbase.secrets import load_secrets, redact
 from stackbase.ssh import Ssh
 
@@ -55,6 +56,21 @@ def build_parser() -> argparse.ArgumentParser:
     shell.add_argument("rest", nargs=argparse.REMAINDER, help="optional command to run, after --")
     shell.add_argument("--debug", action="store_true", help="print the full traceback on failure")
 
+    deploy = commands.add_parser("deploy", help="build, package and ship a release to every node")
+    deploy.add_argument("version", help="release version, e.g. v1.4.2")
+    deploy.add_argument("--node", help="restrict to one node")
+    deploy.add_argument("--skip-build", action="store_true", help="skip the build -- use --tarball instead")
+    deploy.add_argument("--tarball", help="a pre-built release tarball (requires --skip-build)")
+    deploy.add_argument("--debug", action="store_true", help="print the full traceback on failure")
+
+    rollback = commands.add_parser("rollback", help="swap traffic back to each node's previous release")
+    rollback.add_argument("--node", help="restrict to one node")
+    rollback.add_argument("--debug", action="store_true", help="print the full traceback on failure")
+
+    status = commands.add_parser("status", help="show each node's active/idle release")
+    status.add_argument("--node", help="restrict to one node")
+    status.add_argument("--debug", action="store_true", help="print the full traceback on failure")
+
     return parser
 
 
@@ -70,8 +86,14 @@ def main(argv: list[str] | None = None) -> None:
     try:
         if args.command == "up":
             _up(args, infra_dir, secrets)
-        else:
+        elif args.command == "ssh":
             _ssh(args, infra_dir)
+        elif args.command == "deploy":
+            _deploy(args, infra_dir)
+        elif args.command == "rollback":
+            _rollback(args, infra_dir)
+        else:
+            _status(args, infra_dir)
     except StackError as error:
         _print_traceback(debug, secrets)
         print(error_line(error, list(secrets.values())), file=sys.stderr)
@@ -207,6 +229,38 @@ def _ssh(args: argparse.Namespace, infra_dir: Path) -> None:
 
     argv = [*ssh.argv(), *command]
     os.execvp(argv[0], argv)
+
+
+def _emit_plain(line: str) -> None:
+    """The print path `deploy`/`rollback`/`status` share.
+
+    These commands never load a secret (no `load_secrets` call anywhere in
+    their path -- see the global constraint that a teammate with only an SSH
+    key listed in `stackbase.deploy.keys` can run them), so there is nothing
+    to mask today. Still routed through `redact()` with an empty value list
+    -- a no-op -- so every printed line goes through the same masking path
+    as the rest of the CLI, in case that ever changes.
+    """
+    print(redact(line, []))
+
+
+def _deploy(args: argparse.Namespace, infra_dir: Path) -> None:
+    run_deploy(
+        infra_dir,
+        args.version,
+        node=args.node,
+        skip_build=args.skip_build,
+        tarball_path=args.tarball,
+        emit=_emit_plain,
+    )
+
+
+def _rollback(args: argparse.Namespace, infra_dir: Path) -> None:
+    run_rollback(infra_dir, node=args.node, emit=_emit_plain)
+
+
+def _status(args: argparse.Namespace, infra_dir: Path) -> None:
+    run_status(infra_dir, node=args.node, emit=_emit_plain)
 
 
 def _token(secrets: dict[str, str], key: str, label: str) -> str:

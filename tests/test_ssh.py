@@ -163,6 +163,56 @@ class RunTests(unittest.TestCase):
             self.assertIn("openssh", ctx.exception.hint.lower())
 
 
+class RunStreamTests(unittest.TestCase):
+    """`run_stream` streams an open file object as stdin, never `input=`."""
+
+    def test_streams_the_file_object_as_stdin_not_input(self) -> None:
+        with TemporaryDirectory() as tmp:
+            payload = Path(tmp) / "payload.tar.gz"
+            payload.write_bytes(b"\x1f\x8b\x00fake-tarball-bytes")
+            runner = FakeRunner()
+            runner.script(_cp_text(["ssh"], returncode=0, stdout="✓ unpacked v1.0.0\n", stderr=""))
+            ssh = Ssh(Path(tmp), _HOST, user="deploy", runner=runner)
+
+            with payload.open("rb") as fh:
+                result = ssh.run_stream("upload v1.0.0 " + "a" * 64, fh)
+
+            self.assertEqual(result.stdout, "✓ unpacked v1.0.0\n")
+            call = runner.calls[0]
+            self.assertEqual(call["argv"][-1], "upload v1.0.0 " + "a" * 64)
+            self.assertEqual(call["argv"][-2], "deploy@" + _HOST)
+            self.assertIs(call["kwargs"]["stdin"], fh)
+            self.assertNotIn("input", call["kwargs"])
+            self.assertIn("BatchMode=yes", call["argv"])
+            self.assertIn(f"UserKnownHostsFile={Path(tmp) / 'known_hosts'}", call["argv"])
+
+    def test_check_true_raises_on_nonzero_same_as_run(self) -> None:
+        with TemporaryDirectory() as tmp:
+            payload = Path(tmp) / "payload.tar.gz"
+            payload.write_bytes(b"x")
+            runner = FakeRunner()
+            runner.script(_cp_text(["ssh"], returncode=1, stdout="", stderr="✗ sha256 mismatch"))
+            ssh = Ssh(Path(tmp), _HOST, runner=runner)
+
+            with payload.open("rb") as fh, self.assertRaises(StackError) as ctx:
+                ssh.run_stream("upload v1.0.0 " + "a" * 64, fh)
+
+            self.assertIn("sha256 mismatch", ctx.exception.hint)
+
+    def test_check_false_returns_the_completed_process(self) -> None:
+        with TemporaryDirectory() as tmp:
+            payload = Path(tmp) / "payload.tar.gz"
+            payload.write_bytes(b"x")
+            runner = FakeRunner()
+            runner.script(_cp_text(["ssh"], returncode=3, stdout="", stderr="✗ another deploy is already in progress"))
+            ssh = Ssh(Path(tmp), _HOST, runner=runner)
+
+            with payload.open("rb") as fh:
+                result = ssh.run_stream("upload v1.0.0 " + "a" * 64, fh, check=False)
+
+            self.assertEqual(result.returncode, 3)
+
+
 class FetchTests(unittest.TestCase):
     def test_fetch_uses_cat_with_quoted_path_and_returns_bytes(self) -> None:
         with TemporaryDirectory() as tmp:

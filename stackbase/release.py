@@ -1,0 +1,833 @@
+"""The laptop-side deploy caller: `deploy`, `rollback`, `status`.
+
+The servers already run the whole engine (`nixos/deploy/stack-deploy.sh`,
+Task 1/Plan 01) behind one restricted SSH door (`stack-deploy-ssh`, Task 2):
+`upload <version> <sha256> | deploy <version> | rollback | status | colors |
+releases`. This module is a thin caller on top of that door -- it builds a
+release, packages it, and drives the door node by node. It holds no deploy
+logic of its own: every actual decision (health checks, the blue/green swap,
+retention, the lock) is the engine's.
+
+Four stages:
+
+- `verify_version` / `validate_version_format` -- the version string must be
+  vMAJOR.MINOR.PATCH, the tag must exist, and the TAGGED commit's Cargo.toml
+  (never the working tree) must carry that version.
+- `release_worktree` / `build` -- check out the tag into a throwaway `git
+  worktree`, build a static musl binary and the CSS bundle, mirroring
+  platform-base's own CI recipe (`templates/project-files/.github/workflows/
+  deploy.yml`), and assemble the on-server bundle layout.
+- `package` -- write the bundle as a deterministic, engine-safe tarball
+  (`nixos/deploy/stack-deploy.sh`'s `deploy_unpack_tarball` refuses absolute
+  paths, `..` members, symlinks and non-regular members -- `package` never
+  produces any of those in the first place).
+- `ship` / `rollback_nodes` / `status_nodes` -- drive the SSH door, one node
+  at a time, in the right order.
+
+These commands need no secrets: no age decryption, no API token. They only
+need `stack.toml`, `stack.state.json` (for each node's IP) and
+`infra/known_hosts` -- a teammate whose only credential is an SSH key listed
+in `stackbase.deploy.keys` can run all three.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import gzip
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+import tomllib
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Iterator
+
+from stackbase.config import StackConfig, StackState, load_config, load_state
+from stackbase.errors import StackError
+from stackbase.ssh import Ssh
+
+# vMAJOR.MINOR.PATCH exactly -- no leading zeros, no pre-release/build
+# suffix. The same grammar the SSH door validates server-side (Task 2's
+# VERSION_RE/VERSION_GREP); checked here BEFORE any git or ssh call.
+_VERSION_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+
+_DEPLOY_SSH_USER = "deploy"
+_STREAM_TAIL_LINES = 20
+_TAR_EXTENSIONS = ("static", "migrations", "config")
+
+_MISSING_TOOL_HINTS: dict[str, str] = {
+    "cargo": "install Rust: https://rustup.rs, then `rustup target add x86_64-unknown-linux-musl`",
+    "npm": "install Node.js (npm ships with it): https://nodejs.org",
+    "git": "install git",
+    "ssh": "install openssh-client (e.g. `apt install openssh-client`, `brew install openssh`)",
+}
+
+
+# --------------------------------------------------------------------------
+# Version verification
+# --------------------------------------------------------------------------
+
+
+def validate_version_format(version: str) -> None:
+    """Reject anything that isn't exactly vMAJOR.MINOR.PATCH. No I/O."""
+    if not _VERSION_RE.match(version):
+        raise StackError(
+            f"invalid version '{version}'",
+            "version must look like vMAJOR.MINOR.PATCH (e.g. v1.4.2) -- no leading zeros, "
+            "no pre-release/build suffix",
+        )
+
+
+def verify_version(repo_dir: Path, version: str, *, runner: Any = subprocess.run) -> None:
+    """The tag must exist, and the TAGGED commit's Cargo.toml must carry the same version.
+
+    Checked in order: the version format itself (no subprocess at all), then
+    that `refs/tags/<version>` exists, then that `git show
+    <version>:Cargo.toml` parses and its `[package].version` matches. The
+    working tree's own Cargo.toml is never consulted -- a dirty or
+    out-of-sync working tree can't fool this, because the build itself later
+    runs from a clean `git worktree add --detach` of the tag, not the working
+    tree.
+    """
+    validate_version_format(version)
+
+    tag_check = runner(
+        ["git", "rev-parse", "-q", "--verify", f"refs/tags/{version}"],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if tag_check.returncode != 0:
+        raise StackError(
+            f"tag {version} does not exist",
+            f"create it once Cargo.toml's version is right, then push it: "
+            f"git tag {version} && git push origin {version}",
+        )
+
+    cargo_show = runner(
+        ["git", "show", f"{version}:Cargo.toml"],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if cargo_show.returncode != 0:
+        raise StackError(
+            f"tag {version} has no Cargo.toml at the repo root",
+            f"check what {version} actually points at (git show {version} --stat) -- "
+            "it must be a commit with a Cargo.toml at the repo root",
+        )
+
+    try:
+        data = tomllib.loads(cargo_show.stdout or "")
+    except tomllib.TOMLDecodeError as exc:
+        raise StackError(f"Cargo.toml at tag {version} is not valid TOML", str(exc)) from exc
+
+    package = data.get("package")
+    cargo_version = package.get("version") if isinstance(package, dict) else None
+    expected = version[1:]
+    if cargo_version != expected:
+        raise StackError(
+            f"tag {version} does not match Cargo.toml's version at that tag ({cargo_version!r})",
+            f'the commit tagged {version} must have [package].version = "{expected}" -- fix '
+            f"Cargo.toml, commit it, then move the tag there: git tag -d {version} && "
+            f"git tag {version} && git push --force origin {version} (only if this tag was never "
+            "used for a real deploy)",
+        )
+
+
+def tag_commit_timestamp(repo_dir: Path, version: str, *, runner: Any = subprocess.run) -> int:
+    """The tagged commit's author-date, as a unix timestamp -- the fixed mtime `package` embeds."""
+    result = runner(
+        ["git", "log", "-1", "--format=%ct", version],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = (result.stdout or "").strip()
+    if result.returncode != 0 or not output:
+        raise StackError(
+            f"could not read the commit timestamp for tag {version}",
+            "check that the tag exists and points at a real commit (git tag -l)",
+        )
+    try:
+        return int(output)
+    except ValueError as exc:
+        raise StackError(
+            f"git returned a non-numeric timestamp for tag {version}",
+            "this looks like a bug in stack-base -- please report it",
+        ) from exc
+
+
+# --------------------------------------------------------------------------
+# Build: checkout worktree, cargo + CSS, assemble the bundle
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Project:
+    """What `build`/`package` need to know about the Rust project being released."""
+
+    version: str
+    binary: str
+
+
+def read_project(worktree: Path) -> Project:
+    """Read `[package].name`/`.version` (and an optional `[[bin]]` name) from the checked-out tag."""
+    cargo_path = worktree / "Cargo.toml"
+    if not cargo_path.is_file():
+        raise StackError(f"{cargo_path} not found", "the checked-out tag has no Cargo.toml at its root")
+    try:
+        data = tomllib.loads(cargo_path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise StackError(f"{cargo_path} is not valid TOML", str(exc)) from exc
+    return project_from_cargo_toml(data)
+
+
+def project_from_cargo_toml(data: dict[str, Any]) -> Project:
+    """Crate names use '-'; Cargo's own binary files use '_' (`stack-demo` -> `stack_demo`) --
+    matching the server option `stackbase.app.binary`'s default -- unless a `[[bin]]` table
+    names the binary explicitly, which always wins.
+    """
+    package = data.get("package")
+    if not isinstance(package, dict) or not isinstance(package.get("name"), str) or not isinstance(
+        package.get("version"), str
+    ):
+        raise StackError(
+            "Cargo.toml is missing [package].name or [package].version",
+            "add both to the crate's Cargo.toml",
+        )
+    name = package["name"]
+    version = package["version"]
+
+    binary = name.replace("-", "_")
+    bins = data.get("bin")
+    if isinstance(bins, list) and bins:
+        first = bins[0]
+        if isinstance(first, dict) and isinstance(first.get("name"), str) and first["name"]:
+            binary = first["name"]
+
+    return Project(version=version, binary=binary)
+
+
+@contextlib.contextmanager
+def release_worktree(repo_dir: Path, version: str, *, runner: Any = subprocess.run) -> Iterator[Path]:
+    """Check out `version` into a throwaway `git worktree`, and always remove it afterwards.
+
+    The build never runs against the working tree -- only against this clean,
+    detached checkout of the tag -- so whatever the operator happens to have
+    lying around uncommitted can never leak into a release. Removed in a
+    `finally` (via `git worktree remove --force` + `git worktree prune`) even
+    if the caller raises -- a failed build never leaves a stray worktree
+    registered against the repo.
+    """
+    tmp_dir = Path(tempfile.mkdtemp(prefix="stackbase-worktree-"))
+    # `git worktree add` refuses to create INTO an already-existing
+    # directory; hand it a path that doesn't exist yet, one level inside our
+    # own throwaway tmp_dir, so `tmp_dir` itself is still ours to clean up
+    # unconditionally afterwards.
+    worktree_dir = tmp_dir / "src"
+    try:
+        result = runner(
+            ["git", "worktree", "add", "--detach", str(worktree_dir), version],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise StackError(
+                f"could not check out tag {version} into a worktree",
+                _tail(result.stderr or "")
+                or "check that the tag exists and that no other worktree already uses it",
+            )
+        yield worktree_dir
+    finally:
+        runner(
+            ["git", "worktree", "remove", "--force", str(worktree_dir)],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        runner(
+            ["git", "worktree", "prune"],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def build(
+    worktree: Path,
+    project: Project,
+    *,
+    runner: Any = subprocess.run,
+    popen: Any = subprocess.Popen,
+    emit: Callable[[str], None] = print,
+) -> Path:
+    """Build the release bundle from an already-checked-out worktree.
+
+    Mirrors platform-base's own CI recipe
+    (`templates/project-files/.github/workflows/deploy.yml`): a static musl
+    binary, then the Tailwind CSS build, bundled the same way the workflow
+    does -- the binary at the top level, plus `static/`, `migrations/`,
+    `config/` when present. Every subprocess is streamed to the terminal via
+    `emit`, so a multi-minute cargo build doesn't look like a hang. Returns
+    the bundle directory (a fresh temp dir, independent of `worktree` --
+    `release_worktree` removes `worktree` once the caller's `with` block
+    exits, and the bundle must outlive that).
+    """
+    env = {**os.environ, "RUSTFLAGS": "-C target-feature=+crt-static"}
+    emit("→ building the release binary (cargo build --release --target x86_64-unknown-linux-musl)")
+    returncode, tail = _stream_local(
+        ["cargo", "build", "--release", "--target", "x86_64-unknown-linux-musl"],
+        cwd=worktree,
+        env=env,
+        popen=popen,
+        emit=emit,
+    )
+    if returncode != 0:
+        raise StackError(f"cargo build failed (exit {returncode})", _cargo_failure_hint(tail))
+
+    _build_css(worktree, popen=popen, emit=emit)
+
+    binary_path = worktree / "target" / "x86_64-unknown-linux-musl" / "release" / project.binary
+    if not binary_path.is_file():
+        raise StackError(
+            f"cargo build succeeded but {binary_path} was not produced",
+            f"check that [package].name (or a [[bin]] name) in Cargo.toml matches the expected "
+            f"binary '{project.binary}'",
+        )
+
+    bundle_dir = Path(tempfile.mkdtemp(prefix="stackbase-bundle-"))
+    shutil.copy2(binary_path, bundle_dir / project.binary)
+    (bundle_dir / project.binary).chmod(0o755)
+    for extra in _TAR_EXTENSIONS:
+        source = worktree / extra
+        if source.is_dir():
+            # symlinks=False: dereference any symlink in the source tree
+            # rather than copying it as a symlink -- package() refuses
+            # symlinks in the bundle outright (the server does too).
+            shutil.copytree(source, bundle_dir / extra, symlinks=False)
+
+    return bundle_dir
+
+
+def _cargo_failure_hint(tail: list[str]) -> str:
+    combined = "\n".join(tail)
+    if "may not be installed" in combined or "error[E0463]" in combined:
+        return "install the musl target: rustup target add x86_64-unknown-linux-musl"
+    if "musl-gcc" in combined:
+        return "install musl-tools (e.g. `apt install musl-tools`) or the musl package for your distro"
+    return _tail_hint(tail, "fix the build and re-run")
+
+
+def _build_css(worktree: Path, *, popen: Any, emit: Callable[[str], None]) -> None:
+    package_json = worktree / "package.json"
+    if package_json.is_file():
+        try:
+            data = json.loads(package_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        scripts = data.get("scripts")
+        if isinstance(scripts, dict) and "build:css" in scripts:
+            emit("→ building CSS (npm ci && npm run build:css)")
+            returncode, tail = _stream_local(["npm", "ci"], cwd=worktree, popen=popen, emit=emit)
+            if returncode != 0:
+                raise StackError(f"npm ci failed (exit {returncode})", _tail_hint(tail, "fix package.json/package-lock.json and re-run"))
+            returncode, tail = _stream_local(["npm", "run", "build:css"], cwd=worktree, popen=popen, emit=emit)
+            if returncode != 0:
+                raise StackError(f"npm run build:css failed (exit {returncode})", _tail_hint(tail, "fix the CSS build and re-run"))
+            return
+
+    tailwind = worktree / "tools" / "tailwindcss"
+    if tailwind.is_file():
+        emit("→ building CSS (tools/tailwindcss)")
+        returncode, tail = _stream_local(
+            [str(tailwind), "-i", "src/templates/input.css", "-o", "static/css/output.css", "--minify"],
+            cwd=worktree,
+            popen=popen,
+            emit=emit,
+        )
+        if returncode != 0:
+            raise StackError(f"tools/tailwindcss failed (exit {returncode})", _tail_hint(tail, "fix the CSS build and re-run"))
+        return
+
+    emit("! no CSS build step found (no package.json build:css script and no tools/tailwindcss) -- skipping")
+
+
+def _stream_local(
+    argv: list[str],
+    *,
+    cwd: Path,
+    popen: Any,
+    emit: Callable[[str], None],
+    env: dict[str, str] | None = None,
+) -> tuple[int, list[str]]:
+    """Run `argv` under `cwd`, echoing its output line by line as it arrives.
+
+    Mirrors `steps.py`'s own `_stream` helper (same bufsize=1/stdin=DEVNULL/
+    tail-deque shape), but that one is tied to a `reconcile.Context` and an
+    `Ssh` -- this is the small local equivalent for a plain subprocess.
+    """
+    try:
+        process = popen(
+            argv,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            # A build can take minutes; without this, stray terminal input
+            # in the meantime would be swallowed by the streamed process.
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        raise StackError(
+            f"the '{argv[0]}' command was not found",
+            _MISSING_TOOL_HINTS.get(argv[0], f"install {argv[0]}"),
+        ) from exc
+
+    tail: deque[str] = deque(maxlen=_STREAM_TAIL_LINES)
+    with process:
+        if process.stdout is not None:
+            for line in process.stdout:
+                line = line.rstrip("\n")
+                emit(line)
+                tail.append(line)
+        returncode = process.wait()
+    return returncode, list(tail)
+
+
+# --------------------------------------------------------------------------
+# Package: bundle -> deterministic, engine-safe tarball
+# --------------------------------------------------------------------------
+
+
+def package(
+    bundle_dir: Path,
+    version: str,
+    mtime: int,
+    *,
+    binary_name: str,
+    output_dir: Path | None = None,
+) -> tuple[Path, str]:
+    """Write `bundle_dir` into a deterministic, engine-safe tarball. Returns (path, sha256hex).
+
+    Deterministic: members are visited in a fixed, sorted order and every
+    member's uid/gid/uname/gname/mtime is normalised (mtime to the caller's
+    `mtime`, e.g. the tag's commit timestamp -- never "now"), and the gzip
+    wrapper itself is written with mtime=0 -- so packaging the same bundle
+    twice produces byte-identical output, and therefore the same sha256.
+
+    Engine-safe: refuses symlinks and non-regular members outright, and every
+    member name is checked for an absolute path, a '..' segment or a
+    backslash before being written -- `nixos/deploy/stack-deploy.sh`'s
+    `deploy_unpack_tarball` refuses all of those server-side too; this
+    refuses them before the tarball even exists.
+    """
+    if output_dir is None:
+        output_dir = bundle_dir.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tar_path = output_dir / f"{version}.tar.gz"
+
+    members = list(_bundle_members(bundle_dir))
+
+    with tar_path.open("wb") as raw:
+        # filename="": don't embed this temp path in the gzip header --
+        # mtime=0: no timestamp either -- both are needed for byte-identical
+        # output across two runs.
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
+            with tarfile.open(fileobj=gz, mode="w") as tar:
+                for path, arcname in members:
+                    _validate_member_name(arcname)
+                    tarinfo = tar.gettarinfo(str(path), arcname=arcname)
+                    tarinfo.uid = 0
+                    tarinfo.gid = 0
+                    tarinfo.uname = ""
+                    tarinfo.gname = ""
+                    tarinfo.mtime = mtime
+                    if tarinfo.isdir():
+                        tarinfo.mode = 0o755
+                        tar.addfile(tarinfo)
+                    else:
+                        tarinfo.mode = 0o755 if arcname == binary_name else 0o644
+                        with path.open("rb") as fh:
+                            tar.addfile(tarinfo, fh)
+
+    sha256 = hashlib.sha256(tar_path.read_bytes()).hexdigest()
+    return tar_path, sha256
+
+
+def _bundle_members(bundle_dir: Path) -> Iterator[tuple[Path, str]]:
+    """Every directory and regular file under `bundle_dir`, in a fixed sorted order.
+
+    `followlinks=False`: a symlinked directory is never descended into.
+    Every entry (directory or file) is checked with `is_symlink()` before
+    being yielded, so a symlink is refused outright rather than silently
+    resolved -- matching the server's own refusal.
+    """
+    for dirpath, dirnames, filenames in os.walk(bundle_dir, followlinks=False):
+        dirnames.sort()
+        filenames.sort()
+        current = Path(dirpath)
+        for name in dirnames:
+            path = current / name
+            if path.is_symlink():
+                raise StackError(
+                    f"bundle contains a symlink: {path}",
+                    "remove it or replace it with a real directory before packaging",
+                )
+            yield path, path.relative_to(bundle_dir).as_posix()
+        for name in filenames:
+            path = current / name
+            if path.is_symlink():
+                raise StackError(
+                    f"bundle contains a symlink: {path}",
+                    "remove it or replace it with a real file before packaging",
+                )
+            if not path.is_file():
+                raise StackError(
+                    f"bundle contains a non-regular file: {path}",
+                    "only regular files and directories may be packaged",
+                )
+            yield path, path.relative_to(bundle_dir).as_posix()
+
+
+def _validate_member_name(name: str) -> None:
+    if name.startswith("/"):
+        raise StackError(f"tarball member has an absolute path: {name}", "this is a bug in stack-base -- please report it")
+    if "\\" in name:
+        raise StackError(f"tarball member name contains a backslash: {name}", "this is a bug in stack-base -- please report it")
+    if any(part == ".." for part in name.split("/")):
+        raise StackError(f"tarball member contains a '..' segment: {name}", "this is a bug in stack-base -- please report it")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# --------------------------------------------------------------------------
+# Ship / rollback / status: drive the SSH door, node by node
+# --------------------------------------------------------------------------
+
+
+def _node_order(cfg: StackConfig, *, primary_first: bool) -> list[str]:
+    """`cfg.nodes` in declaration order, split into primary/replicas and reordered.
+
+    `ship` wants replicas first, primary last (a bad release is caught
+    before the node serving traffic is touched); `rollback` wants the
+    opposite (getting the traffic-serving node back is the priority).
+    """
+    primary_names = [name for name, node in cfg.nodes.items() if node.role == "primary"]
+    replica_names = [name for name, node in cfg.nodes.items() if node.role != "primary"]
+    if primary_first:
+        return [*primary_names, *replica_names]
+    return [*replica_names, *primary_names]
+
+
+def _select_nodes(cfg: StackConfig, order: list[str], only: str | None) -> list[str]:
+    if only is None:
+        return order
+    if only not in cfg.nodes:
+        known = ", ".join(cfg.nodes) or "none"
+        raise StackError(f"there is no node called '{only}' in stack.toml", f"known nodes: {known}")
+    return [only]
+
+
+def _node_ip(state: StackState, name: str) -> str:
+    node_state = state.nodes.get(name)
+    ip = node_state.ipv4 if node_state else None
+    if not ip:
+        raise StackError(
+            f"stack-base does not know an address for node '{name}' yet",
+            "run `up` first -- the address is recorded once the server is running",
+        )
+    return ip
+
+
+def ship(
+    infra_dir: Path,
+    cfg: StackConfig,
+    state: StackState,
+    version: str,
+    tarball: Path,
+    sha256: str,
+    *,
+    node: str | None = None,
+    runner: Any = subprocess.run,
+    emit: Callable[[str], None] = print,
+) -> dict[str, str]:
+    """Upload and switch `version` on every selected node, replicas first, primary last.
+
+    Per node: `upload <version> <sha256>` with the tarball streamed on
+    stdin, then `deploy <version>`. An "already exists" upload (a re-run
+    after a partial failure) is treated as already-uploaded and the run
+    continues straight to `deploy` -- idempotent, matching the engine's own
+    check-then-act contract. Exit code 3 from the door means another deploy
+    holds the node's lock. Stops at the first genuine failure and prints a
+    summary of every selected node's current release (via `colors`) so the
+    operator knows exactly what is live where.
+    """
+    order = _select_nodes(cfg, _node_order(cfg, primary_first=False), node)
+    results: dict[str, str] = {}
+    try:
+        for name in order:
+            ssh = Ssh(infra_dir, _node_ip(state, name), user=_DEPLOY_SSH_USER, runner=runner)
+
+            emit(f"→ node {name}: uploading {version}")
+            with tarball.open("rb") as fh:
+                upload = ssh.run_stream(f"upload {version} {sha256}", fh, check=False)
+            _emit_lines(emit, upload.stdout)
+            _emit_lines(emit, upload.stderr)
+            if upload.returncode == 3:
+                raise StackError(
+                    f"another deploy is running on {name}",
+                    "wait for it to finish, then re-run",
+                )
+            already_uploaded = "already exists" in ((upload.stderr or "") + (upload.stdout or ""))
+            if upload.returncode != 0 and not already_uploaded:
+                raise StackError(
+                    f"uploading {version} to node {name} failed (exit {upload.returncode})",
+                    "check the output above -- fix the issue and re-run; nothing was switched on this node",
+                )
+            if already_uploaded:
+                emit(f"i node {name}: {version} was already uploaded -- continuing to deploy")
+
+            emit(f"→ node {name}: switching traffic to {version}")
+            deployed = ssh.run(f"deploy {version}", check=False)
+            _emit_lines(emit, deployed.stdout)
+            _emit_lines(emit, deployed.stderr)
+            if deployed.returncode == 3:
+                raise StackError(
+                    f"another deploy is running on {name}",
+                    "wait for it to finish, then re-run",
+                )
+            if deployed.returncode != 0:
+                raise StackError(
+                    f"deploying {version} to node {name} failed (exit {deployed.returncode})",
+                    "check the output above -- traffic on this node was not switched; fix the issue and re-run",
+                )
+            results[name] = version
+    finally:
+        _print_summary(infra_dir, cfg, state, order, runner=runner, emit=emit)
+
+    return results
+
+
+def rollback_nodes(
+    infra_dir: Path,
+    cfg: StackConfig,
+    state: StackState,
+    *,
+    node: str | None = None,
+    runner: Any = subprocess.run,
+    popen: Any = subprocess.Popen,
+    emit: Callable[[str], None] = print,
+) -> None:
+    """Run `rollback` on every selected node, primary first -- getting traffic back is the priority."""
+    order = _select_nodes(cfg, _node_order(cfg, primary_first=True), node)
+    for name in order:
+        ssh = Ssh(infra_dir, _node_ip(state, name), user=_DEPLOY_SSH_USER, runner=runner)
+        emit(f"→ node {name}: rollback")
+        returncode = _stream_ssh(ssh, "rollback", popen=popen, emit=emit)
+        if returncode == 3:
+            raise StackError(f"another deploy is running on {name}", "wait for it to finish, then re-run")
+        if returncode != 0:
+            raise StackError(
+                f"rollback failed on node {name} (exit {returncode})",
+                "check the output above -- fix the issue and re-run",
+            )
+
+
+def status_nodes(
+    infra_dir: Path,
+    cfg: StackConfig,
+    state: StackState,
+    *,
+    node: str | None = None,
+    runner: Any = subprocess.run,
+    popen: Any = subprocess.Popen,
+    emit: Callable[[str], None] = print,
+) -> None:
+    """Run `status` on every selected node, one ssh call each."""
+    order = _select_nodes(cfg, _node_order(cfg, primary_first=True), node)
+    for name in order:
+        ssh = Ssh(infra_dir, _node_ip(state, name), user=_DEPLOY_SSH_USER, runner=runner)
+        emit(f"node {name}:")
+        returncode = _stream_ssh(ssh, "status", popen=popen, emit=emit)
+        if returncode != 0:
+            raise StackError(
+                f"status failed on node {name} (exit {returncode})",
+                "check the output above",
+            )
+
+
+def _stream_ssh(ssh: Ssh, cmd: str, *, popen: Any, emit: Callable[[str], None]) -> int:
+    """Run one door command on `ssh`, echoing output line by line. See `_stream_local`."""
+    argv = [*ssh.argv(), cmd]
+    try:
+        process = popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            stdin=subprocess.DEVNULL,
+        )
+    except FileNotFoundError as exc:
+        raise StackError(
+            "the 'ssh' command was not found",
+            _MISSING_TOOL_HINTS["ssh"],
+        ) from exc
+    with process:
+        if process.stdout is not None:
+            for line in process.stdout:
+                emit(line.rstrip("\n"))
+        returncode = process.wait()
+    return returncode
+
+
+def _print_summary(
+    infra_dir: Path,
+    cfg: StackConfig,
+    state: StackState,
+    nodes: list[str],
+    *,
+    runner: Any,
+    emit: Callable[[str], None],
+) -> None:
+    """Print each selected node's current release (from `colors`), best-effort.
+
+    Called whether `ship` succeeded or stopped at a failing node -- either
+    way the operator needs to know exactly what is live on every node it
+    touched, not just the one that failed.
+    """
+    emit("node status:")
+    for name in nodes:
+        try:
+            ip = _node_ip(state, name)
+        except StackError as exc:
+            emit(f"  {name}: {exc}")
+            continue
+        try:
+            ssh = Ssh(infra_dir, ip, user=_DEPLOY_SSH_USER, runner=runner)
+            result = ssh.run("colors", check=False)
+        except StackError as exc:
+            emit(f"  {name}: could not read status ({exc})")
+            continue
+        if result.returncode == 0:
+            emit(f"  {name}: {(result.stdout or '').strip()}")
+        else:
+            emit(f"  {name}: could not read status (exit {result.returncode})")
+
+
+def _emit_lines(emit: Callable[[str], None], text: str | None) -> None:
+    if not text:
+        return
+    for line in text.splitlines():
+        if line:
+            emit(line)
+
+
+def _tail_hint(tail: list[str], advice: str) -> str:
+    text = "\n".join(tail).strip()
+    return f"{text}\n{advice}" if text else advice
+
+
+def _tail(text: str, lines: int = 5) -> str:
+    kept = [line for line in text.splitlines() if line.strip()]
+    return "\n".join(kept[-lines:])
+
+
+# --------------------------------------------------------------------------
+# Orchestration: what the CLI's `deploy`/`rollback`/`status` handlers call
+# --------------------------------------------------------------------------
+
+
+def run_deploy(
+    infra_dir: Path,
+    version: str,
+    *,
+    node: str | None = None,
+    skip_build: bool = False,
+    tarball_path: str | None = None,
+    runner: Any = subprocess.run,
+    popen: Any = subprocess.Popen,
+    emit: Callable[[str], None] = print,
+) -> None:
+    """`deploy <version>`: build (or reuse a prebuilt tarball), package, ship.
+
+    Needs no secrets -- only `stack.toml`, `stack.state.json` and
+    `infra/known_hosts`; `load_secrets` is never called.
+    """
+    if skip_build and not tarball_path:
+        raise StackError("--skip-build requires --tarball PATH", "pass --tarball with the pre-built release archive")
+    if tarball_path and not skip_build:
+        raise StackError(
+            "--tarball requires --skip-build",
+            "pass --skip-build alongside --tarball, or drop --tarball to build from source",
+        )
+
+    cfg = load_config(infra_dir)
+    state = load_state(infra_dir)
+    repo_dir = infra_dir.parent
+
+    if skip_build:
+        validate_version_format(version)
+        assert tarball_path is not None  # guarded above
+        tarball = Path(tarball_path).expanduser()
+        if not tarball.is_file():
+            raise StackError(f"tarball not found: {tarball}", "check the --tarball path")
+        sha256 = _sha256_file(tarball)
+    else:
+        verify_version(repo_dir, version, runner=runner)
+        mtime = tag_commit_timestamp(repo_dir, version, runner=runner)
+        with release_worktree(repo_dir, version, runner=runner) as worktree:
+            project = read_project(worktree)
+            bundle_dir = build(worktree, project, runner=runner, popen=popen, emit=emit)
+            tarball, sha256 = package(bundle_dir, version, mtime, binary_name=project.binary)
+
+    ship(infra_dir, cfg, state, version, tarball, sha256, node=node, runner=runner, emit=emit)
+
+
+def run_rollback(
+    infra_dir: Path,
+    *,
+    node: str | None = None,
+    runner: Any = subprocess.run,
+    popen: Any = subprocess.Popen,
+    emit: Callable[[str], None] = print,
+) -> None:
+    cfg = load_config(infra_dir)
+    state = load_state(infra_dir)
+    rollback_nodes(infra_dir, cfg, state, node=node, runner=runner, popen=popen, emit=emit)
+
+
+def run_status(
+    infra_dir: Path,
+    *,
+    node: str | None = None,
+    runner: Any = subprocess.run,
+    popen: Any = subprocess.Popen,
+    emit: Callable[[str], None] = print,
+) -> None:
+    cfg = load_config(infra_dir)
+    state = load_state(infra_dir)
+    status_nodes(infra_dir, cfg, state, node=node, runner=runner, popen=popen, emit=emit)
