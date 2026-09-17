@@ -221,13 +221,15 @@ def validate_app_env(raw: str) -> str:
             "infra/secrets.age's 'app_env' contains a NUL byte",
             "app_env must be plain KEY=value lines, one per line -- fix it and re-encrypt secrets.age",
         )
-    for line in raw.splitlines():
+    for line_number, line in enumerate(raw.splitlines(), start=1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         if not _APP_ENV_LINE_RE.match(stripped):
+            # The line NUMBER is safe to name -- the content never is (per
+            # the global "secrets are never echoed" rule).
             raise StackError(
-                "infra/secrets.age's 'app_env' has a line that is not KEY=value",
+                f"infra/secrets.age's 'app_env' has a line that is not KEY=value (line {line_number})",
                 "every non-blank, non-comment line must look like NAME=value (NAME starting with "
                 "a letter or underscore) -- fix it and re-encrypt secrets.age",
             )

@@ -1795,6 +1795,13 @@ class EnsureAppEnvTests(unittest.TestCase):
     _TMP_CMD = "set -eu; install -m 0640 -o root -g acme /dev/null /var/lib/stackbase/app.env.new"
     _CAT_CMD = "set -eu; cat > /var/lib/stackbase/app.env.new"
     _MV_CMD = "set -eu; mv -f /var/lib/stackbase/app.env.new /var/lib/stackbase/app.env"
+    # B2 (Fix round, Task 4): one remote command distinguishes "active-color
+    # genuinely does not exist" from every other failure -- see
+    # steps.py::_restart_active_color.
+    _CHECK_CMD = (
+        "if [ -e /var/lib/stackbase-deploy/active-color ]; then "
+        "cat -- /var/lib/stackbase-deploy/active-color; else echo __STACKBASE_NONE__; fi"
+    )
 
     def _ctx(
         self,
@@ -1829,9 +1836,9 @@ class EnsureAppEnvTests(unittest.TestCase):
                 return _cp(argv, returncode=0)
             if cmd == self._MV_CMD:
                 return _cp(argv, returncode=0)
-            if cmd == "cat -- /var/lib/stackbase-deploy/active-color":
+            if cmd == self._CHECK_CMD:
                 if active_color is None:
-                    return _cp(argv, returncode=1, stderr="No such file or directory\n")
+                    return _cp(argv, returncode=0, stdout="__STACKBASE_NONE__\n")
                 return _cp(argv, returncode=0, stdout=f"{active_color}\n")
             if cmd.startswith("systemctl try-restart"):
                 return _cp(argv, returncode=0)
@@ -1966,6 +1973,13 @@ class EnsureAppEnvTests(unittest.TestCase):
             )
 
     def test_sha_is_saved_only_after_success_so_a_failed_restart_retries_next_run(self) -> None:
+        """B2 (Fix round, Task 4): app_env_sha is now assigned AFTER
+        `_restart_active_color` returns, not before -- a restart that fails
+        (here: the active-color file holds an unvalidatable value) must
+        raise BEFORE the digest is ever set, in memory or on disk, so the
+        next `up` sees this step as still pending and retries the whole
+        push+restart, not just "nothing to do".
+        """
         with Infra() as infra_dir:
             from stackbase.config import load_state, save_state
 
@@ -1981,12 +1995,51 @@ class EnsureAppEnvTests(unittest.TestCase):
             with self.assertRaises(StackError):
                 apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
 
-            # ctx.state was mutated in memory (the sha was set before the
-            # restart failed) -- but apply() never called save_state() for
-            # this step, so the on-disk copy must be untouched.
             saved = load_state(infra_dir)
             self.assertIsNone(saved.nodes["a"].app_env_sha)
-            self.assertIsNotNone(ctx.state.nodes["a"].app_env_sha)
+            # Old behaviour (pre-B2) set the digest in ctx.state BEFORE the
+            # restart ran, so it stayed set here even though the restart
+            # itself failed -- only the separate save_state() call being
+            # skipped kept the ON-DISK copy clean. Now the digest is never
+            # assigned at all on this path.
+            self.assertIsNone(ctx.state.nodes["a"].app_env_sha)
+
+    def test_an_ambiguous_active_color_check_failure_is_a_hard_failure_and_the_sha_is_not_saved(self) -> None:
+        """B2: the OLD code treated ANY non-zero exit from the `cat` check as
+        "no release deployed yet" -- silently swallowing a real failure
+        (permission denied, an ssh hiccup, ...) and letting app_env_sha be
+        saved anyway, so the broken restart was never retried. The new check
+        command can only mean "file missing" via its own success-path
+        marker; any non-zero exit is now unambiguously a hard failure.
+        """
+
+        def handler(argv, kwargs):
+            if not argv or argv[0] != "ssh":
+                return None
+            cmd = argv[-1]
+            if cmd == "getent group acme":
+                return _cp(argv, returncode=0, stdout="acme:x:993:\n")
+            if cmd == self._TMP_CMD:
+                return _cp(argv, returncode=0)
+            if cmd == self._CAT_CMD:
+                return _cp(argv, returncode=0)
+            if cmd == self._MV_CMD:
+                return _cp(argv, returncode=0)
+            if cmd == self._CHECK_CMD:
+                return _cp(argv, returncode=1, stderr="permission denied\n")
+            return None
+
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(infra_dir, app_env=self._APP_ENV_RAW, runner=FakeRunner(handler=handler))
+
+            with self.assertRaises(StackError) as caught:
+                apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
+
+            self.assertIn("could not check", str(caught.exception))
+            self.assertIsNone(ctx.state.nodes["a"].app_env_sha)
+            self.assertFalse(
+                any(c["argv"][-1].startswith("systemctl") for c in ctx.runner.calls if c["argv"][0] == "ssh")
+            )
 
 
 class SetupReinstallEndToEndTests(unittest.TestCase):
@@ -2274,6 +2327,22 @@ class LocalFactsTests(unittest.TestCase):
 
             self.assertNotEqual(first, second)
 
+    def test_the_rev_changes_when_a_new_ci_deploy_pub_key_is_added(self) -> None:
+        """Task 4: adding infra/keys/ci-deploy.pub (via `ci-setup`) must
+        trigger a rebuild on the next `up`, the same way any other
+        keys/*.pub change does -- PUSH_EXCLUDES doesn't list it, and
+        compute_rev hashes the whole infra/ tree, so this only needs proving
+        once at this level.
+        """
+        with Infra() as infra_dir:
+            first = local_facts(infra_dir, {}).desired_rev
+            (infra_dir / "keys" / "ci-deploy.pub").write_text(
+                "ssh-ed25519 AAAAExampleCiDeployKey ci-deploy@acme\n", encoding="utf-8"
+            )
+            second = local_facts(infra_dir, {}).desired_rev
+
+            self.assertNotEqual(first, second)
+
     def test_the_rev_ignores_the_state_file_and_the_known_hosts_file(self) -> None:
         with Infra() as infra_dir:
             first = local_facts(infra_dir, {}).desired_rev
@@ -2352,6 +2421,18 @@ class LocalFactsTests(unittest.TestCase):
                 local_facts(infra_dir, {"app_env": "not-a-key-value-line\n"})
 
             self.assertNotIn("not-a-key-value-line", str(caught.exception))
+
+    def test_malformed_app_env_names_the_line_number_never_the_content(self) -> None:
+        """B3 (Fix round, Task 4): the error names WHICH line is wrong (by
+        number), still never its content.
+        """
+        with Infra() as infra_dir:
+            with self.assertRaises(StackError) as caught:
+                local_facts(infra_dir, {"app_env": "A=1\n# a comment\n\nnot-a-key-value-line\n"})
+
+            message = str(caught.exception)
+            self.assertIn("line 4", message)
+            self.assertNotIn("not-a-key-value-line", message)
 
     def test_app_env_with_a_nul_byte_is_rejected(self) -> None:
         with Infra() as infra_dir:

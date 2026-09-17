@@ -665,6 +665,14 @@ _DEPLOY_STATE_DIR = "/var/lib/stackbase-deploy"
 _ACTIVE_COLOR_FILE = f"{_DEPLOY_STATE_DIR}/active-color"
 _VALID_COLORS = frozenset({"blue", "green"})
 
+# Printed by the remote check command itself when active-color genuinely
+# does not exist -- distinguishes "no release deployed yet" (legitimate,
+# skip the restart) from every other failure (permission denied, an ssh
+# hiccup, ...), which must NOT be read as "no release deployed yet" (Fix
+# round, B2). Unlikely to collide with anything real; not secret, never
+# masked.
+_NO_ACTIVE_COLOR_MARKER = "__STACKBASE_NONE__"
+
 
 def _ensure_app_env(ctx: Context, step: Step) -> str:
     """Push infra/secrets.age's "app_env" to /var/lib/stackbase/app.env, then
@@ -711,11 +719,19 @@ def _ensure_app_env(ctx: Context, step: Step) -> str:
     ssh.run(f"set -eu; cat > {tmp_path}", input=normalized)
     ssh.run(f"set -eu; mv -f {tmp_path} {final_path}")
 
-    # Saved only now that the file is actually in place -- a failure above
-    # leaves state unchanged, so the next run retries the whole push.
+    # The restart runs BEFORE app_env_sha is saved (Fix round, B2): the old
+    # order saved the digest right here, before the restart even ran, so a
+    # restart that failed (or an ambiguous "can't tell" ssh/cat failure that
+    # used to be silently read as "no release yet") still left the node
+    # converged as far as stack-base's own state was concerned -- the next
+    # `up` would see nothing to do and never retry. Now the digest is only
+    # ever saved once the restart has genuinely succeeded or was legitimately
+    # skipped (no release deployed yet); anything else raises, so a failure
+    # here leaves state unchanged and the whole step (push + restart) retries
+    # on the next `up`.
+    color = _restart_active_color(ctx, ssh, node, project)
     ctx.node_state(node).app_env_sha = app_env_digest(normalized)
 
-    color = _restart_active_color(ctx, ssh, node, project)
     if color:
         return f"node {node}: application environment updated, {color} restarted"
     return f"node {node}: application environment updated"
@@ -728,13 +744,32 @@ def _restart_active_color(ctx: Context, ssh: Ssh, node: str, project: str) -> st
     change -- restarting the active color directly here is a brief blip, on
     purpose; a zero-downtime way to roll an env change out is to push it and
     then `deploy` (or re-deploy) a release.
+
+    One remote command distinguishes "active-color genuinely does not exist
+    yet" (legitimate -- no release has ever been deployed, so there is
+    nothing to restart) from every other failure (permission denied, an ssh
+    hiccup, ...): the OLD code treated ANY non-zero exit from `cat` the same
+    way, silently swallowing a real failure as if it meant "no release yet"
+    -- app_env_sha would then still get saved by the caller, and the restart
+    would simply never be retried (Fix round, B2). A failure that isn't the
+    file-missing case now raises instead.
     """
-    result = ssh.run(f"cat -- {shlex.quote(_ACTIVE_COLOR_FILE)}", check=False)
+    quoted = shlex.quote(_ACTIVE_COLOR_FILE)
+    check_cmd = f"if [ -e {quoted} ]; then cat -- {quoted}; else echo {_NO_ACTIVE_COLOR_MARKER}; fi"
+    result = ssh.run(check_cmd, check=False)
     if result.returncode != 0:
+        raise StackError(
+            f"node {node}: could not check whether a release has been deployed yet (exit {result.returncode})",
+            "check the node by hand (permissions, connectivity) -- app_env was pushed, but the "
+            "currently active release was never restarted; re-run `up` once this is fixed to retry",
+        )
+
+    output = (result.stdout or "").strip()
+    if output == _NO_ACTIVE_COLOR_MARKER:
         ctx.emit("! no release deployed yet — the new environment applies from the first deploy")
         return None
 
-    color = (result.stdout or "").strip()
+    color = output
     if color not in _VALID_COLORS:
         # Never interpolate an unvalidated remote string into a command --
         # `systemctl try-restart <garbage>@<garbage>.service` is exactly the
