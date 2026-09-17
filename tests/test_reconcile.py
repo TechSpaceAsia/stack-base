@@ -39,6 +39,7 @@ from stackbase.reconcile import (
     local_facts,
     observe,
     plan,
+    render_description,
 )
 from tests.fakes import FakePopen, FakeRunner, FakeServer
 
@@ -301,6 +302,39 @@ class PlanTests(unittest.TestCase):
         plan(_config(), state, _observed_fresh())
 
         self.assertEqual(state, StackState())
+
+
+class RenderDescriptionTests(unittest.TestCase):
+    """Live finding: with no Cloudflare token, PUSH_CONFIG's announced text
+    must not claim it's uploading an origin certificate -- plan() never
+    plans ENSURE_ORIGIN_CERT in that case, and _push_config never has a
+    certificate to push either.
+    """
+
+    def test_push_config_mentions_the_origin_certificate_with_a_token(self) -> None:
+        step = Step(Action.PUSH_CONFIG, "a")
+
+        self.assertEqual(
+            render_description(step, has_cloudflare_token=True),
+            "node a: uploading the configuration and the origin certificate",
+        )
+
+    def test_push_config_drops_the_certificate_mention_without_a_token(self) -> None:
+        step = Step(Action.PUSH_CONFIG, "a")
+
+        self.assertEqual(
+            render_description(step, has_cloudflare_token=False),
+            "node a: uploading the configuration",
+        )
+
+    def test_other_actions_are_unaffected_by_the_cloudflare_token_flag(self) -> None:
+        step = Step(Action.REBUILD, "a")
+
+        self.assertEqual(
+            render_description(step, has_cloudflare_token=True),
+            render_description(step, has_cloudflare_token=False),
+        )
+        self.assertEqual(render_description(step, has_cloudflare_token=False), step.description)
 
 
 class CloudflareOptionalPlanTests(unittest.TestCase):

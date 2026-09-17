@@ -49,14 +49,27 @@ in
     # binding) -- Nix's attrset-literal merging can't combine a plain
     # `mapAttrs` result at `users.users` with a further nested-path binding
     # at `users.users.root.…` in the same `config` literal.
+    #
+    # `lib.unique` on both lists: a live box was found with the same key
+    # listed twice under one admin's own `/etc/ssh/authorized_keys.d/<name>`
+    # (2 lines, 1 distinct value). Whatever upstream reason a key ends up
+    # offered more than once for the same user -- two admins sharing one
+    # key (which would otherwise double up in root's aggregate list below),
+    # or the very same `keys.<admin>.keys` list being contributed by more
+    # than one module -- deduplicating here is the one place that can never
+    # under-count (`lib.unique` only ever drops an exact repeat of a value
+    # already kept, never a distinct one) and never miss a case.
     users.users = lib.mapAttrs (_name: key: {
       isNormalUser = true;
       extraGroups = [ "wheel" ];
-      openssh.authorizedKeys.keys = [ key ];
+      openssh.authorizedKeys.keys = lib.unique [ key ];
     }) cfg.admins // {
       # root needs key login too: the provisioner's very first rebuild
       # connects as root before any admin account exists on the node.
-      root.openssh.authorizedKeys.keys = lib.attrValues cfg.admins;
+      # root legitimately gets every admin's key -- `lib.unique` only
+      # collapses an exact repeat, so every distinct admin key still lands
+      # here.
+      root.openssh.authorizedKeys.keys = lib.unique (lib.attrValues cfg.admins);
     };
 
     security.sudo.wheelNeedsPassword = false;
@@ -77,6 +90,22 @@ in
       extraConfig = ''
         PerSourcePenalties yes
       '';
+    };
+
+    # systemd-resolved -- enabled indirectly, not by this module: the
+    # Hostinger provider module (nixos/providers/hostinger.nix) turns on
+    # cloud-init's networking, which turns on systemd-networkd, which
+    # defaults `services.resolved.enable` on -- otherwise listens for
+    # LLMNR/mDNS on 0.0.0.0:5355 and [::]:5355. The firewall already blocks
+    # both from outside, but there's no legitimate LAN-discovery use for a
+    # public VPS, so turn them off at the source. `mkDefault` so a node that
+    # genuinely needs one can still override it from extra.nix; harmless on
+    # a system with resolved disabled entirely, since resolved's own module
+    # only ever writes `settings.Resolve` into resolved.conf when
+    # `services.resolved.enable` is true.
+    services.resolved.settings.Resolve = {
+      LLMNR = lib.mkDefault "no";
+      MulticastDNS = lib.mkDefault "no";
     };
 
     services.fail2ban.enable = true; # ships a default sshd jail; defaults are fine here

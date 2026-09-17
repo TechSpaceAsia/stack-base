@@ -135,6 +135,21 @@ class Step:
         return self.action in _SLOW
 
 
+def render_description(step: Step, *, has_cloudflare_token: bool) -> str:
+    """The text `--plan` and `apply()`'s progress line print for one step.
+
+    Identical to `step.description`, except for PUSH_CONFIG with no
+    Cloudflare token: `plan()` never plans ENSURE_ORIGIN_CERT in that case
+    (Task 7b), so PUSH_CONFIG never actually has an origin certificate to
+    upload either -- see `steps.py::_push_config`'s own no-token wording,
+    which this matches.
+    """
+    if step.action is Action.PUSH_CONFIG and not has_cloudflare_token:
+        doing = "uploading the configuration"
+        return f"node {step.node}: {doing}" if step.node else doing
+    return step.description
+
+
 # --------------------------------------------------------------------------
 # Local facts
 # --------------------------------------------------------------------------
@@ -839,7 +854,7 @@ def apply(
 
     for step in steps:
         if step.is_slow:
-            ctx.emit(f"→ {step.description}…")
+            ctx.emit(f"→ {render_description(step, has_cloudflare_token=ctx.local.has_cloudflare_token)}…")
         message = step_executors.execute(ctx, step)
         save_state(ctx.infra_dir, ctx.state)
         ctx.emit(f"✓ {message}")

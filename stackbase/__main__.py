@@ -26,7 +26,7 @@ from stackbase.cloudflare import CloudflareClient
 from stackbase.config import load_config, load_state
 from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
-from stackbase.reconcile import SSH_USER, Context, Step, apply, local_facts, observe, plan
+from stackbase.reconcile import SSH_USER, Context, Step, apply, local_facts, observe, plan, render_description
 from stackbase.secrets import load_secrets, redact
 from stackbase.ssh import Ssh
 
@@ -175,9 +175,11 @@ def _print_plan(steps: list[Step], secrets: dict[str, str]) -> None:
         print("nothing to do")
         return
     values = list(secrets.values())
+    has_cloudflare_token = bool(secrets.get("cloudflare_token"))
     print("would do:")
     for number, step in enumerate(steps, start=1):
-        print(redact(f"  {number}. {step.description}", values))
+        description = render_description(step, has_cloudflare_token=has_cloudflare_token)
+        print(redact(f"  {number}. {description}", values))
 
 
 def _ssh(args: argparse.Namespace, infra_dir: Path) -> None:

@@ -208,6 +208,51 @@ module's defaults and can override any of them — then run `./infra/up`
 again. This fails at the *test* stage, before anything is activated, so
 nothing on the server changes until it builds cleanly.
 
+## What Hostinger's NixOS image actually ships (verified live, Sept 2026)
+
+A real Hostinger VPS was taken all the way through `./infra/up` — first
+rebuild (test → probe → switch), a second run reporting `nothing to do`, and
+a deliberate reboot that came back in ~31s with the same host key, the
+static IPv4/IPv6 re-rendered by cloud-init, all services active, 0 failed
+units, and password auth still refused. What the image itself ships,
+confirmed on that box:
+
+- `/etc/nixos` is **empty** — a prebuilt cloud-init image, not a
+  `nixos-install`ed machine.
+- cloud-init's datasource is **NoCloud**, delivered on a `cidata` ISO
+  mounted at `/dev/sr0` (meta-data, network-config, user-data, vendor-data).
+- Networking is **static, not DHCP**: cloud-init renders the IPv4/IPv6
+  addresses into `/etc/systemd/network/`, and systemd-networkd +
+  systemd-resolved own the interface from there — no dhcpcd, no
+  NetworkManager.
+- **BIOS boot, GRUB on `/dev/sda`.**
+- A single ext4 root partition, `LABEL=nixos`, that grows to fill the disk
+  on boot (`x-systemd.growfs` + a `growpart.service`).
+- **qemu-guest-agent** is active.
+- Root's first SSH key is delivered by cloud-init, not by stack-base.
+- `nix 2.34.8`, channel `nixos-26.05` — `experimental-features` is **not**
+  set in `nix.conf`. `nixos-rebuild --flake` still works regardless:
+  `nixos-rebuild` itself enables `nix-command`/`flakes` for the duration of
+  the run whenever `--flake` is passed, it doesn't depend on the box's own
+  `nix.conf` at all.
+- **1 vCPU / ~3.9 GB RAM** — the very first rebuild (building the whole
+  system closure) took a few minutes; expect that specifically on the first
+  run, not on later ones once the store has more in it already.
+
+Three Hostinger API quirks learned the same way, all already handled in
+code (`stackbase/http.py`, `stackbase/hostinger.py`, `stackbase/reconcile.py`):
+
+- Every request needs a **non-default `User-Agent`** — Hostinger (behind
+  Cloudflare) rejects urllib's default `Python-urllib/3.x` with an HTTP
+  `1010`. stack-base sends an explicit, identifying one.
+- The setup/purchase password is validated against **both** `root_password`
+  (a wider symbol set) **and** `panel_password` (a narrower one) — the only
+  symbols that satisfy both are `#+?@`, and stack-base's generated password
+  is built from exactly that intersection.
+- The node's hostname sent to Hostinger **must be an FQDN** — a short
+  `<project>-<node>` name is rejected with "Wrong hostname FQDN format",
+  even though Hostinger's own API docs don't call this out.
+
 ## If you get locked out
 
 stack-base applies a new configuration in two stages on purpose. First it

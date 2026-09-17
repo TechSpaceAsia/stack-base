@@ -111,6 +111,33 @@ def _nix_eval(directory: Path) -> dict:
     return json.loads(result.stdout)
 
 
+def _eval_mk_node(apply_fn: str, *, provider: str | None = "OMIT", extra_config: str = "") -> subprocess.CompletedProcess:
+    """Evaluate `stack-base`'s own `lib.mkNode` directly -- no on-disk
+    template instantiation, no toplevel build -- for tests that only need
+    one `config.*` (or error) fact out of it.
+
+    `provider`: `"OMIT"` (the default) leaves the `provider` argument out of
+    the call entirely, exercising `mkNode`'s own Nix-level default; any
+    other Python value is rendered as the literal Nix `provider = <value>;`
+    (so pass `'"hostinger"'`, `"null"`, or `'"bogus"'` -- already valid Nix
+    source, not a Python string to be quoted again).
+    """
+    provider_line = "" if provider == "OMIT" else f"provider = {provider};"
+    expr = (
+        f'let flake = builtins.getFlake "path:{_REPO_ROOT}"; '
+        f"node = flake.lib.mkNode {{ "
+        f"{provider_line} "
+        f"modules = [ {{ stackbase.project = \"t\"; stackbase.domain = \"t.example.com\"; {extra_config} }} ]; "
+        f"}}; in {apply_fn}"
+    )
+    return subprocess.run(
+        [_NIX or "nix", "eval", "--impure", "--json", "--expr", expr],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 @unittest.skipIf(_NIX is None, "nix is not installed")
 class TemplateFlakeEvaluatesTests(unittest.TestCase):
     """The template must build a real NixOS system from stack.toml alone."""
@@ -177,6 +204,119 @@ class TemplateFlakeEvaluatesTests(unittest.TestCase):
             )
 
             self.assertEqual(_nix_eval(directory)["grubDevice"], "/dev/sdz")
+
+
+@unittest.skipIf(_NIX is None, "nix is not installed")
+class MkNodeProviderContractTests(unittest.TestCase):
+    """`lib.mkNode`'s `provider` argument (review follow-up on task 8a):
+    "hostinger" (the default) must include the Hostinger provider module,
+    `null` must include none, and anything else must fail loudly rather
+    than silently building a node with no provider module.
+    """
+
+    def test_unknown_provider_throws_naming_the_known_providers(self) -> None:
+        result = _eval_mk_node(
+            "node.config.services.cloud-init.enable", provider='"bogus"'
+        )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("unknown provider 'bogus'", result.stderr)
+        self.assertIn("hostinger", result.stderr)
+
+    def test_provider_null_does_not_enable_cloud_init(self) -> None:
+        result = _eval_mk_node(
+            "node.config.services.cloud-init.enable", provider="null"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), False)
+
+    def test_the_default_provider_enables_cloud_init(self) -> None:
+        result = _eval_mk_node("node.config.services.cloud-init.enable")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), True)
+
+
+@unittest.skipIf(_NIX is None, "nix is not installed")
+class AdminKeyDeduplicationTests(unittest.TestCase):
+    """Live finding on task 8a: a real box had the same key listed twice
+    under one admin's own `/etc/ssh/authorized_keys.d/<name>`. base.nix now
+    wraps both the per-admin list and root's aggregate list in `lib.unique`.
+    """
+
+    # `users.users.*` pulls in enough of the rest of the system (postgresql's
+    # ensureUsers, rpcbind/nfs's fsType check, ...) that a root filesystem
+    # must be defined even just to evaluate an authorizedKeys list.
+    _SHARED_KEY_ADMINS = (
+        'fileSystems."/" = { device = "/dev/vda1"; fsType = "ext4"; }; '
+        'stackbase.admins = { matt = "ssh-ed25519 AAAAsharedkey shared@laptop"; '
+        'kim = "ssh-ed25519 AAAAsharedkey shared@laptop"; };'
+    )
+
+    def test_roots_aggregate_list_has_no_duplicate_when_two_admins_share_a_key(self) -> None:
+        result = _eval_mk_node(
+            "node.config.users.users.root.openssh.authorizedKeys.keys",
+            extra_config=self._SHARED_KEY_ADMINS,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        keys = json.loads(result.stdout)
+        # Two admins, one shared key -- root still gets every *distinct*
+        # admin key (one), never the same key twice.
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertEqual(len(keys), 1)
+
+    def test_each_admins_own_list_has_no_duplicate(self) -> None:
+        result = _eval_mk_node(
+            "{ matt = node.config.users.users.matt.openssh.authorizedKeys.keys;"
+            " kim = node.config.users.users.kim.openssh.authorizedKeys.keys; }",
+            extra_config=self._SHARED_KEY_ADMINS,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        facts = json.loads(result.stdout)
+        for name, keys in facts.items():
+            with self.subTest(admin=name):
+                self.assertEqual(len(keys), len(set(keys)))
+                self.assertEqual(len(keys), 1)
+
+
+@unittest.skipIf(_NIX is None, "nix is not installed")
+class ResolvedLlmnrMdnsTests(unittest.TestCase):
+    """Live finding on task 8a: systemd-resolved was listening for LLMNR on
+    0.0.0.0:5355/[::]:5355 -- firewalled, but pointless on a server.
+    `tests/vm.nix`'s VM never enables resolved at all (it builds straight
+    off baseModules, with no provider module to turn cloud-init/networkd on
+    for it), so this is asserted via `nix eval` on a real `mkNode` config
+    (default "hostinger" provider) rather than extending that VM test.
+    """
+
+    _WITH_ROOT_FS = 'fileSystems."/" = { device = "/dev/vda1"; fsType = "ext4"; };'
+
+    def test_llmnr_and_multicast_dns_are_off_when_resolved_is_active(self) -> None:
+        result = _eval_mk_node(
+            "{ enable = node.config.services.resolved.enable;"
+            " llmnr = node.config.services.resolved.settings.Resolve.LLMNR;"
+            " mdns = node.config.services.resolved.settings.Resolve.MulticastDNS; }",
+            extra_config=self._WITH_ROOT_FS,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        facts = json.loads(result.stdout)
+        self.assertTrue(facts["enable"], "resolved should be active via the default hostinger provider")
+        self.assertEqual(facts["llmnr"], "no")
+        self.assertEqual(facts["mdns"], "no")
+
+    def test_setting_the_values_does_not_enable_resolved_on_its_own(self) -> None:
+        result = _eval_mk_node(
+            "node.config.services.resolved.enable",
+            provider="null",
+            extra_config=self._WITH_ROOT_FS,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), False)
 
 
 class TemplateUpScriptTests(unittest.TestCase):
