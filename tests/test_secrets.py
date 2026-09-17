@@ -117,6 +117,10 @@ class SecretsRoundTripTests(unittest.TestCase):
             # a create-command hint must use shell variables, never inline placeholders
             self.assertIn("HOSTINGER_TOKEN=<paste here>", message)
             self.assertIn("$HOSTINGER_TOKEN", message)
+            # Task 7b: Cloudflare is optional -- the hint must say so, still
+            # using the shell-variable style (never an inline placeholder).
+            self.assertIn("CLOUDFLARE_TOKEN=<paste here, or leave empty>", message)
+            self.assertIn("optional", message)
 
     def test_wrong_identity_raises_useful_hint(self) -> None:
         with TempInfraDir() as infra_dir:

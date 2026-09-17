@@ -118,13 +118,28 @@ def error_line(error: StackError, secret_values: list[str]) -> str:
     return redact(f"error: {error}", secret_values)
 
 
+_NO_CLOUDFLARE_WARNING = (
+    "! no Cloudflare token in secrets.age — skipping DNS and the TLS origin certificate; "
+    "the server will be reachable by IP/SSH only. Add cloudflare_token later and run up again."
+)
+
+
 def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
     cfg = load_config(infra_dir)
     state = load_state(infra_dir)
     secrets.update(load_secrets(infra_dir))
 
     hostinger = HostingerClient(_token(secrets, "hostinger_token", "Hostinger"))
-    cloudflare = CloudflareClient(_token(secrets, "cloudflare_token", "Cloudflare"))
+
+    # Cloudflare is optional (Task 7b): with no token, no CloudflareClient is
+    # ever constructed, observe() makes no Cloudflare request, and plan()
+    # skips the origin cert and DNS entirely -- see reconcile.py.
+    cloudflare_token = secrets.get("cloudflare_token")
+    if cloudflare_token:
+        cloudflare = CloudflareClient(cloudflare_token)
+    else:
+        cloudflare = None
+        print(redact(_NO_CLOUDFLARE_WARNING, list(secrets.values())))
 
     stackbase_src = os.environ.get("STACKBASE_SRC") or None
     local = local_facts(infra_dir, secrets, stackbase_src=stackbase_src)

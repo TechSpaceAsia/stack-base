@@ -59,8 +59,12 @@ _LOCK = {
 }
 
 
-def _project(root: Path) -> tuple[Path, Path]:
+def _project(root: Path, *, cloudflare_token: str | None = _CLOUDFLARE_TOKEN) -> tuple[Path, Path]:
     """Build an infra/ directory with a real encrypted secrets.age.
+
+    `cloudflare_token=None` omits "cloudflare_token" from the secrets payload
+    entirely (Task 7b: Cloudflare is optional -- absent, not just empty, is
+    the normal way an operator would create secrets.age without one).
 
     Returns `(infra_dir, age_identity)`.
     """
@@ -79,7 +83,10 @@ def _project(root: Path) -> tuple[Path, Path]:
     ).stdout.strip()
     (infra_dir / "age-recipients.txt").write_text(public_key + "\n", encoding="utf-8")
 
-    payload = json.dumps({"hostinger_token": _HOSTINGER_TOKEN, "cloudflare_token": _CLOUDFLARE_TOKEN})
+    secrets: dict[str, str] = {"hostinger_token": _HOSTINGER_TOKEN}
+    if cloudflare_token is not None:
+        secrets["cloudflare_token"] = cloudflare_token
+    payload = json.dumps(secrets)
     subprocess.run(
         ["age", "-R", str(infra_dir / "age-recipients.txt"), "-o", str(infra_dir / "secrets.age")],
         input=payload.encode("utf-8"),
@@ -450,6 +457,150 @@ class FailureTests(unittest.TestCase):
 
             self.assertIn("age -R", stderr.getvalue())
             self.assertIn("hostinger_token", stderr.getvalue())
+            self.assertIn("optional", stderr.getvalue())
+
+
+_NO_CLOUDFLARE_WARNING = (
+    "! no Cloudflare token in secrets.age — skipping DNS and the TLS origin certificate; "
+    "the server will be reachable by IP/SSH only. Add cloudflare_token later and run up again."
+)
+
+
+@contextlib.contextmanager
+def _cli_no_cloudflare(server: FakeServer, identity: Path):
+    """Like `_cli`, but also tracks whether CloudflareClient is ever constructed."""
+    with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(identity)}, clear=False):
+        os.environ.pop("STACKBASE_SRC", None)
+        cloudflare_class = mock.MagicMock(side_effect=lambda token: CloudflareClient(token, base_url=server.url))
+        with (
+            mock.patch("stackbase.__main__.HostingerClient", lambda token: HostingerClient(token, base_url=server.url)),
+            mock.patch("stackbase.__main__.CloudflareClient", cloudflare_class),
+            mock.patch("stackbase.reconcile.Ssh") as ssh_class,
+            mock.patch("stackbase.steps.execute") as execute,
+        ):
+            yield ssh_class, execute, cloudflare_class
+
+
+@unittest.skipUnless(_AGE_AVAILABLE, "age/age-keygen are not installed")
+class CloudflareOptionalTests(unittest.TestCase):
+    """Task 7b change 1, end-to-end: no cloudflare_token in secrets.age."""
+
+    def test_plan_without_a_cloudflare_token_prints_the_warning_and_makes_no_cloudflare_request(self) -> None:
+        with TemporaryDirectory() as tmp, FakeServer() as server:
+            infra_dir, identity = _project(Path(tmp), cloudflare_token=None)
+            server.script(
+                "GET",
+                f"/api/vps/v1/virtual-machines/{_VPS_ID}",
+                200,
+                {
+                    "id": _VPS_ID,
+                    "state": "running",
+                    "actions_lock": "unlocked",
+                    "firewall_group_id": None,
+                    "ipv4": [{"id": 1, "address": _IPV4}],
+                    "ipv6": None,
+                },
+            )
+            server.script("GET", "/api/vps/v1/public-keys?page=1", 200, {"data": [], "meta": _meta(0)})
+            server.script("GET", "/api/vps/v1/firewall?page=1", 200, {"data": [], "meta": _meta(0)})
+            stdout = io.StringIO()
+
+            with _cli_no_cloudflare(server, identity) as (_ssh_class, _execute, cloudflare_class):
+                with contextlib.redirect_stdout(stdout):
+                    main(["--infra-dir", str(infra_dir), "up", "--plan"])
+
+            cloudflare_class.assert_not_called()
+            output = stdout.getvalue()
+            self.assertIn(_NO_CLOUDFLARE_WARNING, output)
+            self.assertIn("would do:", output)
+            paths = [request["path"] for request in server.requests]
+            self.assertFalse(
+                any("/zones" in p or "dns_records" in p or "/ips" in p for p in paths),
+                f"a Cloudflare endpoint was hit with no token: {paths}",
+            )
+
+    def test_a_converged_stack_without_cloudflare_prints_the_warning_then_nothing_to_do(self) -> None:
+        with TemporaryDirectory() as tmp, FakeServer() as server:
+            infra_dir, identity = _project(Path(tmp), cloudflare_token=None)
+            (infra_dir / "known_hosts").write_text(f"{_IPV4} ssh-ed25519 AAAAhostkey\n", encoding="utf-8")
+            (infra_dir / "nodes" / "a").mkdir(parents=True)
+            (infra_dir / "nodes" / "a" / "hardware-configuration.nix").write_text("{ }\n", encoding="utf-8")
+
+            from stackbase.reconcile import local_facts
+
+            rev = local_facts(infra_dir, {}).desired_rev
+            (infra_dir / "stack.state.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "nodes": {
+                            "a": {
+                                "vps_id": _VPS_ID,
+                                "ipv4": _IPV4,
+                                "ipv6": None,
+                                "host_key_pinned": True,
+                                "hardware_captured": True,
+                                "applied_rev": rev,
+                            }
+                        },
+                        "cloudflare": {"zone_id": None, "record_id": None},
+                        "hostinger": {"firewall_id": 7, "ssh_key_ids": {"matt": 11}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            server.script(
+                "GET",
+                f"/api/vps/v1/virtual-machines/{_VPS_ID}",
+                200,
+                {
+                    "id": _VPS_ID,
+                    "state": "running",
+                    "actions_lock": "unlocked",
+                    "firewall_group_id": 7,
+                    "ipv4": [{"id": 1, "address": _IPV4}],
+                    "ipv6": None,
+                },
+            )
+            key = (infra_dir / "keys" / "matt.pub").read_text(encoding="utf-8").strip()
+            server.script(
+                "GET",
+                "/api/vps/v1/public-keys?page=1",
+                200,
+                {"data": [{"id": 11, "name": "matt", "key": key}], "meta": _meta(1)},
+            )
+            server.script(
+                "GET",
+                "/api/vps/v1/firewall?page=1",
+                200,
+                {
+                    "data": [
+                        {
+                            "id": 7,
+                            "name": "stackbase-acme",
+                            "rules": [
+                                {"id": 1, "protocol": "TCP", "port": "22", "source": "any", "source_detail": "any"},
+                                {"id": 2, "protocol": "TCP", "port": "443", "source": "any", "source_detail": "any"},
+                            ],
+                        }
+                    ],
+                    "meta": _meta(1),
+                },
+            )
+            stdout = io.StringIO()
+
+            with _cli_no_cloudflare(server, identity) as (ssh_class, execute, cloudflare_class):
+                with contextlib.redirect_stdout(stdout):
+                    main(["--infra-dir", str(infra_dir), "up"])
+
+            cloudflare_class.assert_not_called()
+            execute.assert_not_called()
+            ssh_class.assert_not_called()
+            output = stdout.getvalue()
+            self.assertIn(_NO_CLOUDFLARE_WARNING, output)
+            self.assertTrue(output.strip().endswith("nothing to do"))
+            self.assertEqual({request["method"] for request in server.requests}, {"GET"})
 
 
 @unittest.skipUnless(_AGE_AVAILABLE, "age/age-keygen are not installed")

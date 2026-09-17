@@ -303,6 +303,140 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(state, StackState())
 
 
+class CloudflareOptionalPlanTests(unittest.TestCase):
+    """Task 7b change 1: no Cloudflare token in secrets -> no cert, no DNS."""
+
+    def test_no_cloudflare_token_skips_cert_and_dns_but_keeps_provisioning(self) -> None:
+        local = replace(_local(), has_cloudflare_token=False)
+        observed = replace(_observed_fresh(), local=local)
+
+        actions = [step.action for step in plan(_config(), StackState(), observed)]
+
+        self.assertNotIn(Action.ENSURE_ORIGIN_CERT, actions)
+        self.assertNotIn(Action.UPSERT_DNS, actions)
+        self.assertIn(Action.SETUP, actions)
+        self.assertIn(Action.PUSH_CONFIG, actions)
+        self.assertIn(Action.REBUILD, actions)
+
+    def test_converged_stack_without_a_cloudflare_token_plans_nothing(self) -> None:
+        local = replace(
+            _local(rev=_REV, has_origin_cert=False, pinned=(_IPV4,), captured=("a",)),
+            has_cloudflare_token=False,
+        )
+        observed = replace(
+            _converged_observed(),
+            local=local,
+            zone_id=None,
+            zone_name=None,
+            record_id=None,
+            record_matches=False,
+        )
+        state = _converged_state()
+        state.cloudflare = CloudflareState()
+
+        self.assertEqual(plan(_config(), state, observed), [])
+
+    def test_adding_a_cloudflare_token_later_replans_cert_push_and_dns_in_one_run(self) -> None:
+        """The applied_rev/convergence logic must not hide the now-needed cert push."""
+        no_cf_local = replace(
+            _local(rev=_REV, has_origin_cert=False, pinned=(_IPV4,), captured=("a",)),
+            has_cloudflare_token=False,
+        )
+        state = _converged_state()
+        state.cloudflare = CloudflareState()
+        no_cf_observed = replace(
+            _converged_observed(),
+            local=no_cf_local,
+            zone_id=None,
+            zone_name=None,
+            record_id=None,
+            record_matches=False,
+        )
+        self.assertEqual(plan(_config(), state, no_cf_observed), [], "sanity: converged without the token")
+
+        with_cf_local = replace(no_cf_local, has_cloudflare_token=True)
+        with_cf_observed = replace(_converged_observed(), local=with_cf_local)
+
+        actions = [step.action for step in plan(_config(), state, with_cf_observed)]
+
+        self.assertEqual(
+            actions,
+            [Action.ENSURE_ORIGIN_CERT, Action.PUSH_CONFIG, Action.REBUILD, Action.UPSERT_DNS],
+        )
+
+
+class SetupForcesRepinTests(unittest.TestCase):
+    """Task 7b change 2 (parked review finding): SETUP planned -> PIN_HOST_KEY and
+    CAPTURE_HARDWARE planned too, even when the node was previously pinned and
+    captured and nothing about the local disk looks stale.
+    """
+
+    def test_reinstall_of_a_previously_pinned_and_captured_node_forces_repin_and_recapture(self) -> None:
+        state = _converged_state(rev="old-rev")
+        observed = replace(
+            _converged_observed(rev=_REV),
+            nodes={"a": replace(_converged_observed().nodes["a"], state="initial")},
+        )
+
+        actions = [step.action for step in plan(_config(), state, observed)]
+
+        self.assertEqual(
+            actions,
+            [
+                Action.SETUP,
+                Action.WAIT_RUNNING,
+                Action.PIN_HOST_KEY,
+                Action.CAPTURE_HARDWARE,
+                Action.PUSH_CONFIG,
+                Action.REBUILD,
+            ],
+        )
+        pin_index = actions.index(Action.PIN_HOST_KEY)
+        capture_index = actions.index(Action.CAPTURE_HARDWARE)
+        push_index = actions.index(Action.PUSH_CONFIG)
+        self.assertLess(pin_index, capture_index)
+        self.assertLess(capture_index, push_index)
+
+
+class AdoptInitialStateTests(unittest.TestCase):
+    """Task 7b change 3: an adopted VM still in state 'initial' must get SETUP
+    (and everything after it) in the same run, not ADOPT + a WAIT_RUNNING that
+    would sit out the 15-minute timeout waiting on a transition that will
+    never happen without SETUP.
+    """
+
+    def test_adopted_vm_in_initial_state_plans_setup_in_the_same_run(self) -> None:
+        cfg = _config(nodes={"a": Node(name="a", role="primary", vps_id=None)})
+        observed = replace(
+            _observed_fresh(),
+            nodes={"a": ObservedNode(vps_id=4321, state="initial", actions_lock="unlocked", adopted=True)},
+        )
+
+        actions = [step.action for step in plan(cfg, StackState(), observed)]
+
+        self.assertIn(Action.ADOPT, actions)
+        self.assertIn(Action.SETUP, actions)
+        self.assertLess(actions.index(Action.ADOPT), actions.index(Action.SETUP))
+        self.assertIn(Action.PIN_HOST_KEY, actions)
+        self.assertIn(Action.CAPTURE_HARDWARE, actions)
+
+    def test_adopted_vm_already_running_never_gets_setup(self) -> None:
+        cfg = _config(nodes={"a": Node(name="a", role="primary", vps_id=None)})
+        observed = replace(
+            _observed_fresh(),
+            nodes={
+                "a": ObservedNode(
+                    vps_id=4321, state="running", actions_lock="unlocked", ipv4=_IPV4, adopted=True
+                )
+            },
+        )
+
+        actions = [step.action for step in plan(cfg, StackState(), observed)]
+
+        self.assertIn(Action.ADOPT, actions)
+        self.assertNotIn(Action.SETUP, actions)
+
+
 # --------------------------------------------------------------------------
 # observe() -- GET only
 # --------------------------------------------------------------------------
@@ -413,6 +547,32 @@ class ObserveTests(unittest.TestCase):
                 [request["path"] for request in server.requests],
             )
             self.assertIn(Action.PURCHASE, [s.action for s in plan(cfg, StackState(), observed)])
+
+    def test_observe_with_no_cloudflare_client_issues_no_cloudflare_requests(self) -> None:
+        """Task 7b change 1: with `cloudflare=None`, observe() must not do a
+        zone lookup, an A-record lookup, or the /ips range check.
+        """
+        with FakeServer() as server:
+            server.script("GET", f"/api/vps/v1/virtual-machines/{_VPS_ID}", 200, _vm_body())
+            server.script("GET", "/api/vps/v1/public-keys?page=1", 200, {"data": [], "meta": _meta(0)})
+            server.script("GET", "/api/vps/v1/firewall?page=1", 200, {"data": [], "meta": _meta(0)})
+            hostinger = HostingerClient("htok", base_url=server.url)
+
+            local = replace(_local(), has_cloudflare_token=False)
+            observed = observe(_config(), StackState(), hostinger, None, local=local)
+
+            paths = [r["path"] for r in server.requests]
+            self.assertFalse(
+                any("/zones" in p or "dns_records" in p or "/ips" in p for p in paths),
+                f"observe() with no Cloudflare client made a Cloudflare request: {paths}",
+            )
+            self.assertIsNone(observed.zone_id)
+            self.assertIsNone(observed.zone_name)
+            self.assertIsNone(observed.record_id)
+            self.assertFalse(observed.record_matches)
+            self.assertEqual(observed.cloudflare_ip_warnings, [])
+            # The rest of observe() still runs normally.
+            self.assertEqual(observed.nodes["a"].ipv4, _IPV4)
 
 
 class AdoptionTests(unittest.TestCase):
@@ -1016,6 +1176,29 @@ class PushConfigTests(unittest.TestCase):
             self.assertIn("--exclude=.git", src_rsync["argv"])
             self.assertIn("--exclude=.superpowers", src_rsync["argv"])
 
+    def test_it_skips_the_cert_push_without_a_cloudflare_token(self) -> None:
+        """Task 7b change 1: no cloudflare_token -> PUSH_CONFIG uploads the
+        config but never touches the origin cert; the node keeps its
+        self-signed placeholder (generated by the NixOS module).
+        """
+        with Infra() as infra_dir:
+            state = StackState(nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)})
+            secrets = {"hostinger_token": "htok"}  # no cloudflare_token, no cert/key
+            ctx, lines = _context(
+                infra_dir,
+                state=state,
+                secrets=secrets,
+                runner=FakeRunner(default=_cp(["ssh"], stdout="")),
+            )
+
+            apply([Step(Action.PUSH_CONFIG, "a")], ctx, allow_purchase=False)
+
+            ssh_calls = [call for call in ctx.runner.calls if call["argv"][0] == "ssh"]
+            self.assertEqual(ssh_calls, [], "no cert-push ssh commands should run without a Cloudflare token")
+            rsync_calls = [call for call in ctx.runner.calls if call["argv"][0] == "rsync"]
+            self.assertEqual(len(rsync_calls), 1)
+            self.assertTrue(any("self-signed" in line or "no Cloudflare" in line for line in lines))
+
 
 class RebuildTests(unittest.TestCase):
     def _ctx(self, infra_dir: Path, popen: FakePopen, **kwargs):
@@ -1312,6 +1495,110 @@ class OriginCertOwnershipTests(unittest.TestCase):
                     self.assertNotIn("|| true", call["argv"][-1])
 
 
+class SetupReinstallEndToEndTests(unittest.TestCase):
+    """Task 7b change 2, end-to-end: a previously-pinned, previously-captured
+    node whose VM is observed back in state 'initial' must re-pin and
+    re-capture in the same run as SETUP -- not silently skip both and hand
+    CAPTURE_HARDWARE an ssh connection to a host that was never re-pinned.
+    """
+
+    def test_reinstalled_node_completes_setup_wait_pin_capture_push_rebuild_in_one_run(self) -> None:
+        def handler(argv, kwargs):
+            joined = " ".join(argv)
+            if argv[0] == "ssh-keyscan":
+                return _cp(argv, stdout=f"{_IPV4} ssh-ed25519 AAAAnewkeybody\n")
+            if "basename" in joined:
+                return _cp(argv, stdout=f"{_HARDWARE}\n")
+            if "cat --" in joined and "hardware-configuration.nix" in joined:
+                return _cp(argv, stdout=b'{ fileSystems."/" = { }; }\n')
+            if "cat --" in joined and "configuration.nix" in joined:
+                return _cp(argv, stdout=b"{ }\n")
+            return None
+
+        with Infra() as infra_dir:
+            (infra_dir / "known_hosts").write_text(f"{_IPV4} ssh-ed25519 AAAAoldkeybody\n", encoding="utf-8")
+
+            state = StackState(
+                nodes={
+                    "a": NodeState(
+                        vps_id=_VPS_ID,
+                        ipv4=_IPV4,
+                        ipv6=_IPV6,
+                        host_key_pinned=True,
+                        hardware_captured=True,
+                        applied_rev="old-rev",
+                    )
+                },
+                cloudflare=CloudflareState(zone_id="zone1", record_id="rec1"),
+                hostinger=HostingerState(firewall_id=7, ssh_key_ids={"matt": 11, "kim": 12}),
+            )
+            observed = replace(
+                _converged_observed(rev=_REV),
+                nodes={"a": replace(_converged_observed().nodes["a"], state="initial")},
+            )
+
+            steps = plan(_config(), state, observed)
+            self.assertEqual(
+                [s.action for s in steps],
+                [
+                    Action.SETUP,
+                    Action.WAIT_RUNNING,
+                    Action.PIN_HOST_KEY,
+                    Action.CAPTURE_HARDWARE,
+                    Action.PUSH_CONFIG,
+                    Action.REBUILD,
+                ],
+            )
+
+            secrets = {
+                "hostinger_token": "htok",
+                "cloudflare_token": "ctok",
+                "origin_cert": _CERT_PEM,
+                "origin_key": _KEY_PEM,
+            }
+            with FakeServer() as server:
+                server.script("GET", "/api/vps/v1/templates", 200, [{"id": 1130, "name": "NixOS 26.05"}])
+                server.script("GET", "/api/vps/v1/data-centers", 200, [{"id": 21, "name": "kul"}])
+                server.script("POST", f"/api/vps/v1/virtual-machines/{_VPS_ID}/setup", 200, {})
+                server.script("POST", f"/api/vps/v1/public-keys/attach/{_VPS_ID}", 200, {})
+                server.script("GET", f"/api/vps/v1/virtual-machines/{_VPS_ID}", 200, _vm_body())
+
+                popen = FakePopen()
+                popen.script(0, "building...\n")
+                popen.script(0, "switching...\n")
+
+                ctx, lines = _context(
+                    infra_dir,
+                    state=state,
+                    secrets=secrets,
+                    observed=observed,
+                    server=server,
+                    popen=popen,
+                    runner=FakeRunner(handler=handler, default=_cp(["ssh"], stdout="")),
+                )
+
+                apply(steps, ctx, allow_purchase=False)
+
+            # SETUP unpinned and un-captured; PIN_HOST_KEY / CAPTURE_HARDWARE
+            # then re-established both -- the run finishes fully converged.
+            self.assertTrue(ctx.state.nodes["a"].host_key_pinned)
+            self.assertTrue(ctx.state.nodes["a"].hardware_captured)
+            self.assertIsNotNone(ctx.state.nodes["a"].applied_rev)
+
+            known_hosts_text = (infra_dir / "known_hosts").read_text(encoding="utf-8")
+            self.assertNotIn("AAAAoldkeybody", known_hosts_text)
+            self.assertIn("AAAAnewkeybody", known_hosts_text)
+
+            # Every ssh/rsync call (CAPTURE_HARDWARE, PUSH_CONFIG, REBUILD's
+            # probe) must come strictly after the ssh-keyscan that re-pinned
+            # the host in PIN_HOST_KEY.
+            runner_calls = ctx.runner.calls
+            first_keyscan = next(i for i, c in enumerate(runner_calls) if c["argv"][0] == "ssh-keyscan")
+            for i, call in enumerate(runner_calls):
+                if call["argv"][0] in ("ssh", "rsync"):
+                    self.assertGreater(i, first_keyscan, f"ssh/rsync call before the re-pin: {call['argv']}")
+
+
 class ConvergenceAfterAFullRunTests(unittest.TestCase):
     def test_a_finished_run_leaves_the_node_up_to_date(self) -> None:
         """CAPTURE_HARDWARE writes into infra/ -- which is part of what gets pushed.
@@ -1451,6 +1738,12 @@ class OutputTests(unittest.TestCase):
 
 
 class LocalFactsTests(unittest.TestCase):
+    def test_has_cloudflare_token_true_only_for_a_non_empty_token(self) -> None:
+        with Infra() as infra_dir:
+            self.assertTrue(local_facts(infra_dir, {"cloudflare_token": "ctok"}).has_cloudflare_token)
+            self.assertFalse(local_facts(infra_dir, {}).has_cloudflare_token)
+            self.assertFalse(local_facts(infra_dir, {"cloudflare_token": ""}).has_cloudflare_token)
+
     def test_the_rev_changes_when_a_pushed_file_changes(self) -> None:
         with Infra() as infra_dir:
             first = local_facts(infra_dir, {}).desired_rev

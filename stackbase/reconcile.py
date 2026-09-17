@@ -148,6 +148,13 @@ class Local:
     has_origin_cert: bool
     pinned_hosts: frozenset[str]
     captured_nodes: frozenset[str]
+    # True when `secrets.age` decrypted to a non-empty "cloudflare_token".
+    # Cloudflare is optional (Task 7b): with no token, `observe()` is never
+    # given a `CloudflareClient` and `plan()` must not emit ENSURE_ORIGIN_CERT
+    # or UPSERT_DNS. Defaults to True so every existing caller that builds a
+    # `Local` without naming this field keeps today's (token-present)
+    # behaviour byte-for-byte.
+    has_cloudflare_token: bool = True
 
 
 def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str | None = None) -> Local:
@@ -161,6 +168,7 @@ def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str 
         has_origin_cert=bool(secrets.get("origin_cert")) and bool(secrets.get("origin_key")),
         pinned_hosts=_pinned_hosts(infra_dir / "known_hosts"),
         captured_nodes=_captured_nodes(infra_dir / "nodes"),
+        has_cloudflare_token=bool(secrets.get("cloudflare_token")),
     )
 
 
@@ -418,7 +426,7 @@ def observe(
     cfg: StackConfig,
     state: StackState,
     hostinger: HostingerClient,
-    cloudflare: CloudflareClient,
+    cloudflare: CloudflareClient | None,
     *,
     local: Local,
 ) -> Observed:
@@ -427,6 +435,12 @@ def observe(
     `local` carries the facts that come from the operator's own disk (see
     `local_facts`); it is passed in rather than gathered here so that
     `observe` stays purely the network-reading half.
+
+    `cloudflare` is `None` when `secrets.age` has no Cloudflare token (Task
+    7b: Cloudflare is optional). In that case NOT ONE Cloudflare request is
+    made -- no zone lookup, no A-record lookup, no `/ips` range check -- and
+    the Cloudflare-shaped fields on the returned `Observed` are left at their
+    "nothing configured yet" defaults.
     """
     unresolved_nodes = [
         name
@@ -444,11 +458,15 @@ def observe(
     firewall_id = firewall.get("id") if firewall else None
     rules_match = bool(firewall) and _rule_keys(firewall.get("rules") or []) == _rule_keys(desired_firewall_rules())
 
-    zone_id, zone_name = cloudflare.zone_for(cfg.domain)
-    expected_ip = _expected_primary_ip(cfg, state, nodes)
-    record_id, record_matches = _observe_record(cloudflare, zone_id, cfg.domain, expected_ip)
-
-    cloudflare_ip_warnings = _cloudflare_ip_warnings(cloudflare)
+    if cloudflare is None:
+        zone_id = zone_name = record_id = None
+        record_matches = False
+        cloudflare_ip_warnings: list[str] = []
+    else:
+        zone_id, zone_name = cloudflare.zone_for(cfg.domain)
+        expected_ip = _expected_primary_ip(cfg, state, nodes)
+        record_id, record_matches = _observe_record(cloudflare, zone_id, cfg.domain, expected_ip)
+        cloudflare_ip_warnings = _cloudflare_ip_warnings(cloudflare)
 
     return Observed(
         local=local,
@@ -623,7 +641,11 @@ def plan(cfg: StackConfig, state: StackState, observed: Observed) -> list[Step]:
     for name, node in cfg.nodes.items():
         steps.extend(_provisioning_steps(state, observed, name, node))
 
-    cert_pending = not observed.local.has_origin_cert
+    # Cloudflare is optional (Task 7b): with no token, `observed.local` says
+    # so and neither the origin cert nor DNS is ever planned -- the node
+    # keeps its self-signed placeholder cert and is reachable by IP/SSH only.
+    has_cloudflare = observed.local.has_cloudflare_token
+    cert_pending = has_cloudflare and not observed.local.has_origin_cert
     if cert_pending:
         steps.append(Step(Action.ENSURE_ORIGIN_CERT))
 
@@ -632,7 +654,7 @@ def plan(cfg: StackConfig, state: StackState, observed: Observed) -> list[Step]:
             steps.append(Step(Action.PUSH_CONFIG, name))
             steps.append(Step(Action.REBUILD, name))
 
-    if not _dns_converged(state, observed):
+    if has_cloudflare and not _dns_converged(state, observed):
         steps.append(Step(Action.UPSERT_DNS, primary_node(cfg)))
 
     return steps
@@ -650,6 +672,16 @@ def _provisioning_steps(state: StackState, observed: Observed, name: str, node: 
     node_state = state.nodes.get(name) or NodeState()
     seen = observed.nodes.get(name) or ObservedNode()
     steps: list[Step] = []
+    # True whenever SETUP gets planned for this node below (whether it's a
+    # known vps_id whose VM is back in state "initial", or a just-adopted
+    # one that was never installed). A SETUP stack-base performs itself
+    # reinstalls the box: the host key WILL change and any previously
+    # captured hardware files describe a machine that no longer exists, so
+    # both PIN_HOST_KEY and CAPTURE_HARDWARE must be planned in the same
+    # run regardless of what the (now-stale) "already converged" checks
+    # below would otherwise conclude. See `steps._setup`, which unpins the
+    # host key and clears `hardware_captured` for exactly this reason.
+    setup_planned = False
 
     vps_id = node.vps_id or node_state.vps_id
     if vps_id is None:
@@ -658,10 +690,19 @@ def _provisioning_steps(state: StackState, observed: Observed, name: str, node: 
             # likely a PURCHASE whose response never made it back) -- record
             # it rather than buying a second server.
             steps.append(Step(Action.ADOPT, name))
+            if seen.state == "initial":
+                # The adopted VM was never installed. Plan SETUP (and
+                # everything after it) in this same run rather than ADOPT +
+                # a bare WAIT_RUNNING, which would sit out the 15-minute
+                # running timeout waiting for a state transition that will
+                # never happen without SETUP.
+                steps.append(Step(Action.SETUP, name))
+                setup_planned = True
         else:
             steps.append(Step(Action.PURCHASE, name))
     elif seen.state == "initial":
         steps.append(Step(Action.SETUP, name))
+        setup_planned = True
 
     running = seen.state == "running" and seen.actions_lock == "unlocked"
     if steps or not running or not node_state.ipv4 or node_state.ipv4 != seen.ipv4:
@@ -678,17 +719,20 @@ def _provisioning_steps(state: StackState, observed: Observed, name: str, node: 
     # PIN_HOST_KEY is replanned when: it was never pinned; the recorded IP
     # isn't in known_hosts; the OBSERVED IP differs from the recorded one
     # (the server moved -- a new IP means a host key that was never pinned
-    # for that address); or the observed IP itself isn't in known_hosts yet.
+    # for that address); the observed IP itself isn't in known_hosts yet;
+    # or SETUP was just planned (a reinstall we caused invalidates whatever
+    # was pinned before, even if it still looks valid by every other check).
     ip_drifted = bool(seen.ipv4) and seen.ipv4 != node_state.ipv4
     known_ips = {ip for ip in (node_state.ipv4, seen.ipv4) if ip}
     if (
         not node_state.host_key_pinned
         or ip_drifted
+        or setup_planned
         or any(ip not in observed.local.pinned_hosts for ip in known_ips)
     ):
         steps.append(Step(Action.PIN_HOST_KEY, name))
 
-    if not node_state.hardware_captured or name not in observed.local.captured_nodes:
+    if not node_state.hardware_captured or setup_planned or name not in observed.local.captured_nodes:
         steps.append(Step(Action.CAPTURE_HARDWARE, name))
 
     return steps
@@ -730,7 +774,7 @@ class Context:
     state: StackState
     secrets: dict[str, str]
     hostinger: HostingerClient
-    cloudflare: CloudflareClient
+    cloudflare: CloudflareClient | None
     observed: Observed
     stackbase_src: str | None = None
     runner: Any = subprocess.run

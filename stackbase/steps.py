@@ -136,6 +136,12 @@ def _setup(ctx: Context, step: Step) -> str:
         if node_state.ipv4:
             ctx.ssh(node).unpin_host_key()
         node_state.host_key_pinned = False
+    # Same reasoning for the hardware files: a reinstall means whatever
+    # `infra/nodes/<node>/` holds now describes a machine that no longer
+    # exists. `plan()` always plans CAPTURE_HARDWARE alongside SETUP (see
+    # `reconcile._provisioning_steps`), but clearing the flag here too keeps
+    # this step honest on its own, independent of that caller.
+    node_state.hardware_captured = False
     return f"node {node}: NixOS installed on virtual machine {vps_id}"
 
 
@@ -354,6 +360,13 @@ def _push_config(ctx: Context, step: Step) -> str:
     ssh.rsync_to(ctx.infra_dir, REMOTE_CONFIG_DIR, delete=True, exclude=list(PUSH_EXCLUDES))
     if ctx.stackbase_src:
         ssh.rsync_to(ctx.stackbase_src, REMOTE_SRC_DIR, delete=True, exclude=list(SRC_EXCLUDES))
+
+    # Cloudflare is optional (Task 7b). With no token there is no origin
+    # cert to push -- `plan()` never plans ENSURE_ORIGIN_CERT in that case
+    # either -- so the node just keeps the self-signed placeholder cert its
+    # own NixOS module generates.
+    if not ctx.secrets.get("cloudflare_token"):
+        return f"node {node}: configuration uploaded (no Cloudflare token -- keeping the self-signed placeholder cert)"
 
     _push_origin_cert(ctx, ssh)
     return f"node {node}: configuration and origin certificate uploaded"

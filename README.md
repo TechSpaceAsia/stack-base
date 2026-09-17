@@ -26,12 +26,17 @@ You also need:
 
 - **A Hostinger API token** (hPanel → account → API). It buys and manages the
   servers.
-- **A Cloudflare API token** with these permissions, scoped to your zone:
-  **Zone → DNS → Edit** and **Zone → SSL and Certificates → Edit**.
-- **Your Cloudflare zone set to Full (strict) SSL mode.** stack-base installs
-  a Cloudflare origin certificate on the server; Full (strict) is the setting
-  that makes Cloudflare actually check it. "Flexible" would leave the traffic
-  between Cloudflare and your server unencrypted.
+- **A Cloudflare API token** (optional) with these permissions, scoped to your
+  zone: **Zone → DNS → Edit** and **Zone → SSL and Certificates → Edit**.
+  Leave it out and stack-base still stands up the server — it just skips DNS
+  and the TLS origin certificate, so the server is only reachable by its bare
+  IP over SSH. Add the token later and run `./infra/up` again to fill both
+  in.
+- **Your Cloudflare zone set to Full (strict) SSL mode** (only if you're using
+  Cloudflare). stack-base installs a Cloudflare origin certificate on the
+  server; Full (strict) is the setting that makes Cloudflare actually check
+  it. "Flexible" would leave the traffic between Cloudflare and your server
+  unencrypted.
 - **An SSH key** (`~/.ssh/id_ed25519.pub`, or run `ssh-keygen -t ed25519`).
 
 ## First run, step by step
@@ -56,11 +61,14 @@ age-keygen -y ~/.age/key.txt                      # prints your PUBLIC key
 Paste that public key into `infra/age-recipients.txt`, one per line.
 
 **4. Create the secrets file.** Set the two variables, then run the command
-as-is:
+as-is. `CLOUDFLARE_TOKEN` is optional — leave it empty (`CLOUDFLARE_TOKEN=`)
+to skip DNS and the TLS origin certificate for now; the server is still
+provisioned, just reachable by IP/SSH only until you add the token and run
+`./infra/up` again:
 
 ```bash
 HOSTINGER_TOKEN=<paste here>
-CLOUDFLARE_TOKEN=<paste here>
+CLOUDFLARE_TOKEN=<paste here, or leave empty>
 printf '{"hostinger_token": "%s", "cloudflare_token": "%s"}' \
   "$HOSTINGER_TOKEN" "$CLOUDFLARE_TOKEN" \
   | age -R infra/age-recipients.txt -o infra/secrets.age

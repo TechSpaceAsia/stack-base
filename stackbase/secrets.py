@@ -78,9 +78,10 @@ def load_secrets(infra_dir: Path) -> dict[str, str]:
         # runs -- never type those in by hand.
         raise StackError(
             f"{secrets_path} not found",
-            "create it with:\n"
+            "create it with (CLOUDFLARE_TOKEN is optional -- leave it empty to skip DNS and the "
+            "TLS origin certificate; the server is then reachable by IP/SSH only):\n"
             "HOSTINGER_TOKEN=<paste here>\n"
-            "CLOUDFLARE_TOKEN=<paste here>\n"
+            "CLOUDFLARE_TOKEN=<paste here, or leave empty>\n"
             'printf \'{"hostinger_token": "%s", "cloudflare_token": "%s"}\' '
             '"$HOSTINGER_TOKEN" "$CLOUDFLARE_TOKEN" '
             f"| age -R {recipients_path} -o {secrets_path}",
