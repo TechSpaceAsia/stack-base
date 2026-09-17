@@ -18,6 +18,7 @@
         self.nixosModules.base
         self.nixosModules.appHost
         self.nixosModules.postgres
+        self.nixosModules.deploy
       ];
     in
     {
@@ -25,6 +26,7 @@
       nixosModules.appHost = import ./nixos/app-host.nix;
       nixosModules.postgres = import ./nixos/postgres.nix;
       nixosModules.hostinger = import ./nixos/providers/hostinger.nix;
+      nixosModules.deploy = import ./nixos/deploy.nix;
       nixosModules.default = { imports = baseModules; };
 
       # `provider` selects the module that reproduces one hosting provider's
@@ -49,6 +51,9 @@
           ] ++ modules;
         };
 
-      checks.${system}.vm = import ./tests/vm.nix { inherit self pkgs lib; };
+      checks.${system} = {
+        vm = import ./tests/vm.nix { inherit self pkgs lib; };
+        vm-deploy = import ./tests/vm-deploy.nix { inherit self pkgs lib; };
+      };
     };
 }
