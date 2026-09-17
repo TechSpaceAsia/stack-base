@@ -238,6 +238,13 @@ def ci_setup(
     emit(f"  3. mkdir -p .github/workflows && cp {_WORKFLOW_TEMPLATE} .github/workflows/deploy-stack.yml")
     emit("     git add .github/workflows/deploy-stack.yml && git commit -m 'ci: add the deploy workflow'")
     if rotate:
-        emit(f"  The OLD key keeps working until step 2 (./infra/up) above has actually run.")
+        # M5: the GitHub secret was already replaced above, immediately --
+        # not step 2. Until step 1 is committed AND step 2 has installed the
+        # new public half on every server, CI deploys will fail outright
+        # (the runner now offers the NEW private key; every server still
+        # only trusts the OLD public one). Laptop deploys using a
+        # teammate's own key are unaffected either way.
+        emit("  CI deploys will FAIL (wrong key) until steps 1 and 2 above have both completed --")
+        emit("  the GitHub secret was already replaced, just now. Laptop deploys are unaffected.")
     emit("To turn CI deploys back off:")
     emit(f"  rm {pub_path} && ./infra/up && gh secret delete {SECRET_NAME} --repo {repo_slug}")

@@ -208,6 +208,93 @@ performs, so a mistake is caught here, not on the next `up`.
 Key names must match `^[a-z][a-z0-9_]{0,40}$` — lowercase letters, digits,
 and underscores, starting with a letter.
 
+## Releasing a version
+
+Once a server is up (`./infra/up` has completed at least once), you ship
+application code with `./infra/up deploy`, `./infra/up rollback`, and
+`./infra/up status`. These are a separate concern from `./infra/up` itself:
+`up` makes the SERVER match `stack.toml`; `deploy` puts a RELEASE of your
+app on it, blue/green, with zero downtime.
+
+**Before your first deploy:**
+
+- `./infra/up` must have completed at least once (the server, its `deploy`
+  user, and the systemd units a release runs under all come from that).
+- Set `app_env` and push it — `./infra/up secrets edit app_env` then
+  `./infra/up` — **before** your first `deploy`. Without it the app starts
+  with no `DATABASE_URL` (or whatever else it needs) and fails its own
+  health check, so the deploy is refused. See
+  [The app's environment](#the-apps-environment-app_env) above.
+- `/` answers 502 until the first release goes live — that's expected, not
+  a bug: nothing is listening on the app socket yet.
+
+**The flow:**
+
+```bash
+git tag v1.2.3       # on a commit whose Cargo.toml says version = "1.2.3"
+git push origin v1.2.3
+./infra/up deploy v1.2.3
+```
+
+`deploy` builds a clean, deterministic release from that tag (a fresh `git
+worktree`, never your working tree — the same build a GitHub Actions
+deploy runs, see [below](#deploying-from-github-actions-optional)), uploads
+it, starts it on the currently-idle color, health-checks it, and only THEN
+atomically switches traffic — nginx never serves a half-started release.
+The old color keeps running for
+`drainSeconds` (60s by default) so in-flight requests finish, then stops.
+Releases are pruned to the newest 5 by SemVer after every successful
+deploy (a release either color is currently linked to is never pruned,
+even if it ranks below the cutoff).
+
+```bash
+./infra/up status      # what's live on every node, right now
+./infra/up rollback     # swap back to the previously-active release
+```
+
+**What `rollback` does NOT do: it does not roll back the database.**
+Migrations run at app startup and are never undone by a rollback — this is
+why every migration must be additive-only (expand the schema → migrate the
+data → drop/rename the old column in a LATER release, once nothing depends
+on it anymore). A migration that isn't additive can break the
+currently-live color mid-swap, since both the new and old release's code
+run against the same database during the swap window.
+
+**Exit codes**, from the restricted `deploy@` SSH door (`upload`/`deploy`/
+`rollback` all use these):
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| 0 | ok | nothing |
+| 1 | failure (bad health check, build error, ...) | the output above names it — fix and re-run; nothing was switched |
+| 2 | usage error (bad version string, wrong argument count) | fix the command and re-run |
+| 3 | another deploy is already in progress on that node | wait for it to finish, then re-run |
+| 4 | this version already exists on that node with DIFFERENT content | a published version must never change — bump the version, tag, and deploy that instead; there is deliberately no `--force` over ssh |
+
+`--node <name>` restricts a `deploy`/`rollback`/`status` call to one node
+instead of every node in `stack.toml`.
+
+**What a replica is TODAY.** Every node — primary or replica — runs its
+own LOCAL, initially-empty Postgres; DNS only ever points at the primary.
+Deploying to replicas first (the default order: replicas, then primary) is
+a smoke test against a DIFFERENT database, not a test of real replicated
+traffic — actual database replication is a later piece of work, not
+something `deploy` does today. Don't rely on a replica's deploy succeeding
+as proof the primary's data will behave the same way.
+
+**Writable paths for the app.** The release tree under `/opt/<project>` is
+read-only to the app. `/var/lib/<project>` (systemd's `StateDirectory=`,
+owned by the app user, mode 0750) is the one place for uploads or other
+local files the app needs to persist — see
+[What the files are](#what-the-files-are)-style caveats: it's per NODE, not
+shared between blue/green or between nodes, and it is not backed up yet.
+
+**Long-lived requests and the old color.** SSE streams and other
+long-running requests on the OLD color are cut when it stops, `drainSeconds`
+after the swap (and, failing a graceful stop within `TimeoutStopSec`,
+force-killed). A client reconnecting picks up the new color; there's no
+in-place migration of an open connection.
+
 ## Deploying from GitHub Actions (optional)
 
 Deploys (`./infra/up deploy vX.Y.Z`) normally run from a laptop, over the
@@ -243,11 +330,20 @@ cp <stack-base checkout>/templates/github/deploy-stack.yml .github/workflows/dep
 git add .github/workflows/deploy-stack.yml && git commit -m "ci: add the deploy workflow"
 ```
 
-**Rotate it** with `./infra/up ci-setup --rotate`, then commit the new
-`infra/keys/ci-deploy.pub` and run `./infra/up` — the OLD key keeps working
-on every server until that `./infra/up` has actually completed (it's what
-removes the old key from `stackbase.deploy.keys`), so there's no window
-where deploys are broken mid-rotation.
+**Rotate it** with `./infra/up ci-setup --rotate` — this replaces the
+GitHub Actions secret (`STACK_DEPLOY_KEY`) **immediately**. There IS a
+window where CI deploys are broken: GitHub Actions is now offering the NEW
+private key, but every server still only trusts the OLD public one, until
+you commit the new `infra/keys/ci-deploy.pub` and run `./infra/up` (which
+is what installs the new key on every server):
+
+```bash
+git add infra/keys/ci-deploy.pub && git commit -m "ci: rotate the CI deploy key"
+./infra/up                 # installs the new key on every server -- CI deploys work again after this
+```
+
+Laptop deploys using a teammate's own key are unaffected either way — only
+the `ci-deploy` entry changes.
 
 **Turn it off:**
 
@@ -310,8 +406,9 @@ rather pipe the whole value in from a script or a file — see
 At minimum a platform-base app needs: `DATABASE_URL` (`postgres:///<project>`
 — peer auth over the Unix socket, no password), a session secret and a CSRF
 secret, and the OAuth client id/secret/redirect URL. Check the project's own
-`.env.example` for anything else it expects. Do **not** put `SOCKET_PATH` in
-`app_env` — the systemd unit sets that itself, per color.
+`.env.example` for anything else it expects. `SOCKET_PATH` is reserved — the
+systemd unit sets it itself, per color, and `secrets set`/`secrets edit`/`up`
+all refuse an `app_env` that tries to set it.
 
 **What `./infra/up` does with it:** the whole value, and every individual
 `KEY=value` line inside it, are redacted from every line stack-base prints —
@@ -364,6 +461,10 @@ Every failure is one line: what went wrong, then what to check.
 | `infra/flake.lock is missing` | First run against an unpublished stack-base: set `STACKBASE_SRC` (below) |
 | `app_env has a line that is not KEY=value` | Fix the offending line in `app_env` and re-encrypt `secrets.age` — see [The app's environment](#the-apps-environment-app_env) |
 | `node a has no '<project>' group yet` | Run `./infra/up` again once REBUILD has completed for that node at least once — the group is created by the first rebuild |
+| `infra/secrets.age's 'app_env' sets 'SOCKET_PATH', which is reserved` | Remove that line from `app_env` — the systemd unit sets it itself, per color |
+| Too many authentication failures / connection refused right after a deploy attempt | Your `ssh-agent` is probably offering more keys than the node's `MaxAuthTries` allows before the right one is tried, and fail2ban has banned you. Set `STACKBASE_SSH_IDENTITY=~/.ssh/id_ed25519` (or add an `IdentitiesOnly yes` `Host` block to `~/.ssh/config`) so only your real key is offered. To recover from an existing ban: wait 10 minutes, or unban yourself from hPanel's browser console with `fail2ban-client set sshd unbanip <your-ip>` |
+| `this server's default binary name` (during `deploy`) | Your crate's binary name doesn't match `<project>` with `-` → `_`. Add `[app] binary = "..."` to `stack.toml` (the message gives the exact value) and run `./infra/up` before deploying again |
+| Cargo.toml declares several `[[bin]]` entries and stack.toml has no `[app].binary` | Ambiguous — add `[app] binary = "..."` to `stack.toml`, choosing one of the listed candidates |
 
 A failed run changes nothing further and can always simply be run again: it
 picks up exactly where it stopped.

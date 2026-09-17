@@ -168,6 +168,32 @@ class CiSetupHappyPathTests(unittest.TestCase):
             pub_path = infra_dir / "keys" / "ci-deploy.pub"
             self.assertEqual(pub_path.read_text(encoding="utf-8"), _PUBLIC_KEY_BODY.strip() + "\n")
 
+    def test_rotate_warns_that_ci_deploys_break_until_commit_and_up(self) -> None:
+        """M5: the GitHub secret is replaced immediately by `gh secret set`
+        above (before the pub key is even written), so CI deploys are
+        broken until the new .pub is committed AND ./infra/up has run --
+        the OLD "the old key keeps working" wording was backwards."""
+        with Project() as infra_dir:
+            (infra_dir / "keys" / "ci-deploy.pub").write_text("old-key\n", encoding="utf-8")
+            runner = FakeRunner(handler=_happy_path_handler())
+            printed: list[str] = []
+
+            ci_setup(infra_dir, rotate=True, runner=runner, emit=printed.append)
+
+            joined = "\n".join(printed)
+            self.assertIn("FAIL", joined)
+            self.assertNotIn("keeps working", joined)
+
+    def test_a_fresh_non_rotate_run_does_not_print_the_rotate_warning(self) -> None:
+        with Project() as infra_dir:
+            runner = FakeRunner(handler=_happy_path_handler())
+            printed: list[str] = []
+
+            ci_setup(infra_dir, runner=runner, emit=printed.append)
+
+            joined = "\n".join(printed)
+            self.assertNotIn("FAIL", joined)
+
     def test_the_ssh_keygen_comment_names_the_project(self) -> None:
         with Project() as infra_dir:
             runner = FakeRunner(handler=_happy_path_handler())
