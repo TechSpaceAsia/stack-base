@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import subprocess
 import unittest
 from dataclasses import replace
@@ -821,8 +822,10 @@ class RebuildTests(unittest.TestCase):
 
             commands = popen.argv_strings()
             self.assertEqual(len(commands), 2)
-            self.assertIn("nixos-rebuild test --flake /etc/nixos/stack#a", commands[0])
-            self.assertIn("nixos-rebuild switch --flake /etc/nixos/stack#a", commands[1])
+            # The flake target is shell-quoted, so assert on tokens rather
+            # than on the raw string ('#' makes shlex.quote wrap it).
+            self.assertEqual(shlex.split(commands[0])[-3:], ["test", "--flake", "/etc/nixos/stack#a"])
+            self.assertEqual(shlex.split(commands[1])[-3:], ["switch", "--flake", "/etc/nixos/stack#a"])
             probes = [c["argv"][-1] for c in ctx.runner.calls if c["argv"][0] == "ssh"]
             self.assertIn("true", probes)
             # The fingerprint is computed from the tree as it was pushed,
@@ -880,6 +883,145 @@ class RebuildTests(unittest.TestCase):
 
             self.assertTrue(any("REDACTED" in line for line in lines))
             self.assertFalse(any("ctok" in line for line in lines))
+
+
+class RemoteCommandQuotingTests(unittest.TestCase):
+    """Second layer: even an unvalidated value must not become remote code.
+
+    `load_config` refuses a node name like this one, so these Steps are built
+    by hand -- the point is that steps.py stays safe even when something
+    reaches it that config.py has not vetted (a hand-edited state file, a
+    future caller, a widened pattern).
+    """
+
+    _HOSTILE = "a; touch /tmp/pwned #"
+
+    def _remote_commands(self, ctx) -> list[str]:
+        return [call["argv"][-1] for call in ctx.runner.calls if call["argv"][0] == "ssh"]
+
+    def _assert_nothing_injected(self, commands: list[str]) -> None:
+        for command in commands:
+            tokens = shlex.split(command)
+            self.assertNotIn("touch", tokens, f"payload became a command word in: {command}")
+            self.assertNotIn("/tmp/pwned", tokens, f"payload became an argument in: {command}")
+
+    def test_a_hostile_node_name_cannot_escape_the_rebuild_command(self) -> None:
+        popen = FakePopen()
+        popen.script(0, "")
+        popen.script(0, "")
+        with Infra() as infra_dir:
+            state = StackState(nodes={self._HOSTILE: NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)})
+            ctx, _ = _context(
+                infra_dir, state=state, popen=popen, runner=FakeRunner(default=_cp(["ssh"], stdout=""))
+            )
+
+            apply([Step(Action.REBUILD, self._HOSTILE)], ctx, allow_purchase=False)
+
+            for command in popen.argv_strings():
+                tokens = shlex.split(command)
+                self.assertNotIn("touch", tokens, f"payload became a command word in: {command}")
+                self.assertIn(
+                    f"/etc/nixos/stack#{self._HOSTILE}",
+                    tokens,
+                    "the flake target must survive as exactly one argument",
+                )
+            self._assert_nothing_injected(self._remote_commands(ctx))
+
+    def test_every_remote_command_of_a_full_run_is_injection_free(self) -> None:
+        def handler(argv, kwargs):
+            joined = " ".join(argv)
+            if "basename" in joined:
+                return _cp(argv, stdout=f"{_HARDWARE}\n")
+            if "cat --" in joined:
+                return _cp(argv, stdout=b"{ }\n")
+            return None
+
+        popen = FakePopen()
+        popen.script(0, "")
+        popen.script(0, "")
+        with Infra() as infra_dir:
+            secrets = {
+                "hostinger_token": "htok",
+                "cloudflare_token": "ctok",
+                "origin_cert": _CERT_PEM,
+                "origin_key": _KEY_PEM,
+            }
+            state = StackState(nodes={self._HOSTILE: NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)})
+            ctx, _ = _context(
+                infra_dir,
+                state=state,
+                secrets=secrets,
+                popen=popen,
+                runner=FakeRunner(handler=handler, default=_cp(["ssh"], stdout="")),
+            )
+
+            apply(
+                [
+                    Step(Action.CAPTURE_HARDWARE, self._HOSTILE),
+                    Step(Action.PUSH_CONFIG, self._HOSTILE),
+                    Step(Action.REBUILD, self._HOSTILE),
+                ],
+                ctx,
+                allow_purchase=False,
+            )
+
+            commands = self._remote_commands(ctx)
+            self.assertTrue(commands)
+            self._assert_nothing_injected(commands)
+
+
+class OriginCertOwnershipTests(unittest.TestCase):
+    def test_the_push_fails_when_the_key_cannot_be_given_to_the_nginx_group(self) -> None:
+        """A key nginx cannot read is worse than a failed push: nginx won't start.
+
+        The group is only absent before the node's very first rebuild (the
+        nginx group is created by building nginx), which the command handles
+        explicitly. Any *other* chgrp failure has to abort the step.
+        """
+        with Infra() as infra_dir:
+            secrets = {
+                "hostinger_token": "htok",
+                "cloudflare_token": "ctok",
+                "origin_cert": _CERT_PEM,
+                "origin_key": _KEY_PEM,
+            }
+            state = StackState(nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)})
+
+            def handler(argv, kwargs):
+                if argv[0] == "ssh" and "chgrp" in argv[-1] and kwargs.get("input"):
+                    return _cp(argv, returncode=1, stderr="chgrp: changing group: Operation not permitted")
+                return None
+
+            ctx, _ = _context(
+                infra_dir,
+                state=state,
+                secrets=secrets,
+                runner=FakeRunner(handler=handler, default=_cp(["ssh"], stdout="")),
+            )
+
+            with self.assertRaises(StackError) as caught:
+                apply([Step(Action.PUSH_CONFIG, "a")], ctx, allow_purchase=False)
+
+            self.assertIn("chgrp", str(caught.exception))
+
+    def test_no_remote_command_swallows_an_error_with_or_true(self) -> None:
+        with Infra() as infra_dir:
+            secrets = {
+                "hostinger_token": "htok",
+                "cloudflare_token": "ctok",
+                "origin_cert": _CERT_PEM,
+                "origin_key": _KEY_PEM,
+            }
+            state = StackState(nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)})
+            ctx, _ = _context(
+                infra_dir, state=state, secrets=secrets, runner=FakeRunner(default=_cp(["ssh"], stdout=""))
+            )
+
+            apply([Step(Action.PUSH_CONFIG, "a")], ctx, allow_purchase=False)
+
+            for call in ctx.runner.calls:
+                if call["argv"][0] == "ssh":
+                    self.assertNotIn("|| true", call["argv"][-1])
 
 
 class ConvergenceAfterAFullRunTests(unittest.TestCase):

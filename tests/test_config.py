@@ -90,6 +90,60 @@ class LoadConfigTests(unittest.TestCase):
             with self.assertRaises(StackError):
                 load_config(infra_dir)
 
+    def test_rejects_a_node_name_that_could_reach_a_shell(self) -> None:
+        """A node name becomes a hostname, a Nix attribute AND part of a remote command.
+
+        `nixos-rebuild --flake /etc/nixos/stack#<node>` runs as root on the
+        server, so an unvalidated TOML table key is a command-injection path
+        (and `infra/nodes/<node>/` is a path-traversal one). Remote commands
+        quote their arguments as well -- this is the first of the two layers.
+        """
+        for name in ('a; touch /tmp/pwned #', "../../etc", "A", "-a", "a b", "1a", "a" * 32):
+            with self.subTest(name=name):
+                toml = VALID_TOML.replace("[nodes.a]", f'[nodes."{name}"]')
+                with TempInfraDir() as infra_dir:
+                    write_toml(infra_dir, toml)
+                    write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+                    with self.assertRaises(StackError) as caught:
+                        load_config(infra_dir)
+
+                    self.assertIn("node", str(caught.exception).lower())
+
+    def test_accepts_ordinary_node_names(self) -> None:
+        for name in ("a", "web", "db-2", "a" * 31):
+            with self.subTest(name=name):
+                toml = VALID_TOML.replace("[nodes.a]", f'[nodes."{name}"]')
+                with TempInfraDir() as infra_dir:
+                    write_toml(infra_dir, toml)
+                    write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+                    self.assertIn(name, load_config(infra_dir).nodes)
+
+    def test_rejects_a_domain_that_is_not_a_hostname(self) -> None:
+        for domain in ("acme.example.com; rm -rf /", "-acme.example.com", "acme example.com", "acme", ""):
+            with self.subTest(domain=domain):
+                toml = VALID_TOML.replace('domain = "acme.example.com"', f'domain = "{domain}"')
+                with TempInfraDir() as infra_dir:
+                    write_toml(infra_dir, toml)
+                    write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+                    with self.assertRaises(StackError):
+                        load_config(infra_dir)
+
+    def test_rejects_an_odd_datacenter_or_owner(self) -> None:
+        for original, replacement in (
+            ('datacenter = "kul"', 'datacenter = "kul; id"'),
+            ('owner = "octocat"', 'owner = "octo cat"'),
+        ):
+            with self.subTest(replacement=replacement):
+                with TempInfraDir() as infra_dir:
+                    write_toml(infra_dir, VALID_TOML.replace(original, replacement))
+                    write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+                    with self.assertRaises(StackError):
+                        load_config(infra_dir)
+
     def test_rejects_zero_primaries(self) -> None:
         toml = VALID_TOML.replace('role = "primary"', 'role = "replica"')
         with TempInfraDir() as infra_dir:

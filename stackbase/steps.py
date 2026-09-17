@@ -20,6 +20,7 @@ Two rules run through all of them:
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 from collections import deque
 from typing import Callable
@@ -330,29 +331,55 @@ def _push_origin_cert(ctx: Context, ssh: Ssh) -> None:
             "run `up` again -- stack-base creates the certificate before pushing it",
         )
 
-    ssh.run(f"set -eu; install -d -m 0750 {REMOTE_CERT_DIR}; {_chgrp(REMOTE_CERT_DIR)}")
+    ssh.run(
+        f"set -eu; install -d -m 0750 {shlex.quote(REMOTE_CERT_DIR)}; {_chgrp(REMOTE_CERT_DIR)}"
+    )
     ssh.run(_write_pem_command("origin.key.new", "0640"), input=key)
     ssh.run(_write_pem_command("origin.crt.new", "0644"), input=cert)
     ssh.run(
-        f"set -eu; mv {REMOTE_CERT_DIR}/origin.key.new {REMOTE_CERT_DIR}/origin.key; "
-        f"mv {REMOTE_CERT_DIR}/origin.crt.new {REMOTE_CERT_DIR}/origin.crt; "
+        "set -eu; "
+        f"mv {_cert_path('origin.key.new')} {_cert_path('origin.key')}; "
+        f"mv {_cert_path('origin.crt.new')} {_cert_path('origin.crt')}; "
         "if systemctl is-active --quiet nginx; then systemctl reload nginx; fi"
     )
 
 
+def _cert_path(filename: str) -> str:
+    return shlex.quote(f"{REMOTE_CERT_DIR}/{filename}")
+
+
 def _write_pem_command(filename: str, mode: str) -> str:
-    path = f"{REMOTE_CERT_DIR}/{filename}"
+    path = _cert_path(filename)
     # umask 077 first: the file must never be world-readable even for the
     # instant between creation and chmod.
-    return f"set -eu; umask 077; cat > {path}; {_chgrp(path)}; chmod {mode} {path}"
+    return (
+        f"set -eu; umask 077; cat > {path}; "
+        f"{_chgrp(f'{REMOTE_CERT_DIR}/{filename}')}; chmod {mode} {path}"
+    )
 
 
 def _chgrp(path: str) -> str:
-    # On a freshly installed node the first push happens before nginx has
-    # ever been built, so the nginx group does not exist yet. Failing to set
-    # the group is harmless (nginx's master process reads the key as root)
-    # and the next run fixes it, so this must not abort the push.
-    return f"chgrp nginx {path} 2>/dev/null || true"
+    """Give `path` to the nginx group, failing the step if that cannot be done.
+
+    nginx must be able to read the private key, so a chgrp that fails is not
+    something to shrug at: under the enclosing `set -eu` this aborts the push.
+
+    The one legitimate reason for the group to be absent is that the node has
+    never been rebuilt -- the nginx group comes into existence with the nginx
+    package, and the first push necessarily happens before the first rebuild.
+    That case is tested for explicitly and announced on stderr, rather than
+    being hidden inside a blanket `|| true` that would swallow a genuine
+    permission error too. Left at root:root 0640 the key is strictly more
+    private than intended, and nginx's master process reads its certificates
+    as root before dropping to the nginx user, so that first rebuild still
+    comes up; the next push corrects the group.
+    """
+    return (
+        "if getent group nginx >/dev/null 2>&1; "
+        f"then chgrp nginx {shlex.quote(path)}; "
+        "else echo 'stackbase: no nginx group yet (this node has never been rebuilt) "
+        "- leaving the certificate owned by root' >&2; fi"
+    )
 
 
 def _rebuild(ctx: Context, step: Step) -> str:
@@ -367,10 +394,8 @@ def _rebuild(ctx: Context, step: Step) -> str:
     """
     node = _node(step)
     ssh = ctx.ssh(node)
-    override = f" --override-input stack-base path:{REMOTE_SRC_DIR}" if ctx.stackbase_src else ""
-    command = f"nixos-rebuild {{mode}} --flake {REMOTE_CONFIG_DIR}#{node}{override}"
 
-    returncode, tail = _stream(ctx, ssh, command.format(mode="test"))
+    returncode, tail = _stream(ctx, ssh, _rebuild_command(ctx, node, "test"))
     if returncode != 0:
         raise StackError(
             f"node {node}: the new configuration failed to build or activate",
@@ -385,7 +410,7 @@ def _rebuild(ctx: Context, step: Step) -> str:
             "configuration in infra/ and run `up` again -- the change was NOT made permanent",
         )
 
-    returncode, tail = _stream(ctx, ssh, command.format(mode="switch"))
+    returncode, tail = _stream(ctx, ssh, _rebuild_command(ctx, node, "switch"))
     if returncode != 0:
         raise StackError(
             f"node {node}: making the new configuration permanent failed",
@@ -402,6 +427,25 @@ def _rebuild(ctx: Context, step: Step) -> str:
     if ctx.stackbase_src:
         _fetch_lock_file(ctx, ssh)
     return f"node {node}: NixOS rebuilt and switched"
+
+
+def _rebuild_command(ctx: Context, node: str, mode: str) -> str:
+    """`nixos-rebuild <mode> --flake /etc/nixos/stack#<node>`, safely quoted.
+
+    This string is handed to a root shell on the node, and `node` is a
+    stack.toml table key. `load_config` already constrains it, but the flake
+    target is quoted here too -- one validation regex should not be the only
+    thing standing between a config file and remote code execution. (Note
+    there is no `str.format` here either: a brace in `node` would otherwise
+    be a second interpolation nobody asked for.)
+    """
+    target = shlex.quote(f"{REMOTE_CONFIG_DIR}#{node}")
+    override = (
+        f" --override-input stack-base {shlex.quote(f'path:{REMOTE_SRC_DIR}')}"
+        if ctx.stackbase_src
+        else ""
+    )
+    return f"nixos-rebuild {mode} --flake {target}{override}"
 
 
 def _stream(ctx: Context, ssh: Ssh, command: str) -> tuple[int, list[str]]:

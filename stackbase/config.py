@@ -21,6 +21,29 @@ from typing import Any
 from stackbase.errors import StackError
 
 _PROJECT_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+
+# A node name is not just a label: it becomes the machine's hostname, a Nix
+# attribute name (`nixosConfigurations.<node>`), a directory under
+# `infra/nodes/`, and part of a command that runs as root on the server
+# (`nixos-rebuild --flake /etc/nixos/stack#<node>`). It arrives as a TOML
+# table key, which may contain literally anything -- `[nodes."a; rm -rf /"]`
+# is perfectly valid TOML. Holding it to the same shape as a project name
+# closes the command-injection and path-traversal paths at the door, and is
+# what a hostname and a Nix attribute name want anyway. Remote commands quote
+# their arguments as well; this is the first of those two layers.
+_NODE_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
+
+# A DNS name: dot-separated labels of letters, digits and hyphens, no leading
+# or trailing hyphen within a label, and at least two labels (a single-label
+# "acme" has no Cloudflare zone to be found under).
+_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_DOMAIN_RE = re.compile(rf"^{_LABEL}(?:\.{_LABEL})+$")
+
+# Deliberately conservative: neither of these has any business containing a
+# space, a quote or a shell metacharacter.
+_DATACENTER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,30}$")
+_OWNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,38}$")
+
 _ALLOWED_KEY_TYPES = frozenset({"ssh-ed25519", "sk-ssh-ed25519@openssh.com", "ssh-rsa"})
 _VALID_ROLES = frozenset({"primary", "replica"})
 
@@ -70,9 +93,25 @@ def load_config(infra_dir: Path) -> StackConfig:
             "project must match [a-z][a-z0-9-]{1,30}",
         )
 
-    domain = _require_str(data, "domain", toml_path)
-    owner = _require_str(data, "owner", toml_path)
-    datacenter = _require_str(data, "datacenter", toml_path)
+    domain = _checked(
+        _require_str(data, "domain", toml_path),
+        _DOMAIN_RE,
+        "domain",
+        "domain must be a DNS name like 'acme.example.com' -- letters, digits, '-' and '.', "
+        "with at least two parts",
+    )
+    owner = _checked(
+        _require_str(data, "owner", toml_path),
+        _OWNER_RE,
+        "owner",
+        "owner must be a plain account handle -- letters, digits, '.', '_' or '-', no spaces",
+    )
+    datacenter = _checked(
+        _require_str(data, "datacenter", toml_path),
+        _DATACENTER_RE,
+        "datacenter",
+        "datacenter must be a short code like 'kul' -- letters, digits and '-' only",
+    )
     plan = _require_str(data, "plan", toml_path)
     price_item = _optional_price_item(data, toml_path)
     auto_patch = _optional_bool(data, "auto_patch", True, toml_path)
@@ -101,6 +140,12 @@ def _require_str(data: dict[str, Any], key: str, toml_path: Path) -> str:
             f"{toml_path} is missing '{key}'",
             f"add a non-empty '{key} = \"...\"' key",
         )
+    return value
+
+
+def _checked(value: str, pattern: re.Pattern[str], key: str, hint: str) -> str:
+    if not pattern.match(value):
+        raise StackError(f"invalid '{key}' value {value!r} in stack.toml", hint)
     return value
 
 
@@ -150,6 +195,14 @@ def _parse_nodes(data: dict[str, Any], toml_path: Path) -> dict[str, Node]:
     nodes: dict[str, Node] = {}
     primary_count = 0
     for name, raw in nodes_raw.items():
+        if not _NODE_RE.match(name):
+            raise StackError(
+                f"invalid node name '{name}' in {toml_path}",
+                "a node name becomes the server's hostname, so it must start with a lowercase "
+                "letter and contain only lowercase letters, digits and '-' (at most 31 "
+                "characters) -- e.g. [nodes.a] or [nodes.web-2]",
+            )
+
         if not isinstance(raw, dict):
             raise StackError(
                 f"invalid node '{name}' in {toml_path}",
