@@ -7,7 +7,7 @@ import unittest
 from unittest import mock
 
 from stackbase.errors import StackError
-from stackbase.hostinger import HostingerClient, _generate_password
+from stackbase.hostinger import HostingerClient, _generate_password, _PASSWORD_SYMBOLS
 from stackbase.http import ApiError
 from tests.fakes import FakeServer
 
@@ -489,19 +489,30 @@ class PasswordNeverLeaksTests(unittest.TestCase):
 
 
 class GeneratePasswordTests(unittest.TestCase):
-    """L3 (live `up` finding): the generated password must satisfy
+    """L3/L4 (live `up` findings): the generated password must satisfy
     Hostinger's real password policy -- undocumented in the OpenAPI spec
-    (which only states a minLength), learned live from a real 422: at least
-    one uppercase, one lowercase, one digit, and one symbol from exactly
-    `-().&@?'#;/,+`. `_generate_password()` deliberately never emits `'`
-    (allowed, but a needless quoting hazard) -- see the module docstring.
+    (which only states a minLength), learned live from real 422s. The
+    generated password is validated as BOTH `root_password` (symbols
+    `-().&@?'#;/,+`) AND `panel_password` (symbols ONLY `#%+:?@`) -- a
+    symbol that only satisfies one of the two still gets rejected, so
+    `_generate_password()` only ever draws from their intersection:
+    `#`, `+`, `?`, `@`. See the module docstring.
     """
 
     _UPPER = set(string.ascii_uppercase)
     _LOWER = set(string.ascii_lowercase)
     _DIGITS = set(string.digits)
-    _SYMBOLS = set("-().&@#;/,+?")
+    _SYMBOLS = set("#+?@")
     _ALLOWED = _UPPER | _LOWER | _DIGITS | _SYMBOLS
+
+    def test_the_symbol_set_is_pinned_to_the_root_and_panel_password_intersection(self) -> None:
+        # root_password allows -().&@?'#;/,+ ; panel_password allows ONLY
+        # #%+:?@. Widening _PASSWORD_SYMBOLS to anything outside "#+?@" --
+        # even a symbol root_password itself allows -- risks a live 422
+        # against panel_password (verified live: this exact set is what
+        # Hostinger's controller confirmed a real setup call with). Do not
+        # "improve" this without re-verifying against the live API.
+        self.assertEqual(_PASSWORD_SYMBOLS, "#+?@")
 
     def test_1000_generated_passwords_are_all_policy_compliant_32_chars_and_allowed_charset(self) -> None:
         for _ in range(1000):

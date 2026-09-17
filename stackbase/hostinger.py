@@ -38,17 +38,21 @@ Known deviations from the plan's assumed request/response shapes (spec wins):
   (`/public-keys`, `/firewall`) DO wrap in `{"data": [...], "meta": {...}}`
   with `?page=` pagination -- handled by walking pages until
   `current_page * per_page >= total`.
-- **Learned live, not in the spec** (L3): the OpenAPI document only states a
-  `minLength` for the setup/purchase `password` field. A real `422` against
-  the live API revealed the actual policy: at least one uppercase letter,
-  one lowercase letter, one digit, AND one symbol from exactly
-  `-().&@?'#;/,+`. `secrets.token_urlsafe()` cannot guarantee that (it may
-  happen to omit a whole character class), so `setup_vm`/`purchase_vm` both
-  go through `_generate_password()` instead, which does. It deliberately
-  never emits `'` (the single quote) -- the API accepts it, but it is a
-  needless shell/JSON-quoting hazard for a value that exists only to
-  satisfy a required field and is discarded immediately after use (NixOS
-  disables password login; access is key-only).
+- **Learned live, not in the spec** (L3/L4): the OpenAPI document only
+  states a `minLength` for the setup/purchase `password` field. Real `422`s
+  against the live API revealed the actual policy -- and it's stricter than
+  one rule: the same password is validated against BOTH `root_password`
+  (allows symbols `-().&@?'#;/,+`) AND `panel_password` (allows ONLY
+  `#%+:?@`). A password that only satisfies `root_password`'s symbol set
+  can still be rejected for `panel_password`, so the only symbols that are
+  ever safe to generate are the *intersection* of the two: `#`, `+`, `?`,
+  `@`. `secrets.token_urlsafe()` gave no guarantee of hitting any
+  particular character class at all, so `setup_vm`/`purchase_vm` both go
+  through `_generate_password()` instead, which guarantees one of each of
+  uppercase/lowercase/digit/symbol -- with symbols restricted to that
+  four-character intersection (see `_PASSWORD_SYMBOLS`; do not widen it
+  back to `root_password`'s full set, it was verified live to fail
+  `panel_password`).
 """
 
 from __future__ import annotations
@@ -66,12 +70,15 @@ from stackbase.secrets import redact
 _DEFAULT_BASE_URL = "https://developers.hostinger.com"
 _PASSWORD_LENGTH = 32
 # Hostinger's live (undocumented) policy -- see the module docstring's
-# "Learned live" note. `'` is allowed by the API but deliberately excluded
-# here.
+# "Learned live" note. The generated password is validated as BOTH
+# root_password (symbols -().&@?'#;/,+) AND panel_password (symbols ONLY
+# #%+:?@) -- `#+?@` is exactly their intersection, the only symbols safe
+# under both rules. Verified against the live API; do not widen this back
+# to root_password's full set, it fails panel_password.
 _PASSWORD_UPPER = string.ascii_uppercase
 _PASSWORD_LOWER = string.ascii_lowercase
 _PASSWORD_DIGITS = string.digits
-_PASSWORD_SYMBOLS = "-().&@#;/,+?"
+_PASSWORD_SYMBOLS = "#+?@"
 _PASSWORD_ALL = _PASSWORD_UPPER + _PASSWORD_LOWER + _PASSWORD_DIGITS + _PASSWORD_SYMBOLS
 _VERSION_RE = re.compile(r"\d+(?:\.\d+)*")
 _HPANEL_HINT = "check hPanel (https://hpanel.hostinger.com/) for the virtual machine's real status"

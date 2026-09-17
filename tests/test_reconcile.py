@@ -692,6 +692,36 @@ class ObserveTests(unittest.TestCase):
             self.assertEqual(observed.nodes["a"].ipv4, _IPV4)
 
 
+class HostnameForTests(unittest.TestCase):
+    """L5 (live `up` finding): Hostinger rejected a short, non-dotted
+    hostname ("stack-demo-a") with "Wrong hostname FQDN format". The
+    Hostinger-side hostname must be a real FQDN -- distinct from (and
+    unrelated to) the NixOS `networking.hostName` the template flake sets,
+    which stays the short node name.
+    """
+
+    def test_hostname_for_is_an_fqdn_under_the_project_domain(self) -> None:
+        cfg = _config()  # project="acme", domain=_DOMAIN ("acme.example.com")
+
+        self.assertEqual(hostname_for(cfg, "a"), f"acme-a.{_DOMAIN}")
+
+    def test_matches_the_live_verified_example(self) -> None:
+        cfg = StackConfig(
+            project="stack-demo",
+            domain="stack-demo.techspace.asia",
+            owner="matt",
+            datacenter="kul",
+            plan="KVM 1",
+            price_item="kvm1",
+            auto_patch=True,
+            admins=["matt"],
+            nodes={"a": Node(name="a", role="primary")},
+            admin_keys={"matt": _KEY_MATT},
+        )
+
+        self.assertEqual(hostname_for(cfg, "a"), "stack-demo-a.stack-demo.techspace.asia")
+
+
 class AdoptionTests(unittest.TestCase):
     """Finding 4(b): a lost purchase response must not cause a double purchase."""
 

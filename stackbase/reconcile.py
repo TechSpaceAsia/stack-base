@@ -347,14 +347,22 @@ def desired_firewall_rules() -> list[dict[str, str]]:
 
 
 def hostname_for(cfg: StackConfig, node: str) -> str:
-    """The hostname Hostinger records for a node.
+    """The hostname Hostinger records for a node -- must be an FQDN.
 
-    The VPS setup API puts no pattern on `hostname` (its example is an FQDN
-    but nothing requires one), so this is the short, readable
-    `<project>-<node>` rather than a fake FQDN that would then disagree with
-    the real DNS name Cloudflare serves.
+    Learned live (L5): the OpenAPI doc's example `hostname` happens to be an
+    FQDN but states no pattern requiring one, so a short `<project>-<node>`
+    form (the original design here) went unnoticed until a real setup call
+    rejected it with "Wrong hostname FQDN format". Verified live:
+    `<project>-<node>.<domain>` is accepted (e.g.
+    `stack-demo-a.stack-demo.techspace.asia`).
+
+    This is the Hostinger-side hostname only, used for setup/purchase and
+    for matching an already-existing VM during ADOPT (`_find_adoptable_vms`
+    below). It is unrelated to the NixOS `networking.hostName` the template
+    flake sets from the node's bare table key (e.g. "a") -- that stays
+    short and is not changed by this.
     """
-    return f"{cfg.project}-{node}"
+    return f"{cfg.project}-{node}.{cfg.domain}"
 
 
 def primary_node(cfg: StackConfig) -> str:
