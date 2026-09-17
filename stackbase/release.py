@@ -75,8 +75,15 @@ _MISSING_TOOL_HINTS: dict[str, str] = {
 
 
 def validate_version_format(version: str) -> None:
-    """Reject anything that isn't exactly vMAJOR.MINOR.PATCH. No I/O."""
-    if not _VERSION_RE.match(version):
+    """Reject anything that isn't exactly vMAJOR.MINOR.PATCH. No I/O.
+
+    M3: `re.fullmatch`, not `.match` -- `$` alone still allows one trailing
+    newline after the last real character (a Python `re` quirk: `$` matches
+    at the end of the string OR just before a trailing "\\n"), so `.match()`
+    would silently accept "v1.2.3\\n" as a valid version. `fullmatch`
+    doesn't have that gap.
+    """
+    if not _VERSION_RE.fullmatch(version):
         raise StackError(
             f"invalid version '{version}'",
             "version must look like vMAJOR.MINOR.PATCH (e.g. v1.4.2) -- no leading zeros, "
@@ -180,7 +187,7 @@ class Project:
     binary: str
 
 
-def read_project(worktree: Path) -> Project:
+def read_project(worktree: Path, cfg: StackConfig) -> Project:
     """Read `[package].name`/`.version` (and an optional `[[bin]]` name) from the checked-out tag."""
     cargo_path = worktree / "Cargo.toml"
     if not cargo_path.is_file():
@@ -189,13 +196,24 @@ def read_project(worktree: Path) -> Project:
         data = tomllib.loads(cargo_path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
         raise StackError(f"{cargo_path} is not valid TOML", str(exc)) from exc
-    return project_from_cargo_toml(data)
+    return project_from_cargo_toml(data, cfg)
 
 
-def project_from_cargo_toml(data: dict[str, Any]) -> Project:
-    """Crate names use '-'; Cargo's own binary files use '_' (`stack-demo` -> `stack_demo`) --
-    matching the server option `stackbase.app.binary`'s default -- unless a `[[bin]]` table
-    names the binary explicitly, which always wins.
+def project_from_cargo_toml(data: dict[str, Any], cfg: StackConfig) -> Project:
+    """Decide the release binary's name -- I6.
+
+    `stack.toml`'s optional `[app].binary` always wins when set (the
+    operator has already told the server about it too, via
+    `templates/infra/flake.nix` mapping it into `stackbase.app.binary`).
+
+    Otherwise, the binary name is derived from Cargo.toml exactly as before
+    (an explicit single `[[bin]]` name, or the crate name with '-' -> '_'):
+    several `[[bin]]` entries with no override is ambiguous and REQUIRES a
+    choice rather than silently taking the first one, and a single derived
+    name that does not match what the server would use by default
+    (`stackbase.app.binary`'s own default, `project` slug with '-' -> '_')
+    is refused BEFORE building -- deploying a binary under a name the
+    server's systemd unit isn't looking for would just 502 forever.
     """
     package = data.get("package")
     if not isinstance(package, dict) or not isinstance(package.get("name"), str) or not isinstance(
@@ -208,12 +226,30 @@ def project_from_cargo_toml(data: dict[str, Any]) -> Project:
     name = package["name"]
     version = package["version"]
 
-    binary = name.replace("-", "_")
+    if cfg.app.binary:
+        return Project(version=version, binary=cfg.app.binary)
+
+    candidates: list[str] = []
     bins = data.get("bin")
     if isinstance(bins, list) and bins:
-        first = bins[0]
-        if isinstance(first, dict) and isinstance(first.get("name"), str) and first["name"]:
-            binary = first["name"]
+        for entry in bins:
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str) and entry["name"]:
+                candidates.append(entry["name"])
+
+    if len(candidates) > 1:
+        listed = ", ".join(candidates)
+        raise StackError(
+            "Cargo.toml declares several [[bin]] entries and stack.toml has no [app].binary",
+            f'add [app] binary = "<name>" to stack.toml, choosing one of: {listed}',
+        )
+
+    binary = candidates[0] if candidates else name.replace("-", "_")
+    expected = cfg.project.replace("-", "_")
+    if binary != expected:
+        raise StackError(
+            f"the release binary '{binary}' does not match this server's default binary name '{expected}'",
+            f'add [app] binary = "{binary}" to stack.toml and run ./infra/up first, then deploy',
+        )
 
     return Project(version=version, binary=binary)
 
@@ -836,7 +872,7 @@ def run_deploy(
         verify_version(repo_dir, version, runner=runner)
         mtime = tag_commit_timestamp(repo_dir, version, runner=runner)
         with release_worktree(repo_dir, version, runner=runner) as worktree:
-            project = read_project(worktree)
+            project = read_project(worktree, cfg)
             bundle_dir = build(worktree, project, work_dir=work_dir, runner=runner, popen=popen, emit=emit)
             tarball, sha256 = package(bundle_dir, version, mtime, binary_name=project.binary)
         ship(infra_dir, cfg, state, version, tarball, sha256, node=node, runner=runner, popen=popen, emit=emit)

@@ -22,7 +22,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-from stackbase.config import Node, NodeState, StackConfig, StackState
+from stackbase.config import AppConfig, Node, NodeState, StackConfig, StackState
 from stackbase.errors import StackError
 from stackbase.release import (
     Project,
@@ -106,9 +106,9 @@ def _init_repo(
     return repo_dir
 
 
-def _cfg(roles: dict[str, str]) -> StackConfig:
+def _cfg(roles: dict[str, str], *, project: str = "acme", app_binary: str | None = None) -> StackConfig:
     return StackConfig(
-        project="acme",
+        project=project,
         domain="acme.example.com",
         owner="matt",
         datacenter="kul",
@@ -118,6 +118,7 @@ def _cfg(roles: dict[str, str]) -> StackConfig:
         admins=["matt"],
         nodes={name: Node(name=name, role=role, vps_id=1) for name, role in roles.items()},
         admin_keys={"matt": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAExample matt@laptop"},
+        app=AppConfig(binary=app_binary),
     )
 
 
@@ -146,6 +147,40 @@ class ValidateVersionFormatTests(unittest.TestCase):
     def test_rejects_a_pre_release_suffix(self) -> None:
         with self.assertRaises(StackError):
             validate_version_format("v1.4.2-rc1")
+
+    def test_rejects_a_trailing_newline(self) -> None:
+        """M3: re.fullmatch, not .match -- Python's `$` alone still allows
+        one trailing newline after the last real character, so `.match()`
+        would silently accept "v1.2.3\\n"."""
+        with self.assertRaises(StackError):
+            validate_version_format("v1.4.2\n")
+
+
+class VersionRegexMatchesTheEngineTests(unittest.TestCase):
+    """M3: release.py's own version grammar must be the exact literal
+    substituted into nixos/deploy.nix's `versionRegex` binding (itself the
+    one source of truth for both stack-deploy.sh's VERSION_GREP and
+    stack-deploy-ssh.sh's VERSION_RE, per Fix round 1 F3) -- extracted from
+    the real deploy.nix source, not retyped by hand, so a future edit to one
+    and not the other is caught here rather than only live, on a server.
+    """
+
+    def test_python_version_regex_is_identical_to_deploy_nix_versionregex(self) -> None:
+        import re as _re
+
+        from stackbase.release import _VERSION_RE
+
+        deploy_nix = (
+            Path(__file__).resolve().parent.parent / "nixos" / "deploy.nix"
+        ).read_text(encoding="utf-8")
+        match = _re.search(r'versionRegex = "((?:[^"\\]|\\.)*)";', deploy_nix)
+        self.assertIsNotNone(match, "could not find `versionRegex = \"...\";` in nixos/deploy.nix")
+        # The Nix string literal escapes each backslash ("\\." in the source
+        # -> the two characters \ and . in the resulting string); undo that
+        # one layer of escaping the same way Nix's own string parser would,
+        # to get the literal regex text.
+        nix_literal = match.group(1).replace('\\"', '"').replace("\\\\", "\\")
+        self.assertEqual(_VERSION_RE.pattern, nix_literal)
 
 
 class VerifyVersionTests(unittest.TestCase):
@@ -234,16 +269,58 @@ class ReleaseWorktreeTests(unittest.TestCase):
 
 class ProjectFromCargoTomlTests(unittest.TestCase):
     def test_binary_name_defaults_to_dashes_replaced_with_underscores(self) -> None:
-        project = project_from_cargo_toml({"package": {"name": "stack-demo", "version": "1.0.0"}})
+        # project="stack-demo" -> server default "stack_demo", matching the
+        # Cargo-derived name -- no [app].binary override needed.
+        cfg = _cfg({"a": "primary"}, project="stack-demo")
+        project = project_from_cargo_toml({"package": {"name": "stack-demo", "version": "1.0.0"}}, cfg)
         self.assertEqual(project, Project(version="1.0.0", binary="stack_demo"))
 
     def test_explicit_bin_name_wins_over_the_package_name(self) -> None:
+        cfg = _cfg({"a": "primary"}, project="server")
         data = {"package": {"name": "stack-demo", "version": "1.0.0"}, "bin": [{"name": "server"}]}
-        self.assertEqual(project_from_cargo_toml(data).binary, "server")
+        self.assertEqual(project_from_cargo_toml(data, cfg).binary, "server")
 
     def test_missing_package_table_raises(self) -> None:
         with self.assertRaises(StackError):
-            project_from_cargo_toml({})
+            project_from_cargo_toml({}, _cfg({"a": "primary"}))
+
+    def test_app_binary_override_always_wins_no_matter_what_cargo_says(self) -> None:
+        """I6: [app].binary short-circuits everything else -- it's not even
+        compared against Cargo.toml's own name/[[bin]] entries."""
+        cfg = _cfg({"a": "primary"}, project="acme", app_binary="custom_bin")
+        data = {"package": {"name": "totally-different", "version": "1.0.0"}, "bin": [{"name": "yet-another"}]}
+        project = project_from_cargo_toml(data, cfg)
+        self.assertEqual(project, Project(version="1.0.0", binary="custom_bin"))
+
+    def test_several_bin_entries_with_no_override_requires_a_choice(self) -> None:
+        """I6: ambiguous -- must not silently take the first [[bin]] entry."""
+        cfg = _cfg({"a": "primary"}, project="acme")
+        data = {
+            "package": {"name": "acme", "version": "1.0.0"},
+            "bin": [{"name": "acme"}, {"name": "acme-worker"}],
+        }
+        with self.assertRaises(StackError) as caught:
+            project_from_cargo_toml(data, cfg)
+
+        message = str(caught.exception)
+        self.assertIn("[app]", message)
+        self.assertIn("acme", message)
+        self.assertIn("acme-worker", message)
+
+    def test_a_cargo_derived_name_that_does_not_match_the_server_default_is_refused_before_building(self) -> None:
+        """I6: deploying a binary under a name the server's systemd unit
+        isn't looking for would just 502 forever -- caught here instead."""
+        cfg = _cfg({"a": "primary"}, project="acme")
+        data = {"package": {"name": "stack-demo", "version": "1.0.0"}}
+
+        with self.assertRaises(StackError) as caught:
+            project_from_cargo_toml(data, cfg)
+
+        message = str(caught.exception)
+        self.assertIn("stack_demo", message)
+        self.assertIn("acme", message)
+        self.assertIn("[app] binary", message)
+        self.assertIn("./infra/up", message)
 
 
 # --------------------------------------------------------------------------
@@ -1091,6 +1168,18 @@ class RunDeployWorkDirTests(unittest.TestCase):
                     "[nodes.a]",
                     'role   = "primary"',
                     "vps_id = 1",
+                    "",
+                    # I6: _init_repo's default package_name ("stack-demo",
+                    # below) derives to binary "stack_demo", which does NOT
+                    # match this project's own default ("acme" -> "acme") --
+                    # exactly the mismatch project_from_cargo_toml now
+                    # refuses without an override. These tests are about
+                    # work-dir privacy/removal, not binary-name resolution
+                    # (which has its own ProjectFromCargoTomlTests below),
+                    # so the override is declared here once for every test
+                    # sharing this fixture.
+                    "[app]",
+                    'binary = "stack_demo"',
                     "",
                 ]
             ),

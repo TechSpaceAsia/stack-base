@@ -3,3 +3,9 @@
 # encrypted (commit it), and stack.state.json, known_hosts, flake.lock and
 # nodes/ are all records the whole team needs -- commit them too.
 result
+
+# secrets.py's save_secrets() writes through a same-directory temp file
+# before its atomic rename -- a crash mid-save can leave one of these
+# behind. Encrypted, like secrets.age itself, but still a stray write-ahead
+# artefact that must never be committed.
+secrets.age.*.tmp

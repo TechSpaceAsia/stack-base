@@ -91,6 +91,10 @@ def _nix_eval(directory: Path) -> dict:
         " networkdEnable = node.config.systemd.network.enable;"
         " passwordAuthentication = node.config.services.openssh.settings.PasswordAuthentication;"
         " firewallPorts = node.config.networking.firewall.allowedTCPPorts;"
+        " appBinary = node.config.stackbase.app.binary;"
+        " appHealthPath = node.config.stackbase.app.healthPath;"
+        " appHealthTries = node.config.stackbase.app.healthTries;"
+        " appHealthSleep = node.config.stackbase.app.healthSleep;"
         " }"
     )
     result = subprocess.run(
@@ -188,6 +192,50 @@ class TemplateFlakeEvaluatesTests(unittest.TestCase):
             (directory / "nodes" / "a" / "extra.nix").write_text(_EXTRA_NIX, encoding="utf-8")
 
             self.assertEqual(_nix_eval(directory)["domain"], "set-by-extra-nix")
+
+    def test_app_table_is_absent_by_default_and_module_defaults_apply(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+
+            facts = _nix_eval(directory)
+
+            self.assertEqual(facts["appBinary"], "acme")  # project "acme" -> default binary "acme"
+            self.assertEqual(facts["appHealthPath"], "/health")
+            self.assertEqual(facts["appHealthTries"], 30)
+            self.assertEqual(facts["appHealthSleep"], 2)
+
+    def test_app_table_fields_are_mapped_to_stackbase_app_options(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+            (directory / "stack.toml").write_text(
+                _SAMPLE_STACK_TOML
+                + '\n[app]\nbinary = "stack_demo"\nhealth_path = "/healthz"\nhealth_tries = 45\nhealth_sleep = 3\n',
+                encoding="utf-8",
+            )
+
+            facts = _nix_eval(directory)
+
+            self.assertEqual(facts["appBinary"], "stack_demo")
+            self.assertEqual(facts["appHealthPath"], "/healthz")
+            self.assertEqual(facts["appHealthTries"], 45)
+            self.assertEqual(facts["appHealthSleep"], 3)
+
+    def test_app_table_with_only_binary_set_leaves_health_options_at_their_default(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+            (directory / "stack.toml").write_text(
+                _SAMPLE_STACK_TOML + '\n[app]\nbinary = "stack_demo"\n', encoding="utf-8"
+            )
+
+            facts = _nix_eval(directory)
+
+            self.assertEqual(facts["appBinary"], "stack_demo")
+            self.assertEqual(facts["appHealthPath"], "/health")
+            self.assertEqual(facts["appHealthTries"], 30)
+            self.assertEqual(facts["appHealthSleep"], 2)
 
     def test_an_extra_nix_can_override_the_providers_mkdefault_grub_device(self) -> None:
         """The provider module must set boot.loader.grub.device with
@@ -679,7 +727,7 @@ class TemplateFilesTests(unittest.TestCase):
             if line.strip() and not line.startswith("#")
         ]
 
-        self.assertEqual(entries, ["result"])
+        self.assertEqual(entries, ["result", "secrets.age.*.tmp"])
 
     def test_the_example_stack_toml_parses_and_covers_the_schema(self) -> None:
         import tomllib

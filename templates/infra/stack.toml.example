@@ -56,3 +56,15 @@ role = "primary"
 # The app's own environment (DATABASE_URL, session/CSRF secrets, OAuth
 # credentials, ...) is NOT set here -- it lives in secrets.age as the
 # "app_env" key. See the README's "The app's environment (app_env)" section.
+
+# Optional. The release engine expects the built binary's name to match
+# this project's slug with "-" -> "_" (so "acme" expects "acme"); if your
+# crate's [package].name or [[bin]] name is different, set it here --
+# `./infra/up deploy` refuses to build otherwise, with the exact value to
+# paste. health_path/health_tries/health_sleep override the release
+# engine's health check (default "/health", 30 tries, 2s apart).
+# [app]
+# binary = "my_crate_name"
+# health_path = "/health"
+# health_tries = 30
+# health_sleep = 2

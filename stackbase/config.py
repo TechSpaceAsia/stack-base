@@ -47,6 +47,12 @@ _OWNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,38}$")
 _ALLOWED_KEY_TYPES = frozenset({"ssh-ed25519", "sk-ssh-ed25519@openssh.com", "ssh-rsa"})
 _VALID_ROLES = frozenset({"primary", "replica"})
 
+# I6: the optional [app] table in stack.toml. Mirrors nixos/deploy.nix's
+# own stackbase.app.binary validation shape (executable-name-safe
+# characters only); health_tries/health_sleep ranges match that module's
+# app.healthTries/app.healthSleep option types (1..300 / 1..60).
+_APP_BINARY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
 
 # --------------------------------------------------------------------------
 # stack.toml -> StackConfig
@@ -61,6 +67,22 @@ class Node:
 
 
 @dataclass(frozen=True)
+class AppConfig:
+    """The optional `[app]` table -- overrides for what `nixos/deploy.nix`
+    would otherwise default (`binary`/`health_path`) or a project would
+    otherwise never be able to set at all from stack.toml
+    (`health_tries`/`health_sleep`, I3's declarative knobs). Every field is
+    `None` when the project never set it -- callers (release.py,
+    templates/infra/flake.nix) fall back to their own defaults in that case.
+    """
+
+    binary: str | None = None
+    health_path: str | None = None
+    health_tries: int | None = None
+    health_sleep: int | None = None
+
+
+@dataclass(frozen=True)
 class StackConfig:
     project: str
     domain: str
@@ -72,6 +94,7 @@ class StackConfig:
     admins: list[str]
     nodes: dict[str, Node]
     admin_keys: dict[str, str]
+    app: AppConfig = field(default_factory=AppConfig)
 
 
 def load_config(infra_dir: Path) -> StackConfig:
@@ -118,6 +141,7 @@ def load_config(infra_dir: Path) -> StackConfig:
     admins = _require_str_list(data, "admins", toml_path)
     nodes = _parse_nodes(data, toml_path)
     admin_keys = _load_admin_keys(admins, infra_dir)
+    app = _parse_app(data, toml_path)
 
     return StackConfig(
         project=project,
@@ -130,6 +154,7 @@ def load_config(infra_dir: Path) -> StackConfig:
         admins=admins,
         nodes=nodes,
         admin_keys=admin_keys,
+        app=app,
     )
 
 
@@ -236,6 +261,56 @@ def _parse_nodes(data: dict[str, Any], toml_path: Path) -> dict[str, Node]:
         )
 
     return nodes
+
+
+def _parse_app(data: dict[str, Any], toml_path: Path) -> AppConfig:
+    raw = data.get("app")
+    if raw is None:
+        return AppConfig()
+    if not isinstance(raw, dict):
+        raise StackError(
+            f"{toml_path} has an invalid '[app]' table",
+            "[app] must be a table, e.g. [app]\\nbinary = \"my_app\"",
+        )
+    _reject_unknown_keys(raw, AppConfig, f"{toml_path} [app]")
+
+    binary = raw.get("binary")
+    if binary is not None:
+        if not isinstance(binary, str) or not _APP_BINARY_RE.match(binary):
+            raise StackError(
+                f"{toml_path} has an invalid [app].binary {binary!r}",
+                "binary must match ^[A-Za-z0-9_.-]{1,64}$ -- letters, digits, '_', '.' or '-'",
+            )
+
+    health_path = raw.get("health_path")
+    if health_path is not None:
+        if (
+            not isinstance(health_path, str)
+            or not health_path.startswith("/")
+            or any(ch.isspace() for ch in health_path)
+        ):
+            raise StackError(
+                f"{toml_path} has an invalid [app].health_path {health_path!r}",
+                "health_path must start with '/' and contain no whitespace",
+            )
+
+    health_tries = _optional_ranged_int(raw, "health_tries", 1, 300, toml_path)
+    health_sleep = _optional_ranged_int(raw, "health_sleep", 1, 60, toml_path)
+
+    return AppConfig(binary=binary, health_path=health_path, health_tries=health_tries, health_sleep=health_sleep)
+
+
+def _optional_ranged_int(data: dict[str, Any], key: str, low: int, high: int, toml_path: Path) -> int | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    # bool is a subclass of int in Python -- same trap as vps_id above.
+    if isinstance(value, bool) or not isinstance(value, int) or not (low <= value <= high):
+        raise StackError(
+            f"{toml_path} has an invalid [app].{key} {value!r}",
+            f"[app].{key} must be an integer between {low} and {high}",
+        )
+    return value
 
 
 def _load_admin_keys(admins: list[str], infra_dir: Path) -> dict[str, str]:

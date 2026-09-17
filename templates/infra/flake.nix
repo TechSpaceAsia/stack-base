@@ -63,6 +63,22 @@
 
       deployKeys = admins // ciDeployKeys;
 
+      # I6: the optional [app] table in stack.toml -- overrides for what
+      # nixos/deploy.nix's stackbase.app.* options would otherwise default
+      # (binary/healthPath) or a project could otherwise never set at all
+      # from stack.toml (healthTries/healthSleep, I3's declarative knobs).
+      # Every field is individually optional; only the ones actually
+      # present in stack.toml are passed through, so an unset field keeps
+      # stackbase.app.*'s own module-level default -- stackbase/config.py
+      # already validated every field's shape/range before `up` ever gets
+      # this far, so nothing here re-validates them.
+      appConfig = stack.app or { };
+      appOptions =
+        (if appConfig ? binary then { binary = appConfig.binary; } else { })
+        // (if appConfig ? health_path then { healthPath = appConfig.health_path; } else { })
+        // (if appConfig ? health_tries then { healthTries = appConfig.health_tries; } else { })
+        // (if appConfig ? health_sleep then { healthSleep = appConfig.health_sleep; } else { });
+
       nodeConfig = name:
         let
           extra = ./nodes + "/${name}/extra.nix";
@@ -76,6 +92,7 @@
               stackbase.domain = stack.domain;
               stackbase.admins = admins;
               stackbase.deploy.keys = deployKeys;
+              stackbase.app = appOptions;
             }
           ] ++ (if builtins.pathExists extra then [ extra ] else [ ]);
         };

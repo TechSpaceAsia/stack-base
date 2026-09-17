@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from stackbase.config import (
+    AppConfig,
     CloudflareState,
     HostingerState,
     Node,
@@ -223,6 +224,89 @@ class LoadConfigTests(unittest.TestCase):
             config = load_config(infra_dir)
 
             self.assertIsNone(config.nodes["b"].vps_id)
+
+    def test_app_table_is_absent_by_default(self) -> None:
+        with TempInfraDir() as infra_dir:
+            write_toml(infra_dir, VALID_TOML)
+            write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+            config = load_config(infra_dir)
+
+            self.assertEqual(config.app, AppConfig())
+
+    def test_app_table_is_parsed(self) -> None:
+        with TempInfraDir() as infra_dir:
+            toml = VALID_TOML + (
+                "\n[app]\n"
+                'binary = "stack_demo"\n'
+                'health_path = "/healthz"\n'
+                "health_tries = 45\n"
+                "health_sleep = 3\n"
+            )
+            write_toml(infra_dir, toml)
+            write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+            config = load_config(infra_dir)
+
+            self.assertEqual(
+                config.app,
+                AppConfig(binary="stack_demo", health_path="/healthz", health_tries=45, health_sleep=3),
+            )
+
+    def test_app_table_fields_are_all_optional(self) -> None:
+        with TempInfraDir() as infra_dir:
+            toml = VALID_TOML + '\n[app]\nbinary = "stack_demo"\n'
+            write_toml(infra_dir, toml)
+            write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+            config = load_config(infra_dir)
+
+            self.assertEqual(config.app.binary, "stack_demo")
+            self.assertIsNone(config.app.health_path)
+            self.assertIsNone(config.app.health_tries)
+            self.assertIsNone(config.app.health_sleep)
+
+    def test_app_binary_rejects_bad_characters(self) -> None:
+        with TempInfraDir() as infra_dir:
+            toml = VALID_TOML + '\n[app]\nbinary = "not a valid binary!"\n'
+            write_toml(infra_dir, toml)
+            write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+            with self.assertRaises(StackError):
+                load_config(infra_dir)
+
+    def test_app_health_path_must_start_with_slash_and_have_no_whitespace(self) -> None:
+        for bad in ("healthz", "/health check", ""):
+            with self.subTest(bad=bad):
+                with TempInfraDir() as infra_dir:
+                    toml = VALID_TOML + f'\n[app]\nhealth_path = "{bad}"\n'
+                    write_toml(infra_dir, toml)
+                    write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+                    with self.assertRaises(StackError):
+                        load_config(infra_dir)
+
+    def test_app_health_tries_and_sleep_reject_out_of_range_and_bool_values(self) -> None:
+        for line in ("health_tries = 0", "health_tries = 301", "health_tries = true", "health_sleep = 0", "health_sleep = 61"):
+            with self.subTest(line=line):
+                with TempInfraDir() as infra_dir:
+                    toml = VALID_TOML + f"\n[app]\n{line}\n"
+                    write_toml(infra_dir, toml)
+                    write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+                    with self.assertRaises(StackError):
+                        load_config(infra_dir)
+
+    def test_app_table_rejects_unknown_keys(self) -> None:
+        with TempInfraDir() as infra_dir:
+            toml = VALID_TOML + '\n[app]\nbogus = "x"\n'
+            write_toml(infra_dir, toml)
+            write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+            with self.assertRaises(StackError) as caught:
+                load_config(infra_dir)
+
+            self.assertIn("bogus", str(caught.exception))
 
 
 class StateRoundTripTests(unittest.TestCase):
