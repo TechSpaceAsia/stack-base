@@ -145,11 +145,27 @@ def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str 
     """Gather everything `plan()` needs that lives on the operator's disk.
 
     `desired_rev` is the fingerprint a node records once it has successfully
-    rebuilt: a hash over every file that would be pushed, combined with the
-    stack-base version in play (the locked rev from `infra/flake.lock`, or --
-    in dev mode -- a hash of the local checkout, which changes as you edit
-    it). A node whose recorded `applied_rev` equals it needs no push and no
-    rebuild.
+    rebuilt -- see `compute_rev`.
+    """
+    return Local(
+        desired_rev=compute_rev(infra_dir, stackbase_src=stackbase_src),
+        has_origin_cert=bool(secrets.get("origin_cert")) and bool(secrets.get("origin_key")),
+        pinned_hosts=_pinned_hosts(infra_dir / "known_hosts"),
+        captured_nodes=_captured_nodes(infra_dir / "nodes"),
+    )
+
+
+def compute_rev(infra_dir: Path, *, stackbase_src: str | None = None) -> str:
+    """The fingerprint of everything a node would be given.
+
+    A hash over every file that would be pushed, combined with the stack-base
+    version in play (the locked rev from `infra/flake.lock`, or -- in dev
+    mode -- a hash of the local checkout, which changes as you edit it). A
+    node whose recorded `applied_rev` equals it needs no push and no rebuild.
+
+    It is recomputed when the rebuild records it, not reused from planning
+    time: `CAPTURE_HARDWARE` writes into `infra/` mid-run, so the tree that
+    actually gets pushed is not always the tree the run was planned against.
     """
     digest = hashlib.sha256()
     digest.update(_tree_digest(infra_dir, PUSH_EXCLUDES, skip=_REV_SKIP).encode("utf-8"))
@@ -159,13 +175,7 @@ def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str 
     else:
         digest.update(b"lock:")
         digest.update(locked_stack_base_rev(infra_dir).encode("utf-8"))
-
-    return Local(
-        desired_rev=digest.hexdigest(),
-        has_origin_cert=bool(secrets.get("origin_cert")) and bool(secrets.get("origin_key")),
-        pinned_hosts=_pinned_hosts(infra_dir / "known_hosts"),
-        captured_nodes=_captured_nodes(infra_dir / "nodes"),
-    )
+    return digest.hexdigest()
 
 
 def locked_stack_base_rev(infra_dir: Path) -> str:

@@ -34,6 +34,7 @@ from stackbase.reconcile import (
     Action,
     Context,
     Step,
+    compute_rev,
     desired_firewall_rules,
     firewall_name,
     first_address,
@@ -391,7 +392,13 @@ def _rebuild(ctx: Context, step: Step) -> str:
             _tail_hint(tail, "the node is still running the tested configuration -- fix infra/ and run `up` again"),
         )
 
-    ctx.node_state(node).applied_rev = ctx.local.desired_rev
+    # Recomputed here rather than reused from planning time: CAPTURE_HARDWARE
+    # writes into infra/ earlier in the same run, so the tree that was just
+    # pushed is not necessarily the tree the run was planned against. And
+    # recorded BEFORE the lock file is fetched: if that fetch changes
+    # infra/flake.lock, the node genuinely is out of date again, and the next
+    # run should say so rather than call a stale node converged.
+    ctx.node_state(node).applied_rev = compute_rev(ctx.infra_dir, stackbase_src=ctx.stackbase_src)
     if ctx.stackbase_src:
         _fetch_lock_file(ctx, ssh)
     return f"node {node}: NixOS rebuilt and switched"

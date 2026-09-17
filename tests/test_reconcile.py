@@ -32,6 +32,7 @@ from stackbase.reconcile import (
     ObservedNode,
     Step,
     apply,
+    compute_rev,
     firewall_name,
     hostname_for,
     local_facts,
@@ -824,7 +825,9 @@ class RebuildTests(unittest.TestCase):
             self.assertIn("nixos-rebuild switch --flake /etc/nixos/stack#a", commands[1])
             probes = [c["argv"][-1] for c in ctx.runner.calls if c["argv"][0] == "ssh"]
             self.assertIn("true", probes)
-            self.assertEqual(ctx.state.nodes["a"].applied_rev, _REV)
+            # The fingerprint is computed from the tree as it was pushed,
+            # not from whatever the run happened to be planned against.
+            self.assertEqual(ctx.state.nodes["a"].applied_rev, compute_rev(infra_dir))
             self.assertTrue(any("building..." in line for line in lines))
 
     def test_it_aborts_before_switch_when_the_post_test_probe_fails(self) -> None:
@@ -877,6 +880,65 @@ class RebuildTests(unittest.TestCase):
 
             self.assertTrue(any("REDACTED" in line for line in lines))
             self.assertFalse(any("ctok" in line for line in lines))
+
+
+class ConvergenceAfterAFullRunTests(unittest.TestCase):
+    def test_a_finished_run_leaves_the_node_up_to_date(self) -> None:
+        """CAPTURE_HARDWARE writes into infra/ -- which is part of what gets pushed.
+
+        If REBUILD recorded the fingerprint computed back when the run was
+        planned, the tree would already have moved on by the time it was
+        saved, and the very next run would push and rebuild again for
+        nothing (minutes of waiting, and `up` never reporting converged).
+        """
+
+        def handler(argv, kwargs):
+            joined = " ".join(argv)
+            if "basename" in joined:
+                return _cp(argv, stdout=f"{_HARDWARE}\n")
+            if "cat --" in joined:
+                return _cp(argv, stdout=b'{ fileSystems."/" = { }; }\n')
+            return None
+
+        popen = FakePopen()
+        popen.script(0, "")
+        popen.script(0, "")
+        with Infra() as infra_dir:
+            secrets = {
+                "hostinger_token": "htok",
+                "cloudflare_token": "ctok",
+                "origin_cert": _CERT_PEM,
+                "origin_key": _KEY_PEM,
+            }
+            state = StackState(nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)})
+            observed = replace(_observed_fresh(), local=local_facts(infra_dir, secrets))
+            ctx, _ = _context(
+                infra_dir,
+                state=state,
+                secrets=secrets,
+                observed=observed,
+                popen=popen,
+                runner=FakeRunner(handler=handler, default=_cp(["ssh"], stdout="")),
+            )
+
+            apply(
+                [
+                    Step(Action.CAPTURE_HARDWARE, "a"),
+                    Step(Action.PUSH_CONFIG, "a"),
+                    Step(Action.REBUILD, "a"),
+                ],
+                ctx,
+                allow_purchase=False,
+            )
+
+            after = local_facts(infra_dir, secrets)
+            self.assertEqual(ctx.state.nodes["a"].applied_rev, after.desired_rev)
+            # ...which is what makes the next run report nothing to do.
+            converged = _converged_state(rev=ctx.state.nodes["a"].applied_rev)
+            self.assertEqual(plan(_config(), converged, _converged_observed(rev=after.desired_rev)), [])
+
+
+_HARDWARE = "hardware-configuration.nix"
 
 
 class DnsTests(unittest.TestCase):
