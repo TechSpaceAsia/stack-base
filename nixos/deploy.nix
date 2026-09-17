@@ -146,11 +146,9 @@ in
     # nginx (app-host.nix) proxies to unix:/run/<project>/app.sock as the
     # `nginx` user. It never runs as <project>, so the only way it can
     # connect() to the app's socket is group membership: put it in
-    # `<project>-sock` (not `<project>` -- see above), and rely on the app
-    # process chmod'ing its socket file group-writable after bind
-    # (connect() on an AF_UNIX socket needs write permission on the socket
-    # special file, not just read). The fake app used by
-    # tests/vm-deploy.nix does this; a real app must too.
+    # `<project>-sock` (not `<project>` -- see above). Reachability itself
+    # (the socket actually being group-writable) comes entirely from the
+    # app unit's UMask=0007, below -- the app itself does nothing special.
     users.users.nginx.extraGroups = [ "${cfg.project}-sock" ];
 
     systemd.tmpfiles.rules = [
@@ -180,8 +178,10 @@ in
       # Owner <project>, group <project>-sock, setgid: a socket file the
       # app creates here inherits the *directory's* group
       # (<project>-sock) rather than the app's own primary group
-      # (<project>), which is what lets nginx (a <project>-sock member)
-      # reach it via the socket's own 0660/0666 mode.
+      # (<project>), which combined with the app unit's UMask=0007
+      # (below -- the socket comes out 0770) is what lets nginx (a
+      # <project>-sock member) reach it, with no cooperation needed from
+      # the app itself.
       "d /run/${cfg.project} 2770 ${cfg.project} ${cfg.project}-sock -"
     ];
 
@@ -219,6 +219,22 @@ in
         # app (it only ever reads its own binary/static assets); the only
         # writable path it needs is its own socket directory.
         ReadWritePaths = [ "/run/${cfg.project}" ];
+        # Socket reachability is a unit-level concern, not an app-level
+        # one: a bare `UnixListener::bind()` (what a real Rust release
+        # binary does -- no chmod call anywhere) gets the default 0022
+        # umask, producing an 0755 socket that a group member can't
+        # connect() to (AF_UNIX connect() needs *write*, not just
+        # read/execute). UMask=0007 makes every file the app creates --
+        # its socket included -- 0660/0770 instead: group
+        # (<project>-sock, via /run/<project>'s setgid bit) gets rw, so
+        # nginx and `deploy` can reach it with zero cooperation required
+        # from the app. NOT platform-base production's 0117 (that strips
+        # the execute bit off directories the app itself creates, which
+        # this unit's own WorkingDirectory doesn't need since it never
+        # creates directories, but 0007 is the correct general-purpose
+        # choice and matches what this module's own socket directory
+        # setgid trick assumes).
+        UMask = "0007";
       };
     };
 

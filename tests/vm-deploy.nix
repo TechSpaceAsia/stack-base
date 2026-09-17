@@ -26,9 +26,14 @@ let
 
   # One fake app, parameterised by __VERSION__ and __HEALTH_CODE__ (200 for
   # a working release, 500 for a broken one) rather than two near-identical
-  # copies. Binds $SOCKET_PATH (removing a stale socket first), chmods it
-  # so nginx -- a member of the project's -sock group, see deploy.nix --
-  # can connect(), and answers GET /health and GET /version.
+  # copies. Binds $SOCKET_PATH (removing a stale socket first) and answers
+  # GET /health and GET /version -- deliberately does NOT touch the
+  # socket's mode itself, matching platform-base's real
+  # UnixListener::bind() (src/main.rs), which never chmods either. Socket
+  # reachability for nginx comes entirely from the app unit's `UMask`
+  # (nixos/deploy.nix), not from anything the app does -- this fake app
+  # has to behave the same way, or the zero-downtime-through-nginx
+  # assertions below would be proving the wrong mechanism.
   fakeApp = ''
     #!/usr/bin/env python3
     import http.server
@@ -65,7 +70,6 @@ let
         pass
 
     httpd = UnixHTTPServer(SOCKET_PATH, Handler)
-    os.chmod(SOCKET_PATH, 0o660)
     httpd.serve_forever()
   '';
 in
@@ -161,6 +165,13 @@ pkgs.testers.runNixOSTest {
           assert node.succeed("stack-deploy colors").strip() == "active=blue idle=green"
           assert node.succeed("cat /var/lib/stackbase/active-color").strip() == "blue"
           assert node.succeed("readlink /run/${project}/app.sock").strip() == "app-blue.sock"
+
+          # The fake app never touches its socket's mode -- this must come
+          # entirely from the app unit's UMask (nixos/deploy.nix), the same
+          # way a real (platform-base) app's bare UnixListener::bind() gets
+          # a connectable socket.
+          sock_stat = node.succeed("stat -c '%a %G' /run/${project}/app-blue.sock").strip()
+          assert sock_stat == "770 ${project}-sock", f"expected socket mode 770, group ${project}-sock; got {sock_stat!r}"
 
           code = proxy.succeed(curl_version).strip()
           body = proxy.succeed("cat /tmp/vbody").strip()
