@@ -5,8 +5,9 @@ in a background thread. Queue a response with `.script(method, path, status,
 body, headers=None)` before making a request; each call queues one response
 per (method, path) pair, consumed first-in-first-out, so a retry scenario is
 scripted as multiple `.script()` calls for the same endpoint. Every request
-received is recorded in `.requests` as `{"method", "path", "body"}` (`body`
-is the JSON-decoded request body, or `None` if the request had no body).
+received is recorded in `.requests` as `{"method", "path", "body", "headers"}`
+(`body` is the JSON-decoded request body, or `None` if the request had no
+body; `headers` is every received header, keyed lowercase).
 
 `FakeRunner` stands in for `subprocess.run` (ssh, rsync, ssh-keyscan,
 openssl) and `FakePopen` for `subprocess.Popen` (the streamed
@@ -93,8 +94,15 @@ class FakeServer:
             except (UnicodeDecodeError, json.JSONDecodeError):
                 parsed_body = raw_body.decode("utf-8", errors="replace")
 
+        # Keys lowercased: header casing is a wire-protocol detail (urllib
+        # sends "User-agent", curl sends "User-Agent", ...) that callers
+        # asserting on a specific header shouldn't have to know about.
+        headers = {key.lower(): value for key, value in handler.headers.items()}
+
         with self._lock:
-            self.requests.append({"method": handler.command, "path": handler.path, "body": parsed_body})
+            self.requests.append(
+                {"method": handler.command, "path": handler.path, "body": parsed_body, "headers": headers}
+            )
             queue = self._responses.get((handler.command, handler.path))
             response = queue.popleft() if queue else None
 

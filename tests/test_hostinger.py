@@ -24,6 +24,24 @@ def _vm(vps_id: int, *, state: str = "running", actions_lock: str = "unlocked") 
     }
 
 
+class HeadersTests(unittest.TestCase):
+    """L1: every request the Hostinger client makes must carry the explicit
+    User-Agent/Accept headers `stackbase.http.request` sets -- Hostinger's
+    API sits behind Cloudflare, which 403s urllib's default User-Agent.
+    """
+
+    def test_list_vms_request_carries_user_agent_and_accept(self) -> None:
+        with FakeServer() as server:
+            server.script("GET", "/api/vps/v1/virtual-machines", 200, [])
+            client = HostingerClient("tok", base_url=server.url)
+
+            client.list_vms()
+
+            headers = server.requests[0]["headers"]
+            self.assertTrue(headers["user-agent"].startswith("stack-base/"))
+            self.assertEqual(headers["accept"], "application/json")
+
+
 class ListAndGetVmTests(unittest.TestCase):
     def test_list_vms_returns_the_bare_array(self) -> None:
         with FakeServer() as server:
@@ -166,14 +184,10 @@ class EnsurePublicKeyTests(unittest.TestCase):
             result = client.ensure_public_key("matt", "ssh-ed25519 AAAA matt@laptop")
 
             self.assertEqual(result, 99)
-            self.assertEqual(
-                server.requests[-1],
-                {
-                    "method": "POST",
-                    "path": "/api/vps/v1/public-keys",
-                    "body": {"name": "matt", "key": "ssh-ed25519 AAAA matt@laptop"},
-                },
-            )
+            created = server.requests[-1]
+            self.assertEqual(created["method"], "POST")
+            self.assertEqual(created["path"], "/api/vps/v1/public-keys")
+            self.assertEqual(created["body"], {"name": "matt", "key": "ssh-ed25519 AAAA matt@laptop"})
 
 
 _KEY = ("matt", "ssh-ed25519 AAAA matt@laptop")
@@ -554,10 +568,10 @@ class EnsureFirewallTests(unittest.TestCase):
             result = client.ensure_firewall("web", [{"protocol": "TCP", "port": "443", "source": "any", "source_detail": "any"}])
 
             self.assertEqual(result, 5)
-            self.assertEqual(
-                server.requests[1],
-                {"method": "POST", "path": "/api/vps/v1/firewall", "body": {"name": "web"}},
-            )
+            created = server.requests[1]
+            self.assertEqual(created["method"], "POST")
+            self.assertEqual(created["path"], "/api/vps/v1/firewall")
+            self.assertEqual(created["body"], {"name": "web"})
             self.assertEqual(server.requests[2]["path"], "/api/vps/v1/firewall/5/rules")
 
 

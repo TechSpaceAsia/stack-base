@@ -437,6 +437,123 @@ class AdoptInitialStateTests(unittest.TestCase):
         self.assertNotIn(Action.SETUP, actions)
 
 
+class AdoptSetupEndToEndTests(unittest.TestCase):
+    """Task 7b change 3, end-to-end (review minor): a single `apply()` call
+    for an adopted VM still in state 'initial' must carry all the way
+    through ADOPT -> SETUP -> ... -> REBUILD, not just plan() saying it
+    should.
+    """
+
+    _ADOPTED_VPS_ID = 4321
+
+    def test_adopted_vm_in_initial_state_completes_adopt_through_rebuild_in_one_apply(self) -> None:
+        def handler(argv, kwargs):
+            joined = " ".join(argv)
+            if argv[0] == "ssh-keyscan":
+                return _cp(argv, stdout=f"{_IPV4} ssh-ed25519 AAAAadoptedkeybody\n")
+            if "basename" in joined:
+                return _cp(argv, stdout=f"{_HARDWARE}\n")
+            if "cat --" in joined and "hardware-configuration.nix" in joined:
+                return _cp(argv, stdout=b'{ fileSystems."/" = { }; }\n')
+            if "cat --" in joined and "configuration.nix" in joined:
+                return _cp(argv, stdout=b"{ }\n")
+            return None
+
+        with Infra() as infra_dir:
+            cfg = _config(nodes={"a": Node(name="a", role="primary", vps_id=None)})
+            state = StackState(
+                cloudflare=CloudflareState(zone_id="zone1", record_id="rec1"),
+                hostinger=HostingerState(firewall_id=7, ssh_key_ids={"matt": 11, "kim": 12}),
+            )
+            # firewall_group_id=7 (already attached) and record_matches=True
+            # keep ENSURE_FIREWALL/UPSERT_DNS out of the plan, so this test
+            # stays focused on the ADOPT->SETUP chain rather than exercising
+            # every other step type again.
+            observed = Observed(
+                local=_local(rev=_REV, has_origin_cert=True, pinned=(), captured=()),
+                nodes={
+                    "a": ObservedNode(
+                        vps_id=self._ADOPTED_VPS_ID,
+                        state="initial",
+                        actions_lock="unlocked",
+                        adopted=True,
+                        firewall_group_id=7,
+                    )
+                },
+                public_key_ids={"matt": 11, "kim": 12},
+                firewall_id=7,
+                firewall_rules_match=True,
+                zone_id="zone1",
+                zone_name="example.com",
+                record_id="rec1",
+                record_matches=True,
+            )
+
+            steps = plan(cfg, state, observed)
+            self.assertEqual(
+                [s.action for s in steps],
+                [
+                    Action.ADOPT,
+                    Action.SETUP,
+                    Action.WAIT_RUNNING,
+                    Action.PIN_HOST_KEY,
+                    Action.CAPTURE_HARDWARE,
+                    Action.PUSH_CONFIG,
+                    Action.REBUILD,
+                ],
+            )
+
+            secrets = {
+                "hostinger_token": "htok",
+                "cloudflare_token": "ctok",
+                "origin_cert": _CERT_PEM,
+                "origin_key": _KEY_PEM,
+            }
+            with FakeServer() as server:
+                server.script("GET", "/api/vps/v1/templates", 200, [{"id": 1130, "name": "NixOS 26.05"}])
+                server.script("GET", "/api/vps/v1/data-centers", 200, [{"id": 21, "name": "kul"}])
+                server.script(
+                    "POST", f"/api/vps/v1/virtual-machines/{self._ADOPTED_VPS_ID}/setup", 200, {}
+                )
+                server.script(
+                    "POST", f"/api/vps/v1/public-keys/attach/{self._ADOPTED_VPS_ID}", 200, {}
+                )
+                server.script(
+                    "GET",
+                    f"/api/vps/v1/virtual-machines/{self._ADOPTED_VPS_ID}",
+                    200,
+                    _vm_body(firewall_group_id=7),
+                )
+
+                popen = FakePopen()
+                popen.script(0, "building...\n")
+                popen.script(0, "switching...\n")
+
+                ctx, lines = _context(
+                    infra_dir,
+                    cfg=cfg,
+                    state=state,
+                    secrets=secrets,
+                    observed=observed,
+                    server=server,
+                    popen=popen,
+                    runner=FakeRunner(handler=handler, default=_cp(["ssh"], stdout="")),
+                )
+
+                apply(steps, ctx, allow_purchase=False)
+
+            # ADOPT recorded the vps id that SETUP then resolved from state.
+            self.assertEqual(ctx.state.nodes["a"].vps_id, self._ADOPTED_VPS_ID)
+            self.assertTrue(ctx.state.nodes["a"].host_key_pinned)
+            self.assertTrue(ctx.state.nodes["a"].hardware_captured)
+            self.assertIsNotNone(ctx.state.nodes["a"].applied_rev)
+            setup_req = next(
+                r for r in server.requests if r["path"].endswith(f"{self._ADOPTED_VPS_ID}/setup")
+            )
+            self.assertEqual(setup_req["method"], "POST")
+            self.assertTrue(any("adopting it instead of buying another" in line for line in lines))
+
+
 # --------------------------------------------------------------------------
 # observe() -- GET only
 # --------------------------------------------------------------------------

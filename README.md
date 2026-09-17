@@ -38,6 +38,11 @@ You also need:
   it. "Flexible" would leave the traffic between Cloudflare and your server
   unencrypted.
 - **An SSH key** (`~/.ssh/id_ed25519.pub`, or run `ssh-keygen -t ed25519`).
+  It must be one that `ssh` will actually offer without being asked: loaded
+  in an `ssh-agent` (`ssh-add ~/.ssh/id_ed25519`) or configured via
+  `IdentityFile` in `~/.ssh/config` for the server's address. stack-base
+  runs `ssh` in batch mode and never prompts, so a key that only works when
+  something asks you for it (or for its passphrase) will just fail.
 
 ## First run, step by step
 

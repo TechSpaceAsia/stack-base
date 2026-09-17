@@ -73,6 +73,67 @@ class TokenLeakTests(unittest.TestCase):
             self.assertNotIn(token, err.hint)
 
 
+class HeadersTests(unittest.TestCase):
+    """L1 (live --plan finding): Hostinger's API sits behind Cloudflare,
+    which returns HTTP 403 / "error code: 1010" for urllib's default
+    User-Agent (`Python-urllib/3.x`). Every request must carry an explicit,
+    identifying User-Agent plus an explicit Accept header.
+    """
+
+    def test_every_request_carries_an_explicit_user_agent_and_accept_header(self) -> None:
+        with FakeServer() as server:
+            server.script("GET", "/thing", 200, {"ok": True})
+
+            request("GET", f"{server.url}/thing", token="tok_abc123")
+
+            headers = server.requests[0]["headers"]
+            self.assertIn("user-agent", headers)
+            self.assertNotIn("python-urllib", headers["user-agent"].lower())
+            self.assertTrue(headers["user-agent"].startswith("stack-base/"))
+            self.assertIn("github.com/matiboy/stack-base", headers["user-agent"])
+            self.assertEqual(headers.get("accept"), "application/json")
+
+    def test_the_user_agent_carries_stackbase_version(self) -> None:
+        from stackbase import __version__
+
+        with FakeServer() as server:
+            server.script("GET", "/thing", 200, {"ok": True})
+
+            request("GET", f"{server.url}/thing", token="tok_abc123")
+
+            self.assertIn(__version__, server.requests[0]["headers"]["user-agent"])
+
+
+class CloudflareFirewallBlockTests(unittest.TestCase):
+    """L1: a Cloudflare edge block (HTTP 403, body 'error code: 1010') is not
+    a token-permission problem -- it must get its own hint, and must not be
+    confused with an ordinary JSON 403 from the API itself.
+    """
+
+    def test_a_1010_block_gets_the_firewall_hint_not_the_permission_hint(self) -> None:
+        with FakeServer() as server:
+            server.script("GET", "/thing", 403, "error code: 1010")
+
+            with self.assertRaises(ApiError) as ctx:
+                request("GET", f"{server.url}/thing", token="tok_abc123", sleep=lambda _seconds: None)
+
+            self.assertEqual(ctx.exception.status, 403)
+            self.assertIn("1010", ctx.exception.hint)
+            self.assertIn("not a problem with your token", ctx.exception.hint)
+            self.assertNotIn("doesn't have permission", ctx.exception.hint)
+
+    def test_an_ordinary_json_403_keeps_the_permission_hint(self) -> None:
+        with FakeServer() as server:
+            server.script("GET", "/thing", 403, {"error": "forbidden"})
+
+            with self.assertRaises(ApiError) as ctx:
+                request("GET", f"{server.url}/thing", token="tok_abc123", sleep=lambda _seconds: None)
+
+            self.assertEqual(ctx.exception.status, 403)
+            self.assertIn("doesn't have permission", ctx.exception.hint)
+            self.assertNotIn("1010", ctx.exception.hint)
+
+
 class BodyHandlingTests(unittest.TestCase):
     def test_empty_body_2xx_returns_empty_dict(self) -> None:
         with FakeServer() as server:
@@ -108,10 +169,11 @@ class BodyHandlingTests(unittest.TestCase):
             )
 
             self.assertEqual(result, {"id": 1})
-            self.assertEqual(
-                server.requests,
-                [{"method": "POST", "path": "/things", "body": {"name": "widget"}}],
-            )
+            self.assertEqual(len(server.requests), 1)
+            recorded = server.requests[0]
+            self.assertEqual(recorded["method"], "POST")
+            self.assertEqual(recorded["path"], "/things")
+            self.assertEqual(recorded["body"], {"name": "widget"})
 
     def test_delete_method_is_allowed(self) -> None:
         with FakeServer() as server:

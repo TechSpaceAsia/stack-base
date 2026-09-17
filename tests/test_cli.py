@@ -20,7 +20,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-from stackbase.__main__ import main
+from stackbase.__main__ import _NO_CLOUDFLARE_WARNING, main
 from stackbase.cloudflare import CloudflareClient
 from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
@@ -458,12 +458,6 @@ class FailureTests(unittest.TestCase):
             self.assertIn("age -R", stderr.getvalue())
             self.assertIn("hostinger_token", stderr.getvalue())
             self.assertIn("optional", stderr.getvalue())
-
-
-_NO_CLOUDFLARE_WARNING = (
-    "! no Cloudflare token in secrets.age — skipping DNS and the TLS origin certificate; "
-    "the server will be reachable by IP/SSH only. Add cloudflare_token later and run up again."
-)
 
 
 @contextlib.contextmanager

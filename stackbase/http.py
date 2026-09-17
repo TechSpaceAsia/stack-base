@@ -18,12 +18,21 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from stackbase import __version__
 from stackbase.errors import StackError
 from stackbase.secrets import redact
 
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 _MAX_BODY_CHARS = 500
 _MAX_BACKOFF_SECONDS = 30.0
+
+# Both Hostinger and Cloudflare sit behind Cloudflare's own edge, which
+# rejects urllib's default User-Agent ("Python-urllib/3.x") with an HTTP 403
+# / "error code: 1010" block -- verified against the live Hostinger API
+# (curl with this exact string: 200; urllib's default: 403). An explicit,
+# identifying User-Agent -- plus an explicit Accept, since we never want to
+# rely on urllib's defaults here either -- sidesteps it.
+USER_AGENT = f"stack-base/{__version__} (+https://github.com/matiboy/stack-base)"
 
 # Hints are written for whoever is running `bin/up`, not necessarily an
 # infra person -- they say what to check, not what went wrong internally.
@@ -39,6 +48,16 @@ _STATUS_HINTS: dict[int, str] = {
     503: "the upstream service is temporarily unavailable -- try again later",
     504: "the upstream service timed out -- try again later",
 }
+
+# Cloudflare's own edge-firewall block page for a rejected request (as
+# opposed to a 403 the *API itself* returns for a bad/under-scoped token).
+# Not a token problem -- retrying with a different token would not help --
+# so it gets its own hint instead of the generic 403 "permission" one.
+_CLOUDFLARE_BLOCK_MARKER = "error code: 1010"
+_CLOUDFLARE_FIREWALL_HINT = (
+    "the provider's firewall blocked this request (Cloudflare error 1010) -- this is not a "
+    "problem with your token; update stack-base, and if it persists report it"
+)
 
 
 class ApiError(StackError):
@@ -78,7 +97,11 @@ def request(
     error) still produces a well-formed result: for an error, an `ApiError`
     with `.status` and a truncated, redacted `.body`.
     """
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
     data: bytes | None = None
     if json_body is not None:
         data = json.dumps(json_body).encode("utf-8")
@@ -133,7 +156,10 @@ def _api_error(method: str, url: str, status: int, body_bytes: bytes, token: str
     text = body_bytes.decode("utf-8", errors="replace")
     body = redact(_truncate(text), [token])
     message = redact(f"{method} {url} returned HTTP {status}", [token])
-    hint = _STATUS_HINTS.get(status, f"the API returned HTTP {status} -- check the response body for details")
+    if status == 403 and _CLOUDFLARE_BLOCK_MARKER in text.lower():
+        hint = _CLOUDFLARE_FIREWALL_HINT
+    else:
+        hint = _STATUS_HINTS.get(status, f"the API returned HTTP {status} -- check the response body for details")
     return ApiError(message, hint, status=status, body=body)
 
 

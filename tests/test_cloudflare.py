@@ -29,6 +29,24 @@ def _record(record_id: str, *, name: str, content: str, proxied: bool = True) ->
     return {"id": record_id, "type": "A", "name": name, "content": content, "proxied": proxied}
 
 
+class HeadersTests(unittest.TestCase):
+    """L1: every request the Cloudflare client makes must carry the explicit
+    User-Agent/Accept headers `stackbase.http.request` sets -- Cloudflare's
+    own edge blocks urllib's default User-Agent with a 403.
+    """
+
+    def test_ip_ranges_request_carries_user_agent_and_accept(self) -> None:
+        with FakeServer() as server:
+            server.script("GET", "/ips", 200, _envelope({"ipv4_cidrs": [], "ipv6_cidrs": []}))
+            client = CloudflareClient("tok", base_url=server.url)
+
+            client.ip_ranges()
+
+            headers = server.requests[0]["headers"]
+            self.assertTrue(headers["user-agent"].startswith("stack-base/"))
+            self.assertEqual(headers["accept"], "application/json")
+
+
 class ZoneForTests(unittest.TestCase):
     def test_strips_trailing_dot_before_building_candidates(self) -> None:
         with FakeServer() as server:
