@@ -16,6 +16,13 @@ let
   # to be present so base.nix's admin-account config has something to work
   # with (`stackbase.admins` requires at least a plausible key string).
   adminKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJBDGmdzpEogrHBnAP+a1MKjbV+D9E9nQOVx8m2wcmt3 vm-test-admin";
+
+  # Must match app-host.nix's certDir/keyFile/certFile -- exercised below to
+  # prove the ownership/mode fix (Finding 5) applies even when the real
+  # cert pair already exists, not just when a placeholder is generated.
+  certDir = "/var/lib/stackbase";
+  keyFile = "${certDir}/origin.key";
+  certFile = "${certDir}/origin.crt";
 in
 pkgs.testers.runNixOSTest {
   name = "stackbase-vm";
@@ -120,5 +127,23 @@ pkgs.testers.runNixOSTest {
 
           outsider_code = outsider.succeed(curl).strip()
           assert outsider_code == "403", f"expected 403 from a non-allowed source, got {outsider_code}"
+
+      with subtest("origin cert ownership is fixed even when the real pair already exists (Finding 5)"):
+          # The placeholder-cert oneshot already left ${keyFile}/${certFile}
+          # owned root:nginx (proven implicitly by nginx being up above).
+          # Simulate what a first PUSH_CONFIG leaves behind -- root:root
+          # 0600, written entirely over ssh before this unit ever reruns --
+          # and prove a rerun corrects it rather than only fixing ownership
+          # the one time a placeholder is freshly generated.
+          node.succeed("chown root:root ${keyFile} ${certFile}")
+          node.succeed("chmod 0600 ${keyFile} ${certFile}")
+          node.succeed("systemctl restart stackbase-origin-cert-placeholder.service")
+
+          key_owner = node.succeed("stat -c '%U:%G %a' ${keyFile}").strip()
+          cert_owner = node.succeed("stat -c '%U:%G %a' ${certFile}").strip()
+          assert key_owner == "root:nginx 640", f"expected origin.key to be root:nginx 640, got {key_owner!r}"
+          assert cert_owner == "root:nginx 644", f"expected origin.crt to be root:nginx 644, got {cert_owner!r}"
+
+          node.succeed("systemctl is-active nginx")
     '';
 }

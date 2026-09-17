@@ -50,6 +50,14 @@ in
     # `nixos-rebuild switch`. This oneshot, ordered before nginx, generates
     # a throwaway self-signed pair only when the real files are absent, so
     # activation always succeeds. It never overwrites a real cert.
+    #
+    # The ownership/mode fix below runs on EVERY start, not just when a
+    # placeholder was just generated: a first push writes the real pair as
+    # root:root 0600 (steps.py's PUSH_CONFIG runs entirely over ssh as
+    # root, before this unit -- or even nginx itself -- has ever run), and
+    # if the fix only ran inside the "files are absent" branch, that real
+    # pair would stay root:root forever and nginx (running as the nginx
+    # user) would never be able to read the key.
     systemd.services.stackbase-origin-cert-placeholder = {
       description = "Generate a placeholder TLS cert for nginx until the real origin cert is pushed";
       before = [ "nginx.service" ];
@@ -64,10 +72,10 @@ in
             -out ${certFile} \
             -days 3650 \
             -subj "/CN=stackbase-placeholder"
-          chown root:nginx ${certFile} ${keyFile}
-          chmod 0640 ${keyFile}
-          chmod 0644 ${certFile}
         fi
+        chown root:nginx ${certFile} ${keyFile}
+        chmod 0640 ${keyFile}
+        chmod 0644 ${certFile}
       '';
     };
 
