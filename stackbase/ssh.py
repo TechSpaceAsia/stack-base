@@ -31,6 +31,26 @@ _WAIT_POLL_SECONDS = 5
 _STDERR_TAIL_LINES = 5
 _HPANEL_STATUS_HINT = "check the VPS's status in hPanel (https://hpanel.hostinger.com/)"
 
+# ssh's own banner text when the pinned host key no longer matches what the
+# server presents. Detecting it lets a PUSH_CONFIG/REBUILD failure that is
+# really "this host key changed" be translated into the same plain-English
+# reinstall-vs-interception hint pin_host_key() gives on first contact,
+# instead of a raw, confusing ssh stderr dump.
+HOST_KEY_CHANGED_MARKER = "REMOTE HOST IDENTIFICATION HAS CHANGED"
+
+
+def host_key_mismatch_hint(known_hosts: Path) -> str:
+    """The reinstall-vs-interception hint, shared by every place a stale
+    pinned host key can surface: first contact (`pin_host_key`) and any
+    later command that hits the same wall (`run`/`fetch`/`rsync_to`, and the
+    nixos-rebuild/probe call sites in `steps.py`).
+    """
+    return (
+        "if the server was reinstalled, remove the old line for this host from "
+        f"{known_hosts} and re-run; otherwise someone may be intercepting the connection -- "
+        "stop and investigate before proceeding"
+    )
+
 # Conservative allowlist: IPv4, IPv6, or a DNS hostname -- letters, digits,
 # '.', '-', ':'. Must not start with '-' (a leading dash would let a
 # malicious/mistyped host string be parsed by ssh/ssh-keyscan/rsync as an
@@ -152,9 +172,7 @@ class Ssh:
                     return  # already pinned with this exact key -- no-op
                 raise StackError(
                     f"the SSH host key for {host_field} does not match the pinned entry in {path}",
-                    "if the server was reinstalled, remove the old line for this host from "
-                    f"{path} and re-run; otherwise someone may be intercepting the connection -- "
-                    "stop and investigate before proceeding",
+                    host_key_mismatch_hint(path),
                 )
 
         new_line = f"{host_field} {key_type} {key_body}"
@@ -165,6 +183,45 @@ class Ssh:
         tmp_path.write_text(content, encoding="utf-8")
         tmp_path.chmod(0o644)
         os.replace(tmp_path, path)  # atomic: known_hosts is never seen half-written
+
+    def unpin_host_key(self) -> None:
+        """Remove this host's pinned entry from known_hosts, if present.
+
+        Used when stack-base itself causes a legitimate host-key change (a
+        SETUP that reinstalls the machine -- see `steps.py::_setup`): the
+        reinstall-vs-interception decision `_pin_key` forces on the operator
+        only belongs to a change stack-base did NOT cause, so a reinstall it
+        performed itself clears the stale pin first instead. No-op (and no
+        rewrite) if this host was never pinned.
+        """
+        path = self._known_hosts
+        if not path.exists():
+            return
+
+        lines = path.read_text(encoding="utf-8").splitlines()
+        kept = [line for line in lines if not self._matches_this_host(line)]
+        if kept == lines:
+            return  # nothing to remove
+
+        content = ("\n".join(kept) + "\n") if kept else ""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.parent / f".{path.name}.tmp{os.getpid()}"
+        tmp_path.write_text(content, encoding="utf-8")
+        tmp_path.chmod(0o644)
+        os.replace(tmp_path, path)
+
+    def _matches_this_host(self, line: str) -> bool:
+        """True for a known_hosts line pinned against exactly `self.host`.
+
+        Matches the host field the same way `_pin_key` writes it: plain
+        (never hashed -- this tool never passes ssh-keyscan's `-H`), so a
+        straight first-field comparison is exact.
+        """
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            return False
+        parts = stripped.split()
+        return bool(parts) and parts[0] == self.host
 
     # -- Remote commands -----------------------------------------------------
 
@@ -179,6 +236,8 @@ class Ssh:
         result = self._exec(argv, text=True, input_data=input)
         if check and result.returncode != 0:
             stderr = result.stderr if isinstance(result.stderr, str) else ""
+            if HOST_KEY_CHANGED_MARKER in stderr:
+                raise self._host_key_mismatch_error()
             raise StackError(
                 f"command failed on {self.host} (exit {result.returncode}): {cmd}",
                 _tail(stderr) or "no stderr output was captured -- re-run with --debug for the full command",
@@ -193,11 +252,19 @@ class Ssh:
         if result.returncode != 0:
             stderr = result.stderr
             stderr_text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr or "")
+            if HOST_KEY_CHANGED_MARKER in stderr_text:
+                raise self._host_key_mismatch_error()
             raise StackError(
                 f"failed to fetch {remote_path} from {self.host} (exit {result.returncode})",
                 _tail(stderr_text) or "no stderr output was captured",
             )
         return result.stdout if isinstance(result.stdout, bytes) else b""
+
+    def _host_key_mismatch_error(self) -> StackError:
+        return StackError(
+            f"the SSH host key for {self.host} does not match the pinned entry in {self._known_hosts}",
+            host_key_mismatch_hint(self._known_hosts),
+        )
 
     def rsync_to(self, local_dir: str | Path, remote_dir: str, *, delete: bool = True, exclude: list[str] = ()) -> None:
         """Sync the contents of `local_dir` to `remote_dir` on the node.
@@ -235,6 +302,8 @@ class Ssh:
         result = self._exec(argv, text=True)
         if result.returncode != 0:
             stderr = result.stderr if isinstance(result.stderr, str) else ""
+            if HOST_KEY_CHANGED_MARKER in stderr:
+                raise self._host_key_mismatch_error()
             raise StackError(
                 f"rsync to {self.host}:{remote_dir} failed (exit {result.returncode})",
                 _tail(stderr) or "no stderr output was captured",

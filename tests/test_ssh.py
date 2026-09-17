@@ -131,6 +131,25 @@ class RunTests(unittest.TestCase):
 
             self.assertEqual(runner.calls[0]["kwargs"]["input"], "payload")
 
+    def test_a_host_key_changed_banner_is_translated_to_the_pin_hint(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runner = FakeRunner()
+            banner = (
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+                "@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @\n"
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+                "Host key verification failed.\n"
+            )
+            runner.script(_cp_text(["ssh"], returncode=255, stdout="", stderr=banner))
+            ssh = Ssh(Path(tmp), _HOST, runner=runner)
+
+            with self.assertRaises(StackError) as ctx:
+                ssh.run("true")
+
+            hint = ctx.exception.hint.lower()
+            self.assertIn("reinstall", hint.replace("re-install", "reinstall"))
+            self.assertIn("intercept", hint)
+
     def test_missing_ssh_binary_raises_stack_error_naming_package(self) -> None:
         with TemporaryDirectory() as tmp:
             def missing_runner(argv, **kwargs):
@@ -399,6 +418,45 @@ class PinHostKeyTests(unittest.TestCase):
                 ssh.pin_host_key()
 
             self.assertIn("openssh", ctx.exception.hint.lower())
+
+
+class UnpinHostKeyTests(unittest.TestCase):
+    def test_removes_the_line_for_this_host_only(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp)
+            known_hosts = infra_dir / "known_hosts"
+            known_hosts.write_text(
+                f"{_HOST} ssh-ed25519 AAAAoldkeybody\nother.host ssh-ed25519 AAAAotherkeybody\n",
+                encoding="utf-8",
+            )
+            ssh = Ssh(infra_dir, _HOST)
+
+            ssh.unpin_host_key()
+
+            content = known_hosts.read_text()
+            self.assertNotIn(_HOST, content)
+            self.assertIn("other.host", content)
+
+    def test_no_op_when_known_hosts_does_not_exist(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp)
+            ssh = Ssh(infra_dir, _HOST)
+
+            ssh.unpin_host_key()  # must not raise
+
+            self.assertFalse((infra_dir / "known_hosts").exists())
+
+    def test_no_op_when_a_different_host_is_pinned(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp)
+            known_hosts = infra_dir / "known_hosts"
+            original = "other.host ssh-ed25519 AAAAotherkeybody\n"
+            known_hosts.write_text(original, encoding="utf-8")
+            ssh = Ssh(infra_dir, _HOST)
+
+            ssh.unpin_host_key()
+
+            self.assertEqual(known_hosts.read_text(), original)
 
 
 class WaitPortTests(unittest.TestCase):
