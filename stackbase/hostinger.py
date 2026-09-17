@@ -14,15 +14,21 @@ permits). `tests/test_no_delete.py` proves this by parsing the module source
 with `ast` -- it does not just trust the docstring.
 
 Known deviations from the plan's assumed request/response shapes (spec wins):
-- `setup_vm`/`purchase_vm` do NOT take `public_key_ids` directly in the
-  Hostinger request body. `VPS.V1.VirtualMachine.SetupRequest` only accepts a
-  single inline `public_key: {name, key}` object. Existing-key-by-id
-  attachment is a separate endpoint,
-  `POST /api/vps/v1/public-keys/attach/{virtualMachineId}` with body
-  `{"ids": [...]}`. The brief's `public_key_ids: list[int]` signature is kept
-  verbatim; internally, `setup_vm`/`purchase_vm` call the setup/purchase
-  endpoint first (no inline `public_key`) and then call the attach endpoint
-  with `public_key_ids` when non-empty.
+- `setup_vm`/`purchase_vm` do NOT take a list of key ids in the Hostinger
+  request body. `VPS.V1.VirtualMachine.SetupRequest` only accepts a single
+  inline `public_key: {name, key}` object, installed by the OS installer
+  itself -- so that key is what actually gets the box reachable, and the
+  controller ruling made it a REQUIRED `public_key: tuple[str, str]`
+  parameter for exactly that reason: a post-setup attach call is not a safe
+  substitute (the setup password is discarded, so there is no fallback login
+  if the attach never reaches a running NixOS box). Existing keys by id are
+  still supported as *extras* via `public_key_ids: list[int] = ()`, attached
+  after setup/purchase via the separate
+  `POST /api/vps/v1/public-keys/attach/{virtualMachineId}` endpoint
+  (`{"ids": [...]}`) -- but a failure to attach an extra does NOT raise
+  (the VM is already reachable via the inline key), it's surfaced as a
+  warning string in the method's return value instead (see `setup_vm`/
+  `purchase_vm` docstrings).
 - `purchase_vm`'s wire body is `{"item_id": price_item, "setup": {...}}`
   (`VPS.V1.VirtualMachine.PurchaseRequest`), not a flat purchase body -- the
   setup fields (template/data-center/hostname/password) nest under `setup`.
@@ -42,7 +48,7 @@ import time
 from typing import Any
 
 from stackbase.errors import StackError
-from stackbase.http import request
+from stackbase.http import ApiError, request
 
 _DEFAULT_BASE_URL = "https://developers.hostinger.com"
 _PASSWORD_BYTES = 24  # secrets.token_urlsafe(24) -> exactly 32 base64url chars (24*8/6, no padding)
@@ -149,14 +155,25 @@ class HostingerClient:
         created = self._call("POST", "/api/vps/v1/public-keys", json_body={"name": name, "key": key})
         return created["id"]
 
-    def _attach_public_keys(self, vps_id: int, public_key_ids: list[int]) -> None:
+    def _attach_public_keys(self, vps_id: int, public_key_ids: list[int]) -> list[str]:
+        """Attach extra, already-registered keys to `vps_id`. Never raises.
+
+        These are extras on top of the inline `public_key` that setup/purchase
+        already installed, so a failure here is degraded-but-safe, not fatal:
+        the VM is already reachable. A failure comes back as a one-line
+        warning string instead of an exception.
+        """
         if not public_key_ids:
-            return
-        self._call(
-            "POST",
-            f"/api/vps/v1/public-keys/attach/{vps_id}",
-            json_body={"ids": list(public_key_ids)},
-        )
+            return []
+        try:
+            self._call(
+                "POST",
+                f"/api/vps/v1/public-keys/attach/{vps_id}",
+                json_body={"ids": list(public_key_ids)},
+            )
+        except ApiError as exc:
+            return [f"failed to attach public key id(s) {list(public_key_ids)} to vps {vps_id}: {exc}"]
+        return []
 
     # -- Setup / purchase ----------------------------------------------------
 
@@ -167,25 +184,34 @@ class HostingerClient:
         template_id: int,
         data_center_id: int,
         hostname: str,
-        public_key_ids: list[int],
-    ) -> None:
+        public_key: tuple[str, str],
+        public_key_ids: list[int] = (),
+    ) -> list[str]:
         """Set up a purchased-but-uninitialised (`state == "initial"`) VM.
 
         A random 32-char password is generated with a CSPRNG, sent once to
         satisfy the API's required field, and then discarded -- it is never
         logged or returned. Access is key-only: NixOS disables password
-        login, and the SSH keys named by `public_key_ids` are attached via a
-        separate call after setup (see module docstring).
+        login, and `public_key` (a required `(name, key)` pair) is sent
+        inline in the setup body so it is installed by the OS installer
+        itself -- the one login path that doesn't depend on a follow-up API
+        call succeeding. `public_key_ids` are optional *extra* already-
+        registered keys attached afterward; a failure to attach one of them
+        does not raise (the VM is already reachable via `public_key`) -- it
+        comes back as a warning string in the returned list, which is empty
+        on full success.
         """
         password = secrets.token_urlsafe(_PASSWORD_BYTES)
+        name, key = public_key
         body = {
             "template_id": template_id,
             "data_center_id": data_center_id,
             "hostname": hostname,
             "password": password,
+            "public_key": {"name": name, "key": key},
         }
         self._call("POST", f"/api/vps/v1/virtual-machines/{vps_id}/setup", json_body=body, retries=1)
-        self._attach_public_keys(vps_id, public_key_ids)
+        return self._attach_public_keys(vps_id, list(public_key_ids))
 
     def purchase_vm(
         self,
@@ -194,14 +220,22 @@ class HostingerClient:
         template_id: int,
         data_center_id: int,
         hostname: str,
-        public_key_ids: list[int],
-    ) -> int:
-        """Purchase a new VM and set it up in one call. Returns the new vps id.
+        public_key: tuple[str, str],
+        public_key_ids: list[int] = (),
+    ) -> tuple[int, list[str]]:
+        """Purchase a new VM and set it up in one call. Returns `(vps_id, warnings)`.
 
         `retries=1`: this issues a real charge. A transient failure must
         raise rather than retry -- retrying a purchase risks buying twice.
+        `public_key` (required `(name, key)`) is sent inline in the nested
+        `setup` body, same rationale as `setup_vm`. `public_key_ids` are
+        optional extras attached afterward; a failed attach does NOT raise
+        away a successful purchase -- the new vps id is still returned, and
+        the failure is one of the strings in `warnings` (empty on full
+        success).
         """
         password = secrets.token_urlsafe(_PASSWORD_BYTES)
+        name, key = public_key
         body = {
             "item_id": price_item,
             "setup": {
@@ -209,6 +243,7 @@ class HostingerClient:
                 "data_center_id": data_center_id,
                 "hostname": hostname,
                 "password": password,
+                "public_key": {"name": name, "key": key},
             },
         }
         result = self._call("POST", "/api/vps/v1/virtual-machines", json_body=body, retries=1)
@@ -221,8 +256,8 @@ class HostingerClient:
                 + "; do not retry the purchase blindly, it may have already gone through",
             )
         vps_id = vm["id"]
-        self._attach_public_keys(vps_id, public_key_ids)
-        return vps_id
+        warnings = self._attach_public_keys(vps_id, list(public_key_ids))
+        return vps_id, warnings
 
     # -- Waiting -------------------------------------------------------------
 

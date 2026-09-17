@@ -174,27 +174,32 @@ class EnsurePublicKeyTests(unittest.TestCase):
             )
 
 
+_KEY = ("matt", "ssh-ed25519 AAAA matt@laptop")
+
+
 class SetupVmTests(unittest.TestCase):
-    def test_sends_setup_body_and_attaches_keys_then_returns_none(self) -> None:
+    def test_sends_inline_public_key_and_attaches_extras_then_returns_no_warnings(self) -> None:
         with FakeServer() as server:
             server.script("POST", "/api/vps/v1/virtual-machines/7/setup", 200, _vm(7, state="initial"))
             server.script("POST", "/api/vps/v1/public-keys/attach/7", 200, {"id": 1, "name": "attach", "state": "success"})
             client = HostingerClient("tok", base_url=server.url)
 
-            result = client.setup_vm(
+            warnings = client.setup_vm(
                 7,
                 template_id=1226,
                 data_center_id=21,
                 hostname="a.acme.example.com",
+                public_key=_KEY,
                 public_key_ids=[42],
             )
 
-            self.assertIsNone(result)
+            self.assertEqual(warnings, [])
             setup_req, attach_req = server.requests
             self.assertEqual(setup_req["path"], "/api/vps/v1/virtual-machines/7/setup")
             self.assertEqual(setup_req["body"]["template_id"], 1226)
             self.assertEqual(setup_req["body"]["data_center_id"], 21)
             self.assertEqual(setup_req["body"]["hostname"], "a.acme.example.com")
+            self.assertEqual(setup_req["body"]["public_key"], {"name": "matt", "key": "ssh-ed25519 AAAA matt@laptop"})
             password = setup_req["body"]["password"]
             self.assertEqual(len(password), 32)
             self.assertEqual(attach_req["path"], "/api/vps/v1/public-keys/attach/7")
@@ -206,19 +211,31 @@ class SetupVmTests(unittest.TestCase):
             server.script("POST", "/api/vps/v1/virtual-machines/2/setup", 200, _vm(2))
             client = HostingerClient("tok", base_url=server.url)
 
-            client.setup_vm(1, template_id=1, data_center_id=1, hostname="a", public_key_ids=[])
-            client.setup_vm(2, template_id=1, data_center_id=1, hostname="b", public_key_ids=[])
+            client.setup_vm(1, template_id=1, data_center_id=1, hostname="a", public_key=_KEY)
+            client.setup_vm(2, template_id=1, data_center_id=1, hostname="b", public_key=_KEY)
 
             passwords = [r["body"]["password"] for r in server.requests]
             self.assertNotEqual(passwords[0], passwords[1])
 
-    def test_no_key_attach_call_when_no_public_key_ids(self) -> None:
+    def test_no_key_attach_call_when_public_key_ids_omitted(self) -> None:
+        # public_key_ids defaults to () -- omitting it must not attempt an attach.
         with FakeServer() as server:
             server.script("POST", "/api/vps/v1/virtual-machines/7/setup", 200, _vm(7))
             client = HostingerClient("tok", base_url=server.url)
 
-            client.setup_vm(7, template_id=1, data_center_id=1, hostname="a", public_key_ids=[])
+            warnings = client.setup_vm(7, template_id=1, data_center_id=1, hostname="a", public_key=_KEY)
 
+            self.assertEqual(warnings, [])
+            self.assertEqual(len(server.requests), 1)
+
+    def test_no_key_attach_call_when_public_key_ids_empty(self) -> None:
+        with FakeServer() as server:
+            server.script("POST", "/api/vps/v1/virtual-machines/7/setup", 200, _vm(7))
+            client = HostingerClient("tok", base_url=server.url)
+
+            warnings = client.setup_vm(7, template_id=1, data_center_id=1, hostname="a", public_key=_KEY, public_key_ids=[])
+
+            self.assertEqual(warnings, [])
             self.assertEqual(len(server.requests), 1)
 
     def test_setup_failure_is_not_retried(self) -> None:
@@ -227,14 +244,35 @@ class SetupVmTests(unittest.TestCase):
             client = HostingerClient("tok", base_url=server.url)
 
             with self.assertRaises(StackError):
-                client.setup_vm(7, template_id=1, data_center_id=1, hostname="a", public_key_ids=[])
+                client.setup_vm(7, template_id=1, data_center_id=1, hostname="a", public_key=_KEY)
 
             # retries=1: exactly one attempt, no retry despite a retryable status.
             self.assertEqual(len(server.requests), 1)
 
+    def test_extra_key_attach_failure_is_a_warning_not_a_raise(self) -> None:
+        with FakeServer() as server:
+            server.script("POST", "/api/vps/v1/virtual-machines/7/setup", 200, _vm(7, state="initial"))
+            server.script("POST", "/api/vps/v1/public-keys/attach/7", 422, {"message": "invalid key id"})
+            client = HostingerClient("tok", base_url=server.url)
+
+            # Must not raise -- setup itself succeeded via the required inline public_key.
+            warnings = client.setup_vm(
+                7,
+                template_id=1,
+                data_center_id=1,
+                hostname="a",
+                public_key=_KEY,
+                public_key_ids=[999],
+            )
+
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("7", warnings[0])
+            # Exactly the setup call plus the one (failed, not retried) attach call.
+            self.assertEqual(len(server.requests), 2)
+
 
 class PurchaseVmTests(unittest.TestCase):
-    def test_sends_nested_setup_body_and_returns_new_vps_id(self) -> None:
+    def test_sends_inline_public_key_in_nested_setup_body_and_returns_vps_id_and_no_warnings(self) -> None:
         order_response = {
             "order": {"id": "order-1"},
             "virtual_machine": _vm(555, state="initial"),
@@ -244,23 +282,43 @@ class PurchaseVmTests(unittest.TestCase):
             server.script("POST", "/api/vps/v1/public-keys/attach/555", 200, {"id": 1, "name": "attach", "state": "success"})
             client = HostingerClient("tok", base_url=server.url)
 
-            vps_id = client.purchase_vm(
+            vps_id, warnings = client.purchase_vm(
                 price_item="hostingercom-vps-kvm2-usd-1m",
                 template_id=1226,
                 data_center_id=21,
                 hostname="a.acme.example.com",
+                public_key=_KEY,
                 public_key_ids=[42],
             )
 
             self.assertEqual(vps_id, 555)
+            self.assertEqual(warnings, [])
             purchase_req = server.requests[0]
             self.assertEqual(purchase_req["path"], "/api/vps/v1/virtual-machines")
             self.assertEqual(purchase_req["body"]["item_id"], "hostingercom-vps-kvm2-usd-1m")
             self.assertEqual(purchase_req["body"]["setup"]["template_id"], 1226)
             self.assertEqual(purchase_req["body"]["setup"]["data_center_id"], 21)
             self.assertEqual(purchase_req["body"]["setup"]["hostname"], "a.acme.example.com")
+            self.assertEqual(
+                purchase_req["body"]["setup"]["public_key"],
+                {"name": "matt", "key": "ssh-ed25519 AAAA matt@laptop"},
+            )
             self.assertEqual(len(purchase_req["body"]["setup"]["password"]), 32)
             self.assertEqual(server.requests[1]["path"], "/api/vps/v1/public-keys/attach/555")
+
+    def test_no_attach_call_when_public_key_ids_omitted(self) -> None:
+        order_response = {"order": {"id": "order-1"}, "virtual_machine": _vm(555, state="initial")}
+        with FakeServer() as server:
+            server.script("POST", "/api/vps/v1/virtual-machines", 200, order_response)
+            client = HostingerClient("tok", base_url=server.url)
+
+            vps_id, warnings = client.purchase_vm(
+                price_item="x", template_id=1, data_center_id=1, hostname="a", public_key=_KEY
+            )
+
+            self.assertEqual(vps_id, 555)
+            self.assertEqual(warnings, [])
+            self.assertEqual(len(server.requests), 1)
 
     def test_payment_processing_response_raises_without_double_purchasing(self) -> None:
         # HTTP 202: payment still processing, no virtual_machine in the body.
@@ -274,6 +332,7 @@ class PurchaseVmTests(unittest.TestCase):
                     template_id=1,
                     data_center_id=1,
                     hostname="a",
+                    public_key=_KEY,
                     public_key_ids=[42],
                 )
 
@@ -287,10 +346,33 @@ class PurchaseVmTests(unittest.TestCase):
 
             with self.assertRaises(StackError):
                 client.purchase_vm(
-                    price_item="x", template_id=1, data_center_id=1, hostname="a", public_key_ids=[]
+                    price_item="x", template_id=1, data_center_id=1, hostname="a", public_key=_KEY
                 )
 
             self.assertEqual(len(server.requests), 1)
+
+    def test_extra_key_attach_failure_after_purchase_is_a_warning_not_a_raise(self) -> None:
+        order_response = {"order": {"id": "order-1"}, "virtual_machine": _vm(555, state="initial")}
+        with FakeServer() as server:
+            server.script("POST", "/api/vps/v1/virtual-machines", 200, order_response)
+            server.script("POST", "/api/vps/v1/public-keys/attach/555", 422, {"message": "invalid key id"})
+            client = HostingerClient("tok", base_url=server.url)
+
+            # Must not raise, and the new vps id must still come back -- the purchase
+            # already succeeded and must not be thrown away over an optional extra.
+            vps_id, warnings = client.purchase_vm(
+                price_item="x",
+                template_id=1,
+                data_center_id=1,
+                hostname="a",
+                public_key=_KEY,
+                public_key_ids=[999],
+            )
+
+            self.assertEqual(vps_id, 555)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("555", warnings[0])
+            self.assertEqual(len(server.requests), 2)
 
 
 class WaitRunningTests(unittest.TestCase):
