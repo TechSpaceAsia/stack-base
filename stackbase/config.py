@@ -219,7 +219,9 @@ def _parse_nodes(data: dict[str, Any], toml_path: Path) -> dict[str, Node]:
             primary_count += 1
 
         vps_id = raw.get("vps_id")
-        if vps_id is not None and not isinstance(vps_id, int):
+        # bool is a subclass of int in Python, so `vps_id = true` would
+        # otherwise sail through as VPS id 1 (and `false` as id 0).
+        if vps_id is not None and (isinstance(vps_id, bool) or not isinstance(vps_id, int)):
             raise StackError(
                 f"invalid vps_id for node '{name}'",
                 "vps_id must be an integer, or omitted if the node needs to be purchased",
@@ -326,7 +328,10 @@ def save_state(infra_dir: Path, state: StackState) -> None:
     state_path = infra_dir / _STATE_FILENAME
     text = json.dumps(asdict(state), indent=2, sort_keys=True) + "\n"
 
-    tmp_path = state_path.with_name(state_path.name + ".tmp")
+    # pid-suffixed, like ssh.py's known_hosts temp file: two concurrent runs
+    # against the same infra/ (unusual, but not impossible) must not step on
+    # each other's temp file.
+    tmp_path = state_path.with_name(f".{state_path.name}.tmp{os.getpid()}")
     tmp_path.write_text(text, encoding="utf-8")
     os.replace(tmp_path, state_path)
 

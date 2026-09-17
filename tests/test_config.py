@@ -202,6 +202,19 @@ class LoadConfigTests(unittest.TestCase):
             config = load_config(infra_dir)
             self.assertTrue(config.admin_keys["matt"].startswith("ssh-rsa"))
 
+    def test_rejects_a_bool_vps_id(self) -> None:
+        # bool is a subclass of int in Python -- `vps_id = true` must not
+        # silently become VPS id 1 (or `false` -> id 0).
+        for literal in ("true", "false"):
+            with self.subTest(literal=literal):
+                toml = VALID_TOML.replace("vps_id = 1984476", f"vps_id = {literal}")
+                with TempInfraDir() as infra_dir:
+                    write_toml(infra_dir, toml)
+                    write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+                    with self.assertRaises(StackError):
+                        load_config(infra_dir)
+
     def test_vps_id_optional(self) -> None:
         with TempInfraDir() as infra_dir:
             write_toml(infra_dir, VALID_TOML)
@@ -261,7 +274,27 @@ class StateRoundTripTests(unittest.TestCase):
 
             names = {p.name for p in infra_dir.iterdir()}
             self.assertIn("stack.state.json", names)
-            self.assertFalse(any(name.endswith(".tmp") for name in names))
+            self.assertFalse(any(".tmp" in name for name in names if name != "stack.state.json"))
+
+    def test_save_state_temp_file_name_includes_the_pid(self) -> None:
+        """Two concurrent runs against the same infra/ must not share a temp file."""
+        import os
+        from unittest import mock
+
+        state = StackState()
+        seen_names: list[str] = []
+        real_replace = os.replace
+
+        def spy_replace(src, dst):
+            seen_names.append(Path(src).name)
+            return real_replace(src, dst)
+
+        with TempInfraDir() as infra_dir:
+            with mock.patch("stackbase.config.os.replace", side_effect=spy_replace):
+                save_state(infra_dir, state)
+
+            self.assertEqual(len(seen_names), 1)
+            self.assertIn(str(os.getpid()), seen_names[0])
 
     def test_load_state_rejects_unknown_top_level_key(self) -> None:
         with TempInfraDir() as infra_dir:
