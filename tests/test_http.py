@@ -134,6 +134,86 @@ class CloudflareFirewallBlockTests(unittest.TestCase):
             self.assertNotIn("1010", ctx.exception.hint)
 
 
+class ErrorDetailFoldingTests(unittest.TestCase):
+    """L2 (live `up` finding): a real HTTP 422 was invisible to the operator
+    -- the run printed only the generic "check the payload" hint, even with
+    --debug, because Hostinger's own explanation (a JSON `message`/`errors`
+    body) was never read. Fold it into the ApiError MESSAGE so `--debug`
+    isn't needed just to see why a request was rejected.
+    """
+
+    def test_json_message_only_is_folded_into_the_message(self) -> None:
+        # A real Hostinger 422 body, message-only shape.
+        detail = (
+            "[VPS:2004] The root_password must contain at least one of the "
+            "following symbols: -().&@?'#;/,+ (and 2 more errors)"
+        )
+        with FakeServer() as server:
+            server.script("POST", "/thing", 422, {"message": detail})
+
+            with self.assertRaises(ApiError) as ctx:
+                request("POST", f"{server.url}/thing", token="tok_abc123", json_body={}, sleep=lambda _s: None)
+
+            self.assertIn(detail, ctx.exception.message)
+            self.assertIn("HTTP 422", ctx.exception.message)
+            self.assertIn(detail, str(ctx.exception))
+
+    def test_message_and_errors_object_are_both_folded(self) -> None:
+        # A real Hostinger 422 body: message + a field->messages errors map.
+        with FakeServer() as server:
+            server.script(
+                "POST",
+                "/thing",
+                422,
+                {
+                    "message": "The password must contain at least one uppercase letter, "
+                    "one lowercase letter, one number.",
+                    "errors": {"password": ["must contain at least one uppercase letter"]},
+                    "correlation_id": "abc-123",
+                },
+            )
+
+            with self.assertRaises(ApiError) as ctx:
+                request("POST", f"{server.url}/thing", token="tok_abc123", json_body={}, sleep=lambda _s: None)
+
+            message = ctx.exception.message
+            self.assertIn(
+                "The password must contain at least one uppercase letter, one lowercase letter, one number.",
+                message,
+            )
+            self.assertIn("password", message)
+            self.assertIn("must contain at least one uppercase letter", message)
+
+    def test_a_non_json_body_leaves_the_message_unchanged(self) -> None:
+        with FakeServer() as server:
+            server.script("GET", "/thing", 502, "<html>gateway timeout</html>")
+
+            with self.assertRaises(ApiError) as ctx:
+                request("GET", f"{server.url}/thing", token="tok_abc123", retries=1, sleep=lambda _s: None)
+
+            self.assertEqual(ctx.exception.message, f"GET {server.url}/thing returned HTTP 502")
+
+    def test_a_json_body_with_no_message_or_errors_leaves_the_message_unchanged(self) -> None:
+        with FakeServer() as server:
+            server.script("GET", "/thing", 403, {"error": "forbidden"})
+
+            with self.assertRaises(ApiError) as ctx:
+                request("GET", f"{server.url}/thing", token="tok_abc123", sleep=lambda _s: None)
+
+            self.assertEqual(ctx.exception.message, f"GET {server.url}/thing returned HTTP 403")
+
+    def test_the_folded_detail_is_still_redacted(self) -> None:
+        token = "tok_abc123"
+        with FakeServer() as server:
+            server.script("POST", "/thing", 422, {"message": f"invalid field, token was {token}"})
+
+            with self.assertRaises(ApiError) as ctx:
+                request("POST", f"{server.url}/thing", token=token, json_body={}, sleep=lambda _s: None)
+
+            self.assertNotIn(token, ctx.exception.message)
+            self.assertNotIn(token, str(ctx.exception))
+
+
 class BodyHandlingTests(unittest.TestCase):
     def test_empty_body_2xx_returns_empty_dict(self) -> None:
         with FakeServer() as server:

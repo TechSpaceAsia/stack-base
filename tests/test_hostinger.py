@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import string
 import unittest
 from unittest import mock
 
 from stackbase.errors import StackError
-from stackbase.hostinger import HostingerClient
+from stackbase.hostinger import HostingerClient, _generate_password
 from stackbase.http import ApiError
 from tests.fakes import FakeServer
 
@@ -428,6 +429,122 @@ class PurchaseVmTests(unittest.TestCase):
             self.assertEqual(len(warnings), 1)
             self.assertIn("555", warnings[0])
             self.assertEqual(len(server.requests), 2)
+
+
+class PasswordNeverLeaksTests(unittest.TestCase):
+    """L2 (live `up` finding): Hostinger's password-policy 422 quotes the
+    rejected value back. `setup_vm`/`purchase_vm` must catch that and make
+    sure the generated password never survives into the re-raised
+    exception's message/hint/body/str -- `redact()`'d, the same way a real
+    API token is.
+    """
+
+    _PASSWORD = "Kn0wnP@ssX1-"
+
+    def test_setup_vm_redacts_a_password_echoed_back_by_the_server(self) -> None:
+        with FakeServer() as server:
+            server.script(
+                "POST",
+                "/api/vps/v1/virtual-machines/7/setup",
+                422,
+                {
+                    "message": f"invalid password: {self._PASSWORD}",
+                    "errors": {"password": [f"rejected value was {self._PASSWORD}"]},
+                },
+            )
+            client = HostingerClient("tok", base_url=server.url)
+
+            with mock.patch("stackbase.hostinger._generate_password", return_value=self._PASSWORD):
+                with self.assertRaises(ApiError) as ctx:
+                    client.setup_vm(7, template_id=1, data_center_id=1, hostname="a", public_key=_KEY)
+
+            err = ctx.exception
+            self.assertNotIn(self._PASSWORD, str(err))
+            self.assertNotIn(self._PASSWORD, err.message)
+            self.assertNotIn(self._PASSWORD, err.hint)
+            self.assertNotIn(self._PASSWORD, err.body)
+
+    def test_purchase_vm_redacts_a_password_echoed_back_by_the_server(self) -> None:
+        with FakeServer() as server:
+            server.script(
+                "POST",
+                "/api/vps/v1/virtual-machines",
+                422,
+                {"message": f"invalid password: {self._PASSWORD}"},
+            )
+            client = HostingerClient("tok", base_url=server.url)
+
+            with mock.patch("stackbase.hostinger._generate_password", return_value=self._PASSWORD):
+                with self.assertRaises(StackError) as ctx:
+                    client.purchase_vm(
+                        price_item="x", template_id=1, data_center_id=1, hostname="a", public_key=_KEY
+                    )
+
+            err = ctx.exception
+            self.assertNotIn(self._PASSWORD, str(err))
+            self.assertNotIn(self._PASSWORD, err.message)
+            self.assertNotIn(self._PASSWORD, err.hint)
+            if isinstance(err, ApiError):
+                self.assertNotIn(self._PASSWORD, err.body)
+
+
+class GeneratePasswordTests(unittest.TestCase):
+    """L3 (live `up` finding): the generated password must satisfy
+    Hostinger's real password policy -- undocumented in the OpenAPI spec
+    (which only states a minLength), learned live from a real 422: at least
+    one uppercase, one lowercase, one digit, and one symbol from exactly
+    `-().&@?'#;/,+`. `_generate_password()` deliberately never emits `'`
+    (allowed, but a needless quoting hazard) -- see the module docstring.
+    """
+
+    _UPPER = set(string.ascii_uppercase)
+    _LOWER = set(string.ascii_lowercase)
+    _DIGITS = set(string.digits)
+    _SYMBOLS = set("-().&@#;/,+?")
+    _ALLOWED = _UPPER | _LOWER | _DIGITS | _SYMBOLS
+
+    def test_1000_generated_passwords_are_all_policy_compliant_32_chars_and_allowed_charset(self) -> None:
+        for _ in range(1000):
+            password = _generate_password()
+            self.assertEqual(len(password), 32)
+            chars = set(password)
+            self.assertTrue(chars & self._UPPER, f"no uppercase in {password!r}")
+            self.assertTrue(chars & self._LOWER, f"no lowercase in {password!r}")
+            self.assertTrue(chars & self._DIGITS, f"no digit in {password!r}")
+            self.assertTrue(chars & self._SYMBOLS, f"no symbol in {password!r}")
+            self.assertTrue(chars <= self._ALLOWED, f"unexpected character(s) in {password!r}")
+
+    def test_never_contains_a_single_quote(self) -> None:
+        for _ in range(200):
+            self.assertNotIn("'", _generate_password())
+
+    def test_generated_passwords_are_not_all_equal(self) -> None:
+        passwords = {_generate_password() for _ in range(50)}
+        self.assertGreater(len(passwords), 1)
+
+    def test_both_setup_vm_and_purchase_vm_send_a_compliant_password_on_the_wire(self) -> None:
+        with FakeServer() as server:
+            server.script("POST", "/api/vps/v1/virtual-machines/7/setup", 200, _vm(7, state="initial"))
+            server.script(
+                "POST",
+                "/api/vps/v1/virtual-machines",
+                200,
+                {"virtual_machine": _vm(555, state="initial")},
+            )
+            client = HostingerClient("tok", base_url=server.url)
+
+            client.setup_vm(7, template_id=1, data_center_id=1, hostname="a", public_key=_KEY)
+            client.purchase_vm(price_item="x", template_id=1, data_center_id=1, hostname="b", public_key=_KEY)
+
+            setup_password = server.requests[0]["body"]["password"]
+            purchase_password = server.requests[1]["body"]["setup"]["password"]
+            for password in (setup_password, purchase_password):
+                chars = set(password)
+                self.assertTrue(chars & self._UPPER)
+                self.assertTrue(chars & self._LOWER)
+                self.assertTrue(chars & self._DIGITS)
+                self.assertTrue(chars & self._SYMBOLS)
+                self.assertTrue(chars <= self._ALLOWED)
 
 
 class WaitRunningTests(unittest.TestCase):

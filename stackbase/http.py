@@ -24,6 +24,7 @@ from stackbase.secrets import redact
 
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 _MAX_BODY_CHARS = 500
+_MAX_DETAIL_CHARS = 300
 _MAX_BACKOFF_SECONDS = 30.0
 
 # Both Hostinger and Cloudflare sit behind Cloudflare's own edge, which
@@ -155,12 +156,68 @@ def _parse_success_body(
 def _api_error(method: str, url: str, status: int, body_bytes: bytes, token: str) -> ApiError:
     text = body_bytes.decode("utf-8", errors="replace")
     body = redact(_truncate(text), [token])
-    message = redact(f"{method} {url} returned HTTP {status}", [token])
+    base = f"{method} {url} returned HTTP {status}"
+    detail = _error_detail(text)
+    message = redact(f"{base}: {detail}" if detail else base, [token])
     if status == 403 and _CLOUDFLARE_BLOCK_MARKER in text.lower():
         hint = _CLOUDFLARE_FIREWALL_HINT
     else:
         hint = _STATUS_HINTS.get(status, f"the API returned HTTP {status} -- check the response body for details")
     return ApiError(message, hint, status=status, body=body)
+
+
+def _error_detail(text: str) -> str | None:
+    """Fold a JSON error body's `message`/`errors` into one readable string.
+
+    L2 (a live `--plan` run): a real HTTP 422 printed nothing beyond the
+    generic `_STATUS_HINTS[422]` line, even with `--debug` -- the API's own
+    explanation was sitting unread in the response body. Hostinger's 4xx
+    bodies look like
+    `{"message": "...", "errors": {"password": ["..."]}, "correlation_id": "..."}`
+    -- sometimes with only `message`. This is deliberately generic (any
+    JSON object shaped that way, not Hostinger-specific), but only reads a
+    `message` string and an `errors` *object* (field -> message(s)); it
+    never touches Cloudflare's own `errors` *list* envelope, which
+    `cloudflare.py` already unpacks on the (different) `success: false`
+    2xx path -- so there is no double-reporting between the two.
+
+    Returns `None` for a non-JSON body or a JSON body with neither a usable
+    `message` nor `errors`, so a plain "returned HTTP {status}" message is
+    unchanged from before this existed.
+    """
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    parts: list[str] = []
+    message = parsed.get("message")
+    if isinstance(message, str) and message.strip():
+        parts.append(message.strip())
+
+    errors = parsed.get("errors")
+    if isinstance(errors, dict):
+        for field, field_errors in errors.items():
+            if not isinstance(field, str):
+                continue
+            joined = _join_field_errors(field_errors)
+            if joined:
+                parts.append(f"[{field}: {joined}]")
+
+    if not parts:
+        return None
+    return _truncate(" ".join(parts), _MAX_DETAIL_CHARS)
+
+
+def _join_field_errors(field_errors: Any) -> str | None:
+    if isinstance(field_errors, str):
+        return field_errors.strip() or None
+    if isinstance(field_errors, list):
+        joined = "; ".join(item.strip() for item in field_errors if isinstance(item, str) and item.strip())
+        return joined or None
+    return None
 
 
 def _network_error(method: str, url: str, exc: urllib.error.URLError, token: str) -> ApiError:

@@ -38,22 +38,80 @@ Known deviations from the plan's assumed request/response shapes (spec wins):
   (`/public-keys`, `/firewall`) DO wrap in `{"data": [...], "meta": {...}}`
   with `?page=` pagination -- handled by walking pages until
   `current_page * per_page >= total`.
+- **Learned live, not in the spec** (L3): the OpenAPI document only states a
+  `minLength` for the setup/purchase `password` field. A real `422` against
+  the live API revealed the actual policy: at least one uppercase letter,
+  one lowercase letter, one digit, AND one symbol from exactly
+  `-().&@?'#;/,+`. `secrets.token_urlsafe()` cannot guarantee that (it may
+  happen to omit a whole character class), so `setup_vm`/`purchase_vm` both
+  go through `_generate_password()` instead, which does. It deliberately
+  never emits `'` (the single quote) -- the API accepts it, but it is a
+  needless shell/JSON-quoting hazard for a value that exists only to
+  satisfy a required field and is discarded immediately after use (NixOS
+  disables password login; access is key-only).
 """
 
 from __future__ import annotations
 
 import re
 import secrets
+import string
 import time
 from typing import Any
 
 from stackbase.errors import StackError
 from stackbase.http import ApiError, request
+from stackbase.secrets import redact
 
 _DEFAULT_BASE_URL = "https://developers.hostinger.com"
-_PASSWORD_BYTES = 24  # secrets.token_urlsafe(24) -> exactly 32 base64url chars (24*8/6, no padding)
+_PASSWORD_LENGTH = 32
+# Hostinger's live (undocumented) policy -- see the module docstring's
+# "Learned live" note. `'` is allowed by the API but deliberately excluded
+# here.
+_PASSWORD_UPPER = string.ascii_uppercase
+_PASSWORD_LOWER = string.ascii_lowercase
+_PASSWORD_DIGITS = string.digits
+_PASSWORD_SYMBOLS = "-().&@#;/,+?"
+_PASSWORD_ALL = _PASSWORD_UPPER + _PASSWORD_LOWER + _PASSWORD_DIGITS + _PASSWORD_SYMBOLS
 _VERSION_RE = re.compile(r"\d+(?:\.\d+)*")
 _HPANEL_HINT = "check hPanel (https://hpanel.hostinger.com/) for the virtual machine's real status"
+
+
+def _generate_password(length: int = _PASSWORD_LENGTH) -> str:
+    """A CSPRNG password guaranteed to satisfy Hostinger's live password
+    policy: at least one uppercase letter, one lowercase letter, one digit,
+    and one symbol from `_PASSWORD_SYMBOLS`. One character of each required
+    class is drawn first (so the guarantee holds regardless of what the
+    remaining, freely-drawn characters turn out to be), the rest are drawn
+    from the union of all four classes, and the whole thing is shuffled so
+    the required characters aren't predictably in the first four positions.
+    """
+    required = [
+        secrets.choice(_PASSWORD_UPPER),
+        secrets.choice(_PASSWORD_LOWER),
+        secrets.choice(_PASSWORD_DIGITS),
+        secrets.choice(_PASSWORD_SYMBOLS),
+    ]
+    remaining = [secrets.choice(_PASSWORD_ALL) for _ in range(length - len(required))]
+    chars = required + remaining
+    secrets.SystemRandom().shuffle(chars)
+    return "".join(chars)
+
+
+def _redact_password(exc: ApiError, password: str) -> ApiError:
+    """Strip `password` out of an `ApiError` raised by setup/purchase.
+
+    L2 (a live `up` run): Hostinger's password-policy 422 quotes the exact
+    value it rejected back in the response body. That password is
+    ephemeral and never logged/returned on success -- it must not become
+    visible on failure either, the same way a real API token never is.
+    """
+    return ApiError(
+        redact(exc.message, [password]),
+        redact(exc.hint, [password]),
+        status=exc.status,
+        body=redact(exc.body, [password]),
+    )
 
 
 class HostingerClient:
@@ -193,9 +251,11 @@ class HostingerClient:
     ) -> list[str]:
         """Set up a purchased-but-uninitialised (`state == "initial"`) VM.
 
-        A random 32-char password is generated with a CSPRNG, sent once to
-        satisfy the API's required field, and then discarded -- it is never
-        logged or returned. Access is key-only: NixOS disables password
+        A random 32-char password meeting Hostinger's live password policy
+        (see `_generate_password`) is generated, sent once to satisfy the
+        API's required field, and then discarded -- it is never logged or
+        returned, and never survives into a raised error either (see
+        `_redact_password`). Access is key-only: NixOS disables password
         login, and `public_key` (a required `(name, key)` pair) is sent
         inline in the setup body so it is installed by the OS installer
         itself -- the one login path that doesn't depend on a follow-up API
@@ -205,7 +265,7 @@ class HostingerClient:
         comes back as a warning string in the returned list, which is empty
         on full success.
         """
-        password = secrets.token_urlsafe(_PASSWORD_BYTES)
+        password = _generate_password()
         name, key = public_key
         body = {
             "template_id": template_id,
@@ -214,7 +274,10 @@ class HostingerClient:
             "password": password,
             "public_key": {"name": name, "key": key},
         }
-        self._call("POST", f"/api/vps/v1/virtual-machines/{vps_id}/setup", json_body=body, retries=1)
+        try:
+            self._call("POST", f"/api/vps/v1/virtual-machines/{vps_id}/setup", json_body=body, retries=1)
+        except ApiError as exc:
+            raise _redact_password(exc, password) from None
         return self._attach_public_keys(vps_id, list(public_key_ids))
 
     def purchase_vm(
@@ -238,7 +301,7 @@ class HostingerClient:
         the failure is one of the strings in `warnings` (empty on full
         success).
         """
-        password = secrets.token_urlsafe(_PASSWORD_BYTES)
+        password = _generate_password()
         name, key = public_key
         body = {
             "item_id": price_item,
@@ -253,6 +316,7 @@ class HostingerClient:
         try:
             result = self._call("POST", "/api/vps/v1/virtual-machines", json_body=body, retries=1)
         except ApiError as exc:
+            exc = _redact_password(exc, password)
             if exc.status == 0:
                 # A network-level failure (timeout, connection reset, ...):
                 # the request may never have reached Hostinger, or it may
@@ -264,8 +328,8 @@ class HostingerClient:
                     "the purchase may have gone through -- "
                     + _HPANEL_HINT
                     + "; do not retry the purchase blindly, it may have already gone through",
-                ) from exc
-            raise
+                ) from None
+            raise exc from None
         vm = result.get("virtual_machine") if isinstance(result, dict) else None
         if not isinstance(vm, dict) or "id" not in vm:
             raise StackError(
