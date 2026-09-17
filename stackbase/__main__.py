@@ -21,6 +21,7 @@ import os
 import sys
 import traceback
 from pathlib import Path
+from typing import Callable
 
 from stackbase.ci import ci_setup
 from stackbase.cloudflare import CloudflareClient
@@ -135,9 +136,9 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "status":
             _status(args, infra_dir)
         elif args.command == "ci-setup":
-            _ci_setup(args, infra_dir)
+            _ci_setup(args, infra_dir, secrets)
         elif args.command == "secrets":
-            _secrets(args, infra_dir)
+            _secrets(args, infra_dir, secrets)
         else:
             # argparse's subparsers are `required=True`, so this is
             # unreachable in practice -- but an explicit branch that fails
@@ -324,20 +325,54 @@ def _status(args: argparse.Namespace, infra_dir: Path) -> None:
     run_status(infra_dir, node=args.node, emit=_emit_plain)
 
 
-def _ci_setup(args: argparse.Namespace, infra_dir: Path) -> None:
-    ci_setup(infra_dir, rotate=args.rotate, emit=_emit_plain)
+def _secret_register_counter(secrets: dict[str, str]) -> Callable[[str], None]:
+    """A `register_secret(value)` callback that feeds `secrets` (F2, Fix
+    round 1) -- the same dict `error_line`/`_print_traceback` redact with,
+    populated incrementally the way `_up` populates it in one shot via
+    `secrets.update(load_secrets(...))`.
+
+    Each call gets its OWN synthetic dict key (`_secret_N`), never the
+    value's semantic name (e.g. "cloudflare_token") -- `edit_key` registers
+    BOTH the original bundle value and the freshly-edited value for the
+    same key name, and a plain `secrets[key] = value` would let the second
+    call silently overwrite (and so un-mask) the first. `redaction_values()`
+    only reads `.values()`, so the key itself carries no meaning.
+    """
+    counter = [0]
+
+    def register(value: str) -> None:
+        if not value:
+            return
+        counter[0] += 1
+        secrets[f"_secret_{counter[0]}"] = value
+
+    return register
 
 
-def _secrets(args: argparse.Namespace, infra_dir: Path) -> None:
+def _ci_setup(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+    ci_setup(
+        infra_dir,
+        rotate=args.rotate,
+        emit=_emit_plain,
+        register_secret=_secret_register_counter(secrets),
+    )
+
+
+def _secrets(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+    register_one = _secret_register_counter(secrets)
+
+    def register_secret(_key: str, value: str) -> None:
+        register_one(value)
+
     if args.secrets_command == "keys":
         for name in list_key_names(infra_dir):
             _emit_plain(name)
     elif args.secrets_command == "set":
-        set_key(infra_dir, args.key, emit=_emit_plain)
+        set_key(infra_dir, args.key, emit=_emit_plain, register_secret=register_secret)
     elif args.secrets_command == "unset":
-        unset_key(infra_dir, args.key, emit=_emit_plain)
+        unset_key(infra_dir, args.key, emit=_emit_plain, register_secret=register_secret)
     elif args.secrets_command == "edit":
-        edit_key(infra_dir, args.key, emit=_emit_plain)
+        edit_key(infra_dir, args.key, emit=_emit_plain, register_secret=register_secret)
     else:
         # secrets_sub is required=True, so this is unreachable in practice --
         # an explicit branch beats a bare `else` silently doing nothing.

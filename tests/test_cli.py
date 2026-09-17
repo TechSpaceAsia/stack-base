@@ -517,6 +517,184 @@ class FailureTests(unittest.TestCase):
             self.assertIn("optional", stderr.getvalue())
 
 
+@unittest.skipUnless(_AGE_AVAILABLE, "age/age-keygen are not installed")
+class SecretsAndCiSetupFailureRedactionTests(unittest.TestCase):
+    """F2, Fix round 1: `ci-setup` and `secrets ...` used to bypass the
+    redaction net entirely -- neither fed the values it handled into the
+    dict `error_line`/`_print_traceback` mask with, so a future failure (or
+    a `--debug` traceback carrying `age`/`gh`/editor stderr) could print a
+    secret unmasked. Each test injects a failure whose message echoes a
+    sensitive value and asserts it never reaches stdout/stderr, with and
+    without `--debug` (a traceback must still appear with `--debug`).
+    """
+
+    # -- secrets set: the NEW value, read from stdin but not yet saved ------
+
+    def test_secrets_set_failure_masks_the_new_value_without_debug(self) -> None:
+        new_value = "brand-new-cloudflare-token-zzz111"
+        with TemporaryDirectory() as tmp:
+            infra_dir, identity = _project(Path(tmp))
+            stdout, stderr = io.StringIO(), io.StringIO()
+
+            def boom(*_args: object, **_kwargs: object) -> None:
+                raise StackError(f"failed to encrypt: {new_value}", f"age stderr said: {new_value}")
+
+            with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(identity)}, clear=False):
+                with mock.patch("stackbase.secrets_cli.sys.stdin", io.StringIO(new_value)):
+                    with mock.patch("stackbase.secrets_cli.save_secrets", side_effect=boom):
+                        with (
+                            contextlib.redirect_stdout(stdout),
+                            contextlib.redirect_stderr(stderr),
+                            self.assertRaises(SystemExit) as caught,
+                        ):
+                            main(["--infra-dir", str(infra_dir), "secrets", "set", "cloudflare_token"])
+
+            self.assertEqual(caught.exception.code, 1)
+            everything = stdout.getvalue() + stderr.getvalue()
+            self.assertNotIn(new_value, everything)
+            self.assertIn("***REDACTED***", everything)
+
+    def test_secrets_set_failure_masks_the_new_value_with_debug(self) -> None:
+        new_value = "brand-new-cloudflare-token-yyy222"
+        with TemporaryDirectory() as tmp:
+            infra_dir, identity = _project(Path(tmp))
+            stdout, stderr = io.StringIO(), io.StringIO()
+
+            def boom(*_args: object, **_kwargs: object) -> None:
+                raise StackError(f"failed to encrypt: {new_value}", f"age stderr said: {new_value}")
+
+            with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(identity)}, clear=False):
+                with mock.patch("stackbase.secrets_cli.sys.stdin", io.StringIO(new_value)):
+                    with mock.patch("stackbase.secrets_cli.save_secrets", side_effect=boom):
+                        with (
+                            contextlib.redirect_stdout(stdout),
+                            contextlib.redirect_stderr(stderr),
+                            self.assertRaises(SystemExit) as caught,
+                        ):
+                            main(["--infra-dir", str(infra_dir), "secrets", "set", "cloudflare_token", "--debug"])
+
+            self.assertEqual(caught.exception.code, 1)
+            everything = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("Traceback (most recent call last)", everything)
+            self.assertNotIn(new_value, everything)
+            self.assertIn("***REDACTED***", everything)
+
+    # -- secrets edit: both the original bundle value and the edited value --
+
+    def _fake_edit_key_leaking(self, original_value: str, new_value: str):
+        def fake_edit_key(infra_dir: Path, key: str, *, emit, register_secret) -> None:  # noqa: ANN001
+            register_secret(key, original_value)
+            register_secret(key, new_value)
+            raise StackError(
+                f"the editor left something odd behind: {new_value}",
+                f"the value used to be: {original_value}",
+            )
+
+        return fake_edit_key
+
+    def test_secrets_edit_failure_masks_the_original_and_edited_value_without_debug(self) -> None:
+        original_value, new_value = "old-cloudflare-secret-ppp999", "new-cloudflare-secret-qqq111"
+        with TemporaryDirectory() as tmp:
+            infra_dir, identity = _project(Path(tmp))
+            stdout, stderr = io.StringIO(), io.StringIO()
+
+            with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(identity)}, clear=False):
+                with mock.patch(
+                    "stackbase.__main__.edit_key",
+                    side_effect=self._fake_edit_key_leaking(original_value, new_value),
+                ):
+                    with (
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                        self.assertRaises(SystemExit) as caught,
+                    ):
+                        main(["--infra-dir", str(infra_dir), "secrets", "edit", "cloudflare_token"])
+
+            self.assertEqual(caught.exception.code, 1)
+            everything = stdout.getvalue() + stderr.getvalue()
+            self.assertNotIn(original_value, everything)
+            self.assertNotIn(new_value, everything)
+            self.assertIn("***REDACTED***", everything)
+
+    def test_secrets_edit_failure_masks_the_original_and_edited_value_with_debug(self) -> None:
+        original_value, new_value = "old-cloudflare-secret-rrr333", "new-cloudflare-secret-sss444"
+        with TemporaryDirectory() as tmp:
+            infra_dir, identity = _project(Path(tmp))
+            stdout, stderr = io.StringIO(), io.StringIO()
+
+            with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(identity)}, clear=False):
+                with mock.patch(
+                    "stackbase.__main__.edit_key",
+                    side_effect=self._fake_edit_key_leaking(original_value, new_value),
+                ):
+                    with (
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                        self.assertRaises(SystemExit) as caught,
+                    ):
+                        main(["--infra-dir", str(infra_dir), "secrets", "edit", "cloudflare_token", "--debug"])
+
+            self.assertEqual(caught.exception.code, 1)
+            everything = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("Traceback (most recent call last)", everything)
+            self.assertNotIn(original_value, everything)
+            self.assertNotIn(new_value, everything)
+            self.assertIn("***REDACTED***", everything)
+
+    # -- ci-setup: a private-key body line -----------------------------------
+
+    def _fake_ci_setup_leaking(self, key_line: str):
+        def fake_ci_setup(infra_dir: Path, *, rotate: bool, emit, register_secret) -> None:  # noqa: ANN001
+            register_secret(key_line)
+            raise StackError(
+                f"gh secret set STACK_DEPLOY_KEY failed, stderr echoed: {key_line}",
+                "check gh auth status",
+            )
+
+        return fake_ci_setup
+
+    def test_ci_setup_failure_masks_a_private_key_body_line_without_debug(self) -> None:
+        key_line = "MC4CAQAwBQYDK2VwBCIEIExampleKeyMaterialLeakLine"
+        with TemporaryDirectory() as tmp:
+            infra_dir, identity = _project(Path(tmp))
+            stdout, stderr = io.StringIO(), io.StringIO()
+
+            with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(identity)}, clear=False):
+                with mock.patch("stackbase.__main__.ci_setup", side_effect=self._fake_ci_setup_leaking(key_line)):
+                    with (
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                        self.assertRaises(SystemExit) as caught,
+                    ):
+                        main(["--infra-dir", str(infra_dir), "ci-setup"])
+
+            self.assertEqual(caught.exception.code, 1)
+            everything = stdout.getvalue() + stderr.getvalue()
+            self.assertNotIn(key_line, everything)
+            self.assertIn("***REDACTED***", everything)
+
+    def test_ci_setup_failure_masks_a_private_key_body_line_with_debug(self) -> None:
+        key_line = "MC4CAQAwBQYDK2VwBCIEIAnotherExampleKeyMaterialLine"
+        with TemporaryDirectory() as tmp:
+            infra_dir, identity = _project(Path(tmp))
+            stdout, stderr = io.StringIO(), io.StringIO()
+
+            with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(identity)}, clear=False):
+                with mock.patch("stackbase.__main__.ci_setup", side_effect=self._fake_ci_setup_leaking(key_line)):
+                    with (
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                        self.assertRaises(SystemExit) as caught,
+                    ):
+                        main(["--infra-dir", str(infra_dir), "ci-setup", "--debug"])
+
+            self.assertEqual(caught.exception.code, 1)
+            everything = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("Traceback (most recent call last)", everything)
+            self.assertNotIn(key_line, everything)
+            self.assertIn("***REDACTED***", everything)
+
+
 @contextlib.contextmanager
 def _cli_no_cloudflare(server: FakeServer, identity: Path):
     """Like `_cli`, but also tracks whether CloudflareClient is ever constructed."""

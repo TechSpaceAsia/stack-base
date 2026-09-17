@@ -317,9 +317,15 @@ class PrivateKeyNeverLeaksTests(unittest.TestCase):
     """The private key must never appear in any argv, log line, exception, or
     file outside the RAM dir (task brief). Scans every recorded argv/kwargs
     and the whole temp project tree after a full run.
+
+    M2, Fix round 1: the leak scan used to exempt every bytes-typed kwarg
+    wholesale ("bytes are allowed to carry it"), which would also have
+    passed if the key had leaked into some OTHER bytes kwarg by mistake.
+    Tightened to exempt only `kwargs["input"]` of the `gh secret set` call,
+    and to assert positively that this is exactly where the key travels.
     """
 
-    def test_the_private_key_never_appears_in_any_recorded_argv_or_on_disk(self) -> None:
+    def test_the_private_key_appears_only_in_gh_secret_sets_input_kwarg_nowhere_else(self) -> None:
         with Project() as infra_dir:
             runner = FakeRunner(handler=_happy_path_handler())
             printed: list[str] = []
@@ -327,13 +333,26 @@ class PrivateKeyNeverLeaksTests(unittest.TestCase):
             ci_setup(infra_dir, runner=runner, emit=printed.append)
 
             needle = _PRIVATE_KEY_BODY.strip()
+            needle_bytes = needle.encode("utf-8")
+            found_in_the_one_legitimate_channel = False
+
             for call in runner.calls:
+                is_gh_secret_set = call["argv"][:3] == ["gh", "secret", "set"]
                 self.assertNotIn(needle, " ".join(call["argv"]))
-                for value in call["kwargs"].values():
-                    if isinstance(value, str):
-                        self.assertNotIn(needle, value)
-                    # bytes (the stdin payload) are allowed to carry it --
-                    # that's the one legitimate channel.
+                for kwarg_name, value in call["kwargs"].items():
+                    if is_gh_secret_set and kwarg_name == "input":
+                        if isinstance(value, bytes) and needle_bytes in value:
+                            found_in_the_one_legitimate_channel = True
+                        continue
+                    if isinstance(value, bytes):
+                        self.assertNotIn(needle_bytes, value, f"leaked into {call['argv']}'s {kwarg_name}= kwarg")
+                    elif isinstance(value, str):
+                        self.assertNotIn(needle, value, f"leaked into {call['argv']}'s {kwarg_name}= kwarg")
+
+            self.assertTrue(
+                found_in_the_one_legitimate_channel,
+                "expected the private key in gh secret set's input= kwarg -- it never traveled at all",
+            )
 
             self.assertNotIn(needle, "\n".join(printed))
 
@@ -346,6 +365,71 @@ class PrivateKeyNeverLeaksTests(unittest.TestCase):
                     continue
                 self.assertNotIn(needle, text, f"private key leaked into {path}")
 
+
+class RegisterSecretForRedactionTests(unittest.TestCase):
+    """F2, Fix round 1: `ci_setup` must feed the generated private key into
+    `register_secret` BEFORE the `gh secret set` call -- the one place it
+    could conceivably come back in a failure's stderr -- so the CLI's own
+    redaction net (`stackbase.__main__`'s `secrets` dict) knows about it
+    before any operation that could raise.
+    """
+
+    def test_the_whole_key_and_every_body_line_are_registered_before_gh_secret_set(self) -> None:
+        # A tripwire runner: raises if `gh secret set` is ever reached before
+        # `register_secret` has already seen the whole key -- proving the
+        # registration happens strictly before that call, not just "at some
+        # point during the run".
+        registered: list[str] = []
+        state = {"registered_before_call": False}
+
+        def handler(argv, kwargs):
+            if argv[:3] == ["gh", "secret", "set"]:
+                state["registered_before_call"] = _PRIVATE_KEY_BODY in registered
+            return _happy_path_handler()(argv, kwargs)
+
+        with Project() as infra_dir:
+            runner = FakeRunner(handler=handler)
+
+            ci_setup(infra_dir, runner=runner, emit=_silent, register_secret=registered.append)
+
+            self.assertTrue(
+                state["registered_before_call"],
+                "the private key was not registered before `gh secret set` ran",
+            )
+            # The whole PEM text was registered.
+            self.assertIn(_PRIVATE_KEY_BODY, registered)
+            # Every non-header/footer body line (>= 8 chars) was registered too.
+            for line in _PRIVATE_KEY_BODY.splitlines():
+                stripped = line.strip()
+                if stripped and not stripped.startswith("-----") and len(stripped) >= 8:
+                    self.assertIn(stripped, registered)
+
+    def test_registration_happens_even_when_gh_secret_set_fails(self) -> None:
+        def handler(argv, kwargs):
+            if argv[:3] == ["git", "remote", "get-url"]:
+                return _cp(argv, stdout="git@github.com:acme/widgets.git\n")
+            if argv[:2] == ["gh", "auth"]:
+                return _cp(argv)
+            if argv[0] == "ssh-keygen":
+                key_path = Path(argv[argv.index("-f") + 1])
+                key_path.write_text(_PRIVATE_KEY_BODY, encoding="utf-8")
+                (key_path.parent / (key_path.name + ".pub")).write_text(_PUBLIC_KEY_BODY, encoding="utf-8")
+                return _cp(argv)
+            if argv[:3] == ["gh", "secret", "set"]:
+                return _cp(argv, returncode=1, stderr="permission denied\n")
+            return None
+
+        with Project() as infra_dir:
+            runner = FakeRunner(handler=handler)
+            registered: list[str] = []
+
+            with self.assertRaises(StackError):
+                ci_setup(infra_dir, runner=runner, emit=_silent, register_secret=registered.append)
+
+            self.assertIn(_PRIVATE_KEY_BODY, registered)
+
+
+class PrivateKeyNeverLeaksRamdirTests(unittest.TestCase):
     def test_the_ramdir_itself_no_longer_exists_once_ci_setup_returns(self) -> None:
         """Belt-and-braces: the private key's own directory is gone, not just
         its content unreferenced -- proves the `with private_ram_dir()` block

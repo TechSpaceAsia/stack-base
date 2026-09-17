@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -50,11 +51,44 @@ def _validate_key_name(key: str) -> None:
         )
 
 
+def _editor_argv(scratch: Path) -> list[str]:
+    """The argv to launch the configured editor on `scratch`.
+
+    Tries `$VISUAL` then `$EDITOR`, each split with `shlex.split` (NEVER
+    `shell=True` -- the result is exec'd as a literal argv list, so shell
+    metacharacters in the value are inert, not a command-injection vector).
+    An unset or whitespace-only value falls through to the next candidate;
+    a value that fails to parse (e.g. an unbalanced quote) raises a
+    `StackError` naming the variable, not its content -- the raw value could
+    itself contain something not meant to be echoed verbatim. Neither
+    variable usable -> `vi`, unsplit (never fails to parse).
+    """
+    for var in ("VISUAL", "EDITOR"):
+        raw = os.environ.get(var)
+        if raw is None or not raw.strip():
+            continue
+        try:
+            parts = shlex.split(raw)
+        except ValueError as exc:
+            raise StackError(
+                f"${var} could not be parsed as a command",
+                f"check for an unbalanced quote (or similar) in ${var}",
+            ) from exc
+        if not parts:
+            continue
+        return [*parts, str(scratch)]
+    return ["vi", str(scratch)]
+
+
 def _stdin_hint(key: str) -> str:
     return (
         f"pass the value on stdin -- e.g. printf '%s' \"$VALUE\" | ./infra/up secrets set {key}, "
         f"or ./infra/up secrets set {key} < file"
     )
+
+
+def _noop_register(_key: str, _value: str) -> None:
+    pass
 
 
 def list_key_names(infra_dir: Path) -> list[str]:
@@ -69,6 +103,7 @@ def set_key(
     *,
     stdin: Any = None,
     emit: Callable[[str], None] = print,
+    register_secret: Callable[[str, str], None] = _noop_register,
 ) -> None:
     """Set `key`'s value, read whole from `stdin` (defaults to `sys.stdin`).
 
@@ -79,6 +114,14 @@ def set_key(
     same check `up` performs -- so a malformed app_env is caught here, not
     on the next `up`. Only the key name is ever printed -- not its length,
     not any part of its value.
+
+    `register_secret(key, value)` feeds the CLI's own redaction net (F2, Fix
+    round 1) -- the caller wires this to the same dict `error_line`/
+    `_print_traceback` mask with. The NEW value is registered as soon as it
+    is read, before it is validated or saved (it is not in the decrypted
+    bundle yet, so nothing upstream would otherwise know to mask it); every
+    existing bundle value is registered right after decryption, in case a
+    later failure echoes one of those instead.
     """
     _validate_key_name(key)
     source = stdin if stdin is not None else sys.stdin
@@ -88,17 +131,34 @@ def set_key(
     value = source.read()
     if isinstance(value, bytes):
         value = value.decode("utf-8")
-    if key == "app_env":
-        value = validate_app_env(value)
+    register_secret(key, value)
 
     secrets = load_secrets(infra_dir)
+    for existing_key, existing_value in secrets.items():
+        register_secret(existing_key, existing_value)
+
+    if key == "app_env":
+        value = validate_app_env(value)
+        register_secret(key, value)
+
     secrets[key] = value
     save_secrets(infra_dir, secrets)
     emit(key)
 
 
-def unset_key(infra_dir: Path, key: str, *, emit: Callable[[str], None] = print) -> None:
-    """Remove `key`. Refuses the required token key outright."""
+def unset_key(
+    infra_dir: Path,
+    key: str,
+    *,
+    emit: Callable[[str], None] = print,
+    register_secret: Callable[[str, str], None] = _noop_register,
+) -> None:
+    """Remove `key`. Refuses the required token key outright.
+
+    Registers every existing bundle value for redaction right after
+    decryption (F2, Fix round 1) -- a failure from `save_secrets` could
+    otherwise echo one of the remaining secrets unmasked.
+    """
     _validate_key_name(key)
     if key == REQUIRED_KEY:
         raise StackError(
@@ -107,6 +167,9 @@ def unset_key(infra_dir: Path, key: str, *, emit: Callable[[str], None] = print)
         )
 
     secrets = load_secrets(infra_dir)
+    for existing_key, existing_value in secrets.items():
+        register_secret(existing_key, existing_value)
+
     if key not in secrets:
         emit(f"{key}: was not set, nothing to do")
         return
@@ -122,29 +185,39 @@ def edit_key(
     *,
     runner: Any = subprocess.run,
     emit: Callable[[str], None] = print,
+    register_secret: Callable[[str, str], None] = _noop_register,
 ) -> None:
     """Edit `key`'s value in `$VISUAL`/`$EDITOR`/`vi`, via a RAM-only scratch file.
 
     The scratch file holds ONLY this one key's value -- never the whole
-    secrets bundle -- at mode 0600, inside `private_ram_dir()`. If the
-    editor leaves the content unchanged, nothing is re-encrypted.
+    secrets bundle -- created directly at mode 0600 (M1, Fix round 1: no
+    window at a laxer mode between creation and a later `chmod`), inside
+    `private_ram_dir()`. If the editor leaves the content unchanged, nothing
+    is re-encrypted.
+
+    `register_secret(key, value)` feeds the CLI's own redaction net (F2, Fix
+    round 1), the same way `set_key` does: every existing bundle value right
+    after decryption, and the freshly-edited value as soon as it is read
+    back -- before it is validated or saved.
     """
     _validate_key_name(key)
     secrets = load_secrets(infra_dir)
+    for existing_key, existing_value in secrets.items():
+        register_secret(existing_key, existing_value)
     original = secrets.get(key, "")
 
     with private_ram_dir() as ramdir:
         scratch = ramdir / key
-        scratch.write_text(original, encoding="utf-8")
-        scratch.chmod(0o600)
+        fd = os.open(str(scratch), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(original)
 
-        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
-        argv = [editor, str(scratch)]
+        argv = _editor_argv(scratch)
         try:
             result = runner(argv, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr, check=False)
         except FileNotFoundError as exc:
             raise StackError(
-                f"the editor '{editor}' was not found",
+                f"the editor '{argv[0]}' was not found",
                 "set $EDITOR (or $VISUAL) to an installed editor",
             ) from exc
         if getattr(result, "returncode", 0) != 0:
@@ -155,6 +228,8 @@ def edit_key(
 
         edited = scratch.read_text(encoding="utf-8")
 
+    register_secret(key, edited)
+
     emit(f"note: {_EDITOR_HINT}")
 
     if edited == original:
@@ -163,6 +238,7 @@ def edit_key(
 
     if key == "app_env":
         edited = validate_app_env(edited)
+        register_secret(key, edited)
 
     secrets[key] = edited
     save_secrets(infra_dir, secrets)

@@ -123,7 +123,19 @@ def load_secrets(infra_dir: Path) -> dict[str, str]:
 
 
 def save_secrets(infra_dir: Path, data: dict[str, str]) -> None:
-    """Encrypt `data` as JSON to `<infra_dir>/secrets.age`; plaintext never touches disk."""
+    """Encrypt `data` as JSON to `<infra_dir>/secrets.age`; plaintext never touches disk.
+
+    `age` writes to a same-directory temp file first (`secrets.age.<pid>.tmp`,
+    created at mode 0600 with no window at a laxer mode -- `os.open` with
+    `O_CREAT|O_EXCL` sets the mode atomically, and `age -o` writing into an
+    already-existing file reuses that inode/mode rather than replacing it).
+    Only once `age` has exited 0 and the temp file is non-empty is it
+    `os.replace`d over `secrets.age` -- an atomic rename on the same
+    filesystem. A crash or a failing `age` mid-write therefore can never
+    truncate the only copy of the project's secrets: the original file is
+    untouched until the replace, and the temp file is removed on every
+    failure path (M3, Fix round 1).
+    """
     recipients_path = infra_dir / _RECIPIENTS_FILENAME
     secrets_path = infra_dir / _SECRETS_FILENAME
 
@@ -135,10 +147,28 @@ def save_secrets(infra_dir: Path, data: dict[str, str]) -> None:
         )
 
     payload = json.dumps(data).encode("utf-8")
-    result = _run_age(["-R", str(recipients_path), "-o", str(secrets_path)], input_bytes=payload)
-    if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", errors="replace").strip()
-        raise StackError(
-            f"failed to encrypt secrets to {secrets_path}",
-            stderr or f"check that {recipients_path} contains valid age public keys",
-        )
+    tmp_path = secrets_path.parent / f"{_SECRETS_FILENAME}.{os.getpid()}.tmp"
+
+    # A stale temp file from a previous crash under the same pid (rare, but
+    # possible across pid reuse) must not block this run from converging.
+    tmp_path.unlink(missing_ok=True)
+    fd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(fd)
+
+    try:
+        result = _run_age(["-R", str(recipients_path), "-o", str(tmp_path)], input_bytes=payload)
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            raise StackError(
+                f"failed to encrypt secrets to {secrets_path}",
+                stderr or f"check that {recipients_path} contains valid age public keys",
+            )
+        if tmp_path.stat().st_size == 0:
+            raise StackError(
+                f"failed to encrypt secrets to {secrets_path}",
+                "age exited successfully but produced no output -- nothing on disk was changed",
+            )
+        os.replace(tmp_path, secrets_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise

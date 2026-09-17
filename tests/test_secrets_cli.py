@@ -9,6 +9,7 @@ than mocking it away.
 from __future__ import annotations
 
 import io
+import os
 import shutil
 import subprocess
 import tempfile
@@ -249,6 +250,178 @@ class SecretsCliRoundTripTests(unittest.TestCase):
             edit_key(infra_dir, "cloudflare_token", runner=self._edit_runner("same"), emit=printed.append)
 
             self.assertTrue(any("noswapfile" in line for line in printed))
+
+    # -- edit: $VISUAL/$EDITOR argv splitting (F1, Fix round 1) --------------
+
+    def _capturing_runner(self, new_content: str, captured: list[list[str]]):
+        def runner(argv, **kwargs):
+            captured.append(list(argv))
+            self.assertIsNot(kwargs.get("shell"), True)  # NEVER shell=True
+            path = Path(argv[-1])
+            path.write_text(new_content, encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0)
+
+        return runner
+
+    def test_edit_splits_a_multi_word_editor_into_argv_with_the_scratch_path_last(self) -> None:
+        captured: list[list[str]] = []
+        with TempInfraDir() as infra_dir:
+            self._infra(infra_dir, {"hostinger_token": "htok", "cloudflare_token": "old"})
+
+            with mock.patch.dict("os.environ", {"EDITOR": "code -w", "VISUAL": ""}):
+                edit_key(
+                    infra_dir, "cloudflare_token", runner=self._capturing_runner("new", captured), emit=_silent
+                )
+
+            self.assertEqual(len(captured), 1)
+            argv = captured[0]
+            self.assertEqual(argv[0], "code")
+            self.assertEqual(argv[1], "-w")
+            self.assertTrue(argv[-1].endswith("/cloudflare_token"))
+
+    def test_edit_never_reaches_a_shell_even_with_shell_metacharacters_in_editor(self) -> None:
+        """`EDITOR="vi; touch /tmp/x"` must be looked up as a literal binary
+        named `vi;` -- never interpreted by a shell -- so the injected
+        command never runs. shlex.split keeps the trailing `;` attached to
+        the first token because it is not a shell.
+        """
+        captured: list[list[str]] = []
+        with TempInfraDir() as infra_dir:
+            self._infra(infra_dir, {"hostinger_token": "htok", "cloudflare_token": "old"})
+
+            with mock.patch.dict("os.environ", {"EDITOR": "vi; touch /tmp/x", "VISUAL": ""}):
+                edit_key(
+                    infra_dir, "cloudflare_token", runner=self._capturing_runner("new", captured), emit=_silent
+                )
+
+            self.assertEqual(len(captured), 1)
+            argv = captured[0]
+            self.assertIsInstance(argv, list)
+            self.assertEqual(argv[0], "vi;")  # the metacharacter is inert, part of a (bogus) binary name
+            self.assertIn("touch", argv)  # a literal argv element, not executed
+
+    def test_edit_falls_through_an_empty_visual_to_editor(self) -> None:
+        captured: list[list[str]] = []
+        with TempInfraDir() as infra_dir:
+            self._infra(infra_dir, {"hostinger_token": "htok", "cloudflare_token": "old"})
+
+            with mock.patch.dict("os.environ", {"VISUAL": "   ", "EDITOR": "ed"}):
+                edit_key(
+                    infra_dir, "cloudflare_token", runner=self._capturing_runner("new", captured), emit=_silent
+                )
+
+            self.assertEqual(captured[0][0], "ed")
+
+    def test_edit_raises_on_an_unparsable_editor_value_naming_the_variable(self) -> None:
+        with TempInfraDir() as infra_dir:
+            self._infra(infra_dir, {"hostinger_token": "htok", "cloudflare_token": "old"})
+
+            with mock.patch.dict("os.environ", {"EDITOR": 'vi "unterminated', "VISUAL": ""}):
+                with self.assertRaises(StackError) as caught:
+                    edit_key(infra_dir, "cloudflare_token", runner=self._edit_runner("new"), emit=_silent)
+
+            self.assertIn("EDITOR", str(caught.exception))
+
+    # -- edit: the scratch file is created at 0600 with no window (M1) -------
+
+    def test_edit_creates_the_scratch_file_at_mode_0600_even_under_a_permissive_umask(self) -> None:
+        seen_modes: list[int] = []
+
+        def runner(argv, **kwargs):
+            path = Path(argv[-1])
+            seen_modes.append(path.stat().st_mode & 0o777)
+            path.write_text("new", encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0)
+
+        old_umask = os.umask(0)  # permissive: proves the mode comes from os.open's own argument
+        try:
+            with TempInfraDir() as infra_dir:
+                self._infra(infra_dir, {"hostinger_token": "htok", "cloudflare_token": "old"})
+
+                edit_key(infra_dir, "cloudflare_token", runner=runner, emit=_silent)
+        finally:
+            os.umask(old_umask)
+
+        self.assertEqual(seen_modes, [0o600])
+
+    # -- register_secret: feeding the CLI's redaction net (F2, Fix round 1) --
+
+    def test_set_registers_the_new_value_and_every_existing_bundle_value(self) -> None:
+        with TempInfraDir() as infra_dir:
+            self._infra(infra_dir, {"hostinger_token": "htok"})
+            registered: list[tuple[str, str]] = []
+
+            set_key(
+                infra_dir,
+                "cloudflare_token",
+                stdin=_FakeStdin("brand-new"),
+                emit=_silent,
+                register_secret=lambda k, v: registered.append((k, v)),
+            )
+
+            self.assertIn(("cloudflare_token", "brand-new"), registered)
+            self.assertIn(("hostinger_token", "htok"), registered)
+
+    def test_set_registers_the_new_value_before_saving_even_if_save_fails(self) -> None:
+        with TempInfraDir() as infra_dir:
+            self._infra(infra_dir, {"hostinger_token": "htok"})
+            registered: list[tuple[str, str]] = []
+
+            with mock.patch("stackbase.secrets_cli.save_secrets", side_effect=StackError("boom", "boom")):
+                with self.assertRaises(StackError):
+                    set_key(
+                        infra_dir,
+                        "cloudflare_token",
+                        stdin=_FakeStdin("brand-new"),
+                        emit=_silent,
+                        register_secret=lambda k, v: registered.append((k, v)),
+                    )
+
+            self.assertIn(("cloudflare_token", "brand-new"), registered)
+
+    def test_unset_registers_every_existing_bundle_value(self) -> None:
+        with TempInfraDir() as infra_dir:
+            self._infra(infra_dir, {"hostinger_token": "htok", "cloudflare_token": "ctok"})
+            registered: list[tuple[str, str]] = []
+
+            unset_key(infra_dir, "cloudflare_token", emit=_silent, register_secret=lambda k, v: registered.append((k, v)))
+
+            self.assertIn(("hostinger_token", "htok"), registered)
+            self.assertIn(("cloudflare_token", "ctok"), registered)
+
+    def test_edit_registers_the_original_bundle_value_and_the_edited_value(self) -> None:
+        with TempInfraDir() as infra_dir:
+            self._infra(infra_dir, {"hostinger_token": "htok", "cloudflare_token": "old-value"})
+            registered: list[tuple[str, str]] = []
+
+            edit_key(
+                infra_dir,
+                "cloudflare_token",
+                runner=self._edit_runner("new-value"),
+                emit=_silent,
+                register_secret=lambda k, v: registered.append((k, v)),
+            )
+
+            self.assertIn(("hostinger_token", "htok"), registered)
+            self.assertIn(("cloudflare_token", "old-value"), registered)  # original, before the edit
+            self.assertIn(("cloudflare_token", "new-value"), registered)  # the edited value
+
+    def test_edit_registers_the_edited_value_before_saving_even_if_save_fails(self) -> None:
+        with TempInfraDir() as infra_dir:
+            self._infra(infra_dir, {"hostinger_token": "htok", "cloudflare_token": "old-value"})
+            registered: list[tuple[str, str]] = []
+
+            with mock.patch("stackbase.secrets_cli.save_secrets", side_effect=StackError("boom", "boom")):
+                with self.assertRaises(StackError):
+                    edit_key(
+                        infra_dir,
+                        "cloudflare_token",
+                        runner=self._edit_runner("new-value"),
+                        emit=_silent,
+                        register_secret=lambda k, v: registered.append((k, v)),
+                    )
+
+            self.assertIn(("cloudflare_token", "new-value"), registered)
 
 
 class ReadmeDocumentsTheSafeFlowTests(unittest.TestCase):

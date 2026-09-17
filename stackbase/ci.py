@@ -91,6 +91,26 @@ def _require_gh(*, runner: Any) -> None:
         raise StackError("gh is not authenticated", "run `gh auth login`, then re-run ci-setup")
 
 
+def _register_private_key(private_key_text: str, register_secret: Callable[[str], None]) -> None:
+    """Feed the private key's whole text, plus each base64 body line, into
+    `register_secret` (F2, Fix round 1) -- before it is ever handed to `gh`.
+
+    A PEM/OpenSSH private key is `-----BEGIN ...-----` / body lines /
+    `-----END ...-----`; only the header/footer lines are non-secret. Each
+    body line is registered individually (not just the joined whole) so that
+    a partial echo of the key (e.g. one line of a remote command's stderr)
+    is still masked, the same reasoning `reconcile.redaction_values` applies
+    to `app_env`.
+    """
+    register_secret(private_key_text)
+    for line in private_key_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("-----"):
+            continue
+        if len(stripped) >= 8:
+            register_secret(stripped)
+
+
 def _write_pub_key_atomically(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / f".{path.name}.tmp"
@@ -105,6 +125,7 @@ def ci_setup(
     rotate: bool = False,
     runner: Any = subprocess.run,
     emit: Callable[[str], None] = print,
+    register_secret: Callable[[str], None] = lambda _value: None,
 ) -> None:
     """Generate (or, with `rotate=True`, replace) the CI deploy key.
 
@@ -112,6 +133,13 @@ def ci_setup(
     `rotate` is false -- ci-setup never silently overwrites a live key.
     Every check that can fail cheaply (repo detection, `gh` auth, an
     existing key) runs BEFORE `ssh-keygen` is ever invoked.
+
+    `register_secret(value)` feeds the CLI's own redaction net (F2, Fix
+    round 1) -- the caller wires this to the same masking mechanism
+    `error_line`/`_print_traceback` use. The generated private key (whole
+    text and each base64 body line) is registered BEFORE the `gh secret set`
+    call -- the one operation that could conceivably echo it back in a
+    failure -- not case-by-case after the fact.
     """
     cfg = load_config(infra_dir)
     pub_path = infra_dir / "keys" / PUB_KEY_FILENAME
@@ -163,6 +191,7 @@ def ci_setup(
 
         public_key = pub_key_path.read_text(encoding="utf-8").strip() + "\n"
         private_key_bytes = key_path.read_bytes()
+        _register_private_key(private_key_bytes.decode("utf-8", errors="replace"), register_secret)
 
         # The private key travels ONLY as this subprocess call's stdin
         # (`input=`) -- never as an argv element, never as an environment

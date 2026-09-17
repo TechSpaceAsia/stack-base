@@ -147,6 +147,103 @@ class SecretsRoundTripTests(unittest.TestCase):
 
             self.assertIn("age-recipients.txt", str(ctx.exception))
 
+    # -- atomic save (M3, Fix round 1) ---------------------------------------
+
+    def test_a_failing_age_leaves_the_original_file_byte_identical_and_no_temp_file_behind(self) -> None:
+        """A REAL binary named `age` (a stub script on PATH, ahead of the real
+        one) that actually writes to whatever `-o` names before exiting
+        non-zero -- exercising the real "does age write straight onto
+        secrets.age, or onto a temp file?" question, not just the return
+        code. Against the OLD (pre-M1) code, `-o` names `secrets.age`
+        directly, so this stub would truncate it with garbage even though
+        `age` "failed" -- exactly the bug M3 fixes.
+        """
+        with TempInfraDir() as infra_dir, tempfile.TemporaryDirectory() as stub_bin_dir:
+            (infra_dir / "age-recipients.txt").write_text(self.public_key + "\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(self.identity_path)}):
+                save_secrets(infra_dir, {"a": "b"})
+            original_bytes = (infra_dir / "secrets.age").read_bytes()
+
+            stub = Path(stub_bin_dir) / "age"
+            stub.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "args = sys.argv[1:]\n"
+                "out = args[args.index('-o') + 1]\n"
+                "with open(out, 'wb') as f:\n"
+                "    f.write(b'GARBAGE-FROM-A-CRASHED-AGE-MID-WRITE')\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            new_path = f"{stub_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+
+            with mock.patch.dict(
+                os.environ, {"PATH": new_path, "STACKBASE_AGE_IDENTITY": str(self.identity_path)}
+            ):
+                with self.assertRaises(StackError):
+                    save_secrets(infra_dir, {"a": "c"})
+
+            self.assertEqual(
+                (infra_dir / "secrets.age").read_bytes(),
+                original_bytes,
+                "secrets.age was truncated by a failing age instead of only the temp file",
+            )
+            leftovers = list(infra_dir.glob("secrets.age.*.tmp"))
+            self.assertEqual(leftovers, [], f"leftover temp files were not cleaned up: {leftovers}")
+
+    def test_age_producing_no_output_is_a_failure_and_leaves_the_original_untouched(self) -> None:
+        with TempInfraDir() as infra_dir:
+            (infra_dir / "age-recipients.txt").write_text(self.public_key + "\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(self.identity_path)}):
+                save_secrets(infra_dir, {"a": "b"})
+            original_bytes = (infra_dir / "secrets.age").read_bytes()
+
+            def empty_output_age(argv, *, input=None, capture_output=True, check=False, **kwargs):
+                # Exits 0 but (bug, or a truncated write) produces nothing.
+                return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+
+            with mock.patch("stackbase.secrets.subprocess.run", side_effect=empty_output_age):
+                with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(self.identity_path)}):
+                    with self.assertRaises(StackError):
+                        save_secrets(infra_dir, {"a": "c"})
+
+            self.assertEqual((infra_dir / "secrets.age").read_bytes(), original_bytes)
+            leftovers = list(infra_dir.glob("secrets.age.*.tmp"))
+            self.assertEqual(leftovers, [])
+
+    def test_a_successful_save_leaves_no_temp_file_behind(self) -> None:
+        with TempInfraDir() as infra_dir:
+            (infra_dir / "age-recipients.txt").write_text(self.public_key + "\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(self.identity_path)}):
+                save_secrets(infra_dir, {"a": "b"})
+
+            leftovers = list(infra_dir.glob("secrets.age.*.tmp"))
+            self.assertEqual(leftovers, [])
+
+    def test_the_temp_file_is_created_at_mode_0600_even_under_a_permissive_umask(self) -> None:
+        with TempInfraDir() as infra_dir:
+            (infra_dir / "age-recipients.txt").write_text(self.public_key + "\n", encoding="utf-8")
+            seen_modes: list[int] = []
+            real_run = subprocess.run
+
+            def spying_run(argv, **kwargs):
+                if argv[:1] == ["age"] and "-o" in argv:
+                    tmp_path = Path(argv[argv.index("-o") + 1])
+                    seen_modes.append(tmp_path.stat().st_mode & 0o777)
+                return real_run(argv, **kwargs)
+
+            old_umask = os.umask(0)
+            try:
+                with mock.patch("stackbase.secrets.subprocess.run", side_effect=spying_run):
+                    with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(self.identity_path)}):
+                        save_secrets(infra_dir, {"a": "b"})
+            finally:
+                os.umask(old_umask)
+
+            self.assertEqual(seen_modes, [0o600])
+
 
 if __name__ == "__main__":
     unittest.main()
