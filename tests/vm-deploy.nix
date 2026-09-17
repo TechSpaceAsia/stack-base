@@ -15,6 +15,10 @@
 let
   domain = "node.test";
   project = "teststack";
+  # Must match nixos/deploy.nix's own `stateDir` binding exactly -- see
+  # its comment for why the engine's state lives here and not under
+  # /var/lib/stackbase (app-host.nix's exclusive, root:nginx domain).
+  stateDir = "/var/lib/stackbase-deploy";
 
   # Health tries/sleep are overridden per-invocation in the test (short,
   # per the brief) so this doesn't slow the suite down; the module's real
@@ -34,6 +38,23 @@ let
   # (nixos/deploy.nix), not from anything the app does -- this fake app
   # has to behave the same way, or the zero-downtime-through-nginx
   # assertions below would be proving the wrong mechanism.
+  # Task 2: a test ed25519 keypair per role, generated at BUILD time (via
+  # a plain derivation -- `nix build`/`nix flake check` already realize
+  # derivations referenced from module config, so this needs no special
+  # IFD flag). `client` holds the one key actually listed in
+  # stackbase.deploy.keys; `stranger` is never listed anywhere (proves an
+  # unknown key is denied); `admin` is listed under stackbase.admins, not
+  # stackbase.deploy.keys (proves an admin key doesn't also work for the
+  # `deploy` account).
+  testKeypair = name: pkgs.runCommand "stackbase-test-key-${name}" { nativeBuildInputs = [ pkgs.openssh ]; } ''
+    mkdir -p "$out"
+    ssh-keygen -q -t ed25519 -N "" -f "$out/id_ed25519" -C "${name}"
+  '';
+  clientKeypair = testKeypair "client";
+  strangerKeypair = testKeypair "stranger";
+  adminKeypair = testKeypair "admin";
+  pubKeyOf = drv: lib.removeSuffix "\n" (builtins.readFile "${drv}/id_ed25519.pub");
+
   fakeApp = ''
     #!/usr/bin/env python3
     import http.server
@@ -89,6 +110,18 @@ pkgs.testers.runNixOSTest {
         stackbase.project = project;
         stackbase.domain = domain;
         stackbase.deploy.drainSeconds = 2;
+        # Small enough to be reliably exceeded by a deliberately oversized
+        # test upload, comfortably larger than every real test tarball
+        # (a few KB at most) so none of the legitimate upload subtests
+        # trip it.
+        stackbase.deploy.maxUploadBytes = 65536;
+
+        # The one key actually allowed to drive stack-deploy over SSH.
+        stackbase.deploy.keys.testclient = pubKeyOf clientKeypair;
+        # An admin account (wheel + sudo, per base.nix) -- NOT a
+        # stackbase.deploy.keys entry. Its key must not also work for the
+        # `deploy` account.
+        stackbase.admins.testadmin = pubKeyOf adminKeypair;
 
         stackbase.allowedProxyRanges = lib.mkForce [
           "${nodes.proxy.networking.primaryIPAddress}/32"
@@ -107,6 +140,31 @@ pkgs.testers.runNixOSTest {
         environment.systemPackages = [ pkgs.curl ];
         system.stateVersion = "26.05";
       };
+
+    # Holds the SSH client and every test keypair's private half, and
+    # everything needed to build a release tarball locally (mirroring
+    # make_tarball on `node`) so the upload protocol's stdin-streaming
+    # path is exercised with a real client-to-node byte stream, not a
+    # file already sitting on the node.
+    client =
+      { ... }:
+      {
+        environment.systemPackages = [ pkgs.openssh pkgs.gnutar pkgs.gzip pkgs.coreutils pkgs.curl ];
+        environment.etc."stackbase-test/fake-app.py".text = fakeApp;
+        environment.etc."deploy-test/client_id_ed25519" = {
+          source = "${clientKeypair}/id_ed25519";
+          mode = "0600";
+        };
+        environment.etc."deploy-test/stranger_id_ed25519" = {
+          source = "${strangerKeypair}/id_ed25519";
+          mode = "0600";
+        };
+        environment.etc."deploy-test/admin_id_ed25519" = {
+          source = "${adminKeypair}/id_ed25519";
+          mode = "0600";
+        };
+        system.stateVersion = "26.05";
+      };
   };
 
   testScript =
@@ -117,8 +175,10 @@ pkgs.testers.runNixOSTest {
       node.wait_for_unit("multi-user.target")
       node.wait_for_unit("nginx.service")
       proxy.wait_for_unit("multi-user.target")
+      client.wait_for_unit("multi-user.target")
 
       node_ip = "${nodes.node.networking.primaryIPAddress}"
+      STATE_DIR = "${stateDir}"
       curl_version = (
           "curl -sk -o /tmp/vbody -w '%{http_code}' "
           f"--resolve ${domain}:443:{node_ip} https://${domain}/version"
@@ -168,7 +228,7 @@ pkgs.testers.runNixOSTest {
           node.succeed(f"${fastHealth} stack-deploy deploy v1.0.0 --tarball /tmp/v1.0.0.tar.gz --sha256 {sha}")
 
           assert node.succeed("stack-deploy colors").strip() == "active=blue idle=green"
-          assert node.succeed("cat /var/lib/stackbase/active-color").strip() == "blue"
+          assert node.succeed(f"cat {STATE_DIR}/active-color").strip() == "blue"
           assert node.succeed("readlink /run/${project}/app.sock").strip() == "app-blue.sock"
 
           # The fake app never touches its socket's mode -- this must come
@@ -237,7 +297,7 @@ pkgs.testers.runNixOSTest {
           assert blue_target == "../releases/v1.0.0", f"blue/current must be restored to v1.0.0, got {blue_target!r}"
 
           assert node.succeed("stack-deploy colors").strip() == "active=green idle=blue"
-          assert node.succeed("cat /var/lib/stackbase/active-color").strip() == "green"
+          assert node.succeed(f"cat {STATE_DIR}/active-color").strip() == "green"
           assert node.succeed("readlink /run/${project}/app.sock").strip() == "app-green.sock"
           node.fail("systemctl is-active --quiet ${project}@blue.service")
 
@@ -262,7 +322,7 @@ pkgs.testers.runNixOSTest {
           # otherwise execute() would block here for the holder's whole
           # 5s, and the lock would already be free by the time the
           # concurrent deploy below runs.
-          node.execute("flock /var/lib/stackbase/deploy.lock sleep 5 </dev/null >/dev/null 2>&1 & sleep 1")
+          node.execute(f"flock {STATE_DIR}/deploy.lock sleep 5 </dev/null >/dev/null 2>&1 & sleep 1")
           status, out = node.execute("stack-deploy deploy v1.3.0")
           assert status == 3, f"expected exit 3 while the lock is held, got status={status}, output={out!r}"
           # let the holder release before continuing
@@ -325,7 +385,7 @@ pkgs.testers.runNixOSTest {
           # never updated off blue (green is still linked+healthy from
           # earlier, so resuming it is legitimate).
           assert node.succeed("stack-deploy colors").strip() == "active=blue idle=green"
-          node.succeed("echo green > /var/lib/stackbase/pending-color")
+          node.succeed(f"echo green > {STATE_DIR}/pending-color")
 
           node.shutdown()
           node.start()
@@ -335,7 +395,7 @@ pkgs.testers.runNixOSTest {
           node.wait_for_unit("stackbase-app-boot.service")
 
           assert node.succeed("stack-deploy colors").strip() == "active=green idle=blue"
-          node.fail("test -e /var/lib/stackbase/pending-color")
+          node.fail(f"test -e {STATE_DIR}/pending-color")
 
           code = proxy.succeed(curl_version).strip()
           body = proxy.succeed("cat /tmp/vbody").strip()
@@ -345,7 +405,7 @@ pkgs.testers.runNixOSTest {
 
       with subtest("boot: pending-color with no linked release is discarded, falls back to active-color (I3)"):
           node.succeed("mv /opt/${project}/blue/current /tmp/blue-current-backup")
-          node.succeed("echo blue > /var/lib/stackbase/pending-color")
+          node.succeed(f"echo blue > {STATE_DIR}/pending-color")
 
           # execute()'s (status, output) only captures stdout by default
           # (its internal wrapper pipes stdout alone into base64, no
@@ -356,7 +416,7 @@ pkgs.testers.runNixOSTest {
           assert "has no linked release; discarding" in out, out
 
           assert node.succeed("stack-deploy colors").strip() == "active=green idle=blue"
-          node.fail("test -e /var/lib/stackbase/pending-color")
+          node.fail(f"test -e {STATE_DIR}/pending-color")
 
           node.succeed("mv /tmp/blue-current-backup /opt/${project}/blue/current")
 
@@ -475,7 +535,7 @@ pkgs.testers.runNixOSTest {
           active_color, idle_color = parse_colors(node.succeed("stack-deploy colors").strip())
           idle_link = "/opt/${project}/" + idle_color + "/current"
           prev_target = node.succeed(f"readlink {idle_link}").strip()
-          active_before = node.succeed("cat /var/lib/stackbase/active-color").strip()
+          active_before = node.succeed(f"cat {STATE_DIR}/active-color").strip()
           sock_before = node.succeed("readlink /run/${project}/app.sock").strip()
 
           # Release dir exists, but its binary is present-yet-not-executable
@@ -495,7 +555,7 @@ pkgs.testers.runNixOSTest {
           assert node.succeed(f"readlink {idle_link}").strip() == prev_target, (
               "idle color's current link must be restored on a pre-flip failure"
           )
-          active_color_after = node.succeed("cat /var/lib/stackbase/active-color").strip()
+          active_color_after = node.succeed(f"cat {STATE_DIR}/active-color").strip()
           assert active_color_after == active_before, f"active-color must be untouched, expected {active_before!r} got {active_color_after!r}"
           sock_after = node.succeed("readlink /run/${project}/app.sock").strip()
           assert sock_after == sock_before, f"app.sock must be untouched, expected {sock_before!r} got {sock_after!r}"
@@ -504,7 +564,7 @@ pkgs.testers.runNixOSTest {
       with subtest("post-flip failure (active-color unwritable) leaves traffic on the new color; a later boot converges (N2-B)"):
           active_color, idle_color = parse_colors(node.succeed("stack-deploy colors").strip())
 
-          node.succeed("chattr +i /var/lib/stackbase/active-color")
+          node.succeed(f"chattr +i {STATE_DIR}/active-color")
           try:
               status, out = node.execute("${fastHealth} stack-deploy rollback 2>&1")
               assert status == 1, f"expected exit 1, got status={status}, output={out!r}"
@@ -514,17 +574,17 @@ pkgs.testers.runNixOSTest {
                   "traffic must already be on the new color despite the failed active-color write"
               )
               node.succeed(f"systemctl is-active --quiet ${project}@{idle_color}.service")
-              node.succeed("test -e /var/lib/stackbase/pending-color")
-              assert node.succeed("cat /var/lib/stackbase/active-color").strip() == active_color, (
+              node.succeed(f"test -e {STATE_DIR}/pending-color")
+              assert node.succeed(f"cat {STATE_DIR}/active-color").strip() == active_color, (
                   "active-color must still read the stale value -- the write never landed"
               )
           finally:
-              node.succeed("chattr -i /var/lib/stackbase/active-color")
+              node.succeed(f"chattr -i {STATE_DIR}/active-color")
 
           node.succeed("stack-deploy boot")
-          active_color_converged = node.succeed("cat /var/lib/stackbase/active-color").strip()
+          active_color_converged = node.succeed(f"cat {STATE_DIR}/active-color").strip()
           assert active_color_converged == idle_color, f"expected active-color to converge to {idle_color!r}, got {active_color_converged!r}"
-          node.fail("test -e /var/lib/stackbase/pending-color")
+          node.fail(f"test -e {STATE_DIR}/pending-color")
           colors_converged = node.succeed("stack-deploy colors").strip()
           assert colors_converged == f"active={idle_color} idle={active_color}", (
               f"expected active={idle_color} idle={active_color}, got {colors_converged!r}"
@@ -543,7 +603,7 @@ pkgs.testers.runNixOSTest {
           # has to genuinely fork+exec the missing binary.
           node.succeed(f"systemctl stop ${project}@{idle_color}.service")
           node.succeed(f"mv {idle_target}/${project} /tmp/n3-binary-backup")
-          node.succeed(f"echo {idle_color} > /var/lib/stackbase/pending-color")
+          node.succeed(f"echo {idle_color} > {STATE_DIR}/pending-color")
 
           status, out = node.execute("${brokenHealth} stack-deploy boot 2>&1")
           assert status == 0, f"expected boot to still bring the active color up, got status={status}, output={out!r}"
@@ -552,9 +612,379 @@ pkgs.testers.runNixOSTest {
           assert colors_after == f"active={active_color} idle={idle_color}", (
               f"expected active={active_color} idle={idle_color}, got {colors_after!r}; boot output was {out!r}"
           )
-          node.fail("test -e /var/lib/stackbase/pending-color")
+          node.fail(f"test -e {STATE_DIR}/pending-color")
           node.succeed(f"systemctl is-active --quiet ${project}@{active_color}.service")
 
           node.succeed(f"mv /tmp/n3-binary-backup {idle_target}/${project}")
+
+      # -----------------------------------------------------------------
+      # Task 2: the restricted SSH door (deploy@node, forced command)
+      # -----------------------------------------------------------------
+
+      import shlex
+
+      SSH_OPTS = (
+          "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+          "-o BatchMode=yes -o ConnectTimeout=5 -o IdentitiesOnly=yes"
+      )
+      CLIENT_KEY = "/etc/deploy-test/client_id_ed25519"
+      STRANGER_KEY = "/etc/deploy-test/stranger_id_ed25519"
+      ADMIN_KEY = "/etc/deploy-test/admin_id_ed25519"
+
+      def ssh(cmd, key=CLIENT_KEY, extra=""):
+          "Runs `cmd` as the literal SSH_ORIGINAL_COMMAND against deploy@node. cmd=None omits the command argument entirely (a bare interactive-login attempt)."
+          arg = "" if cmd is None else shlex.quote(cmd)
+          # -n: redirect local stdin from /dev/null. None of these calls
+          # ever need to relay real stdin (ssh_upload, below, builds its
+          # own command with a `< file` redirect instead and deliberately
+          # does NOT use -n, which would override that). Without it, a
+          # command-less invocation (cmd=None, testing the bare
+          # interactive-login-attempt case) tries to keep relaying this
+          # non-tty test shell's own stdin to the remote session
+          # indefinitely, hanging until the test driver's own call
+          # timeout kills it (status 124) instead of the forced command's
+          # prompt exit 2.
+          # timeout 20: a blanket bound on every one of these calls, so a
+          # future protocol surprise blocks this one subtest for at most
+          # 20s instead of hanging the whole build until something else
+          # kills it (see the -L/-R subtest below for exactly that
+          # failure mode, hit for real during development).
+          full = f"timeout 20 ssh {SSH_OPTS} -n {extra} -i {key} deploy@{node_ip} {arg}".strip()
+          return client.execute(f"{full} 2>&1")
+
+      def incoming_files():
+          return set(node.succeed(f"ls {STATE_DIR}/incoming 2>/dev/null || true").split())
+
+      def release_set():
+          return set(node.succeed("ls /opt/${project}/releases").split())
+
+      def client_make_tarball(version, health_code=200):
+          "Build a flat tarball on the CLIENT (mirrors make_tarball on node) so `upload` streams real client->node bytes over ssh."
+          client.succeed(
+              "rm -rf /tmp/pkg && mkdir -p /tmp/pkg && "
+              f"sed -e 's/__VERSION__/{version}/' -e 's/__HEALTH_CODE__/{health_code}/' "
+              "/etc/stackbase-test/fake-app.py > /tmp/pkg/${project} && "
+              "chmod +x /tmp/pkg/${project} && "
+              f"tar -czf /tmp/{version}.tar.gz -C /tmp/pkg ${project}"
+          )
+          return client.succeed(f"sha256sum /tmp/{version}.tar.gz | cut -d' ' -f1").strip()
+
+      def ssh_upload(version, sha, key=CLIENT_KEY):
+          "Pipes /tmp/<version>.tar.gz on the CLIENT into `ssh ... 'upload <version> <sha>'`'s stdin."
+          cmd = f"upload {version} {sha}"
+          full = f"timeout 20 ssh {SSH_OPTS} -i {key} deploy@{node_ip} {shlex.quote(cmd)} < /tmp/{version}.tar.gz 2>&1"
+          return client.execute(full)
+
+      with subtest("ssh deploy@node status works over the forced command"):
+          status, out = ssh("status")
+          assert status == 0, f"expected exit 0, got {status}, output={out!r}"
+          # This is the FIRST ssh connection in the whole test, so the
+          # output also carries OpenSSH's one-time "Warning: Permanently
+          # added ... to the list of known hosts." TOFU line ahead of the
+          # actual command output -- check for the real payload rather
+          # than assuming it's the first line.
+          assert "active=" in out, f"unexpected status output: {out!r}"
+
+      with subtest("full upload -> deploy -> status -> rollback round trip over ssh, as deploy"):
+          before_active, before_idle = parse_colors(node.succeed("stack-deploy colors").strip())
+
+          sha = client_make_tarball("v3.0.0")
+          status, out = ssh_upload("v3.0.0", sha)
+          assert status == 0, f"upload over ssh failed: status={status} output={out!r}"
+          node.succeed("test -d /opt/${project}/releases/v3.0.0")
+          node.fail(f"test -e {STATE_DIR}/incoming/v3.0.0.tar.gz")
+          node.fail(f"test -e {STATE_DIR}/incoming/v3.0.0.tar.gz.partial")
+
+          status, out = ssh("deploy v3.0.0")
+          assert status == 0, f"deploy over ssh failed: status={status} output={out!r}"
+
+          active_after, _ = parse_colors(node.succeed("stack-deploy colors").strip())
+          assert active_after == before_idle, f"expected the swap to land on {before_idle}, got {active_after}"
+
+          status, out = ssh("status")
+          assert status == 0, f"status over ssh failed: status={status} output={out!r}"
+          assert "v3.0.0" in out, f"expected status to mention v3.0.0, got {out!r}"
+
+          code = proxy.succeed(curl_version).strip()
+          body = proxy.succeed("cat /tmp/vbody").strip()
+          assert code == "200" and body == "v3.0.0", f"expected v3.0.0 live after an ssh-driven deploy, got {code}/{body!r}"
+
+          status, out = ssh("rollback")
+          assert status == 0, f"rollback over ssh failed: status={status} output={out!r}"
+          active_final, _ = parse_colors(node.succeed("stack-deploy colors").strip())
+          assert active_final == before_active, f"expected rollback to land back on {before_active}, got {active_final}"
+
+      with subtest("zero-downtime swap driven entirely over ssh"):
+          before_active, before_idle = parse_colors(node.succeed("stack-deploy colors").strip())
+          sha = client_make_tarball("v3.1.0")
+          status, out = ssh_upload("v3.1.0", sha)
+          assert status == 0, f"upload over ssh failed: {out!r}"
+
+          status, pid_out = proxy.execute(
+              "rm -f /tmp/loop2.log; "
+              "( while true; do "
+              f"code=$(curl -sk -o /tmp/vbody3 -w '%{{http_code}}' --resolve ${domain}:443:{node_ip} https://${domain}/version 2>/dev/null); "
+              "echo \"$code $(cat /tmp/vbody3 2>/dev/null)\" >> /tmp/loop2.log; "
+              "sleep 0.05; done ) </dev/null >/dev/null 2>&1 & echo $!"
+          )
+          assert status == 0, f"failed to start the background curl loop: {pid_out}"
+          loop_pid = pid_out.strip()
+
+          status, out = ssh("deploy v3.1.0")
+          assert status == 0, f"deploy over ssh failed: status={status} output={out!r}"
+
+          proxy.succeed("sleep 1")
+          proxy.succeed(f"kill {loop_pid} 2>/dev/null || true")
+
+          active_after, _ = parse_colors(node.succeed("stack-deploy colors").strip())
+          assert active_after == before_idle
+
+          loop_log = proxy.succeed("cat /tmp/loop2.log")
+          lines = [l for l in loop_log.splitlines() if l.strip()]
+          assert lines, "the background curl loop recorded no requests at all"
+          codes = {l.split()[0] for l in lines}
+          bodies = {l.split()[1] for l in lines if len(l.split()) > 1}
+          assert codes == {"200"}, f"saw a non-200 response during an ssh-driven swap: {codes}"
+          assert "v3.1.0" in bodies, f"never observed the new version during an ssh-driven swap: {bodies}"
+
+      with subtest("a leftover pending-color is resolved when the next command arrives over ssh, as deploy (I3, over ssh)"):
+          active_before, idle_before = parse_colors(node.succeed("stack-deploy colors").strip())
+          # Simulate the crash window (see activate_color/I3): pending-color
+          # says the swap to idle_before happened, but active-color was
+          # never updated off active_before. idle_before already carries a
+          # healthy linked release from earlier in the suite.
+          node.succeed(f"echo {idle_before} > {STATE_DIR}/pending-color")
+
+          sha = client_make_tarball("v3.2.0")
+          status, out = ssh_upload("v3.2.0", sha)
+          assert status == 0, f"upload over ssh failed: {out!r}"
+
+          # The next command to arrive over ssh is `deploy` -- its first act
+          # (resolve_pending_color, shared with rollback/boot) must finish
+          # the interrupted swap to idle_before before this new deploy of
+          # v3.2.0 proceeds onto what is then the (newly) idle color
+          # (active_before).
+          status, out = ssh("deploy v3.2.0")
+          assert status == 0, f"deploy over ssh failed to resolve the pending swap: status={status} output={out!r}"
+          node.fail(f"test -e {STATE_DIR}/pending-color")
+
+          active_final, _ = parse_colors(node.succeed("stack-deploy colors").strip())
+          assert active_final == active_before, (
+              f"expected active to return to {active_before} after resolving the pending swap to {idle_before} "
+              f"and deploying v3.2.0 on top of it, got {active_final}"
+          )
+          code = proxy.succeed(curl_version).strip()
+          body = proxy.succeed("cat /tmp/vbody").strip()
+          assert code == "200" and body == "v3.2.0", f"expected v3.2.0 live, got {code}/{body!r}"
+
+      with subtest("the forced command refuses anything outside the protocol, with no side effects"):
+          before_releases = release_set()
+          before_incoming = incoming_files()
+
+          bad_attempts = [
+              ("no command at all (bare interactive login attempt)", None),
+              ("bash", "bash"),
+              ("status; id", "status; id"),
+              ("status && id", "status && id"),
+              ("command substitution as the command", "$(id)"),
+              ("backticks as the command", "`id`"),
+              ("a newline embedded in the command", "status\nid"),
+              ("upload with an extra word", "upload v1.0.0 " + "0" * 64 + " extra"),
+              ("a version with a shell metacharacter", "deploy v1.0.0;id"),
+              ("a version with a path-traversal component", "deploy ../x"),
+          ]
+
+          for label, cmd in bad_attempts:
+              status, out = ssh(cmd)
+              assert status == 2, f"[{label}] expected exit 2, got status={status} output={out!r}"
+              assert "uid=" not in out, f"[{label}] 'id' appears to have run: {out!r}"
+
+          assert release_set() == before_releases, "a refused command left a new release behind"
+          assert incoming_files() == before_incoming, "a refused command left something under incoming/"
+
+      with subtest("ssh -t requests a PTY but none is granted (restrict)"):
+          # Provoking and interpreting LIVE pty-req negotiation from this
+          # non-interactive test shell proved unreliable across several
+          # attempts: a plain -t never even reaches the server (OpenSSH's
+          # client-side heuristic sees stdin isn't a terminal and silently
+          # skips sending the request, printing its own unrelated local
+          # notice instead); forcing it with -tt hangs this environment
+          # instead (status 124) rather than producing a clean local
+          # denial message either. The one thing all of that live
+          # negotiation is meant to prove -- that `restrict` (which
+          # unconditionally implies no-pty, among other things) is
+          # actually the option guarding every deploy.keys entry -- is
+          # verified far more robustly by reading the generated
+          # authorized_keys file directly.
+          keys_file = node.succeed("cat /etc/ssh/authorized_keys.d/deploy").strip()
+          assert keys_file, "authorized_keys.d/deploy is empty"
+          for line in keys_file.splitlines():
+              assert line.startswith("restrict,command="), (
+                  f"every deploy authorized_keys line must start with restrict,command=..., got: {line!r}"
+              )
+
+          # A plain `-t` (single) still proves the forced command runs
+          # fine even when a pty WAS requested at the ssh(1) CLI level --
+          # covering the "still works, doesn't hang or error out" half of
+          # this property live, without depending on which side (client
+          # heuristic vs. server restrict) is what ultimately prevented
+          # allocation in this particular test environment.
+          status, out = ssh("status", extra="-t")
+          assert status == 0, f"expected the forced command to still run with -t requested, got status={status} output={out!r}"
+          assert "active=" in out, f"expected the status command to still have run: {out!r}"
+
+      with subtest("-R port forwarding is refused (restrict)"):
+          # -R asks the server for a "tcpip-forward" global request up
+          # front; restrict's no-port-forwarding makes the server refuse
+          # it outright, and ExitOnForwardFailure=yes makes the CLIENT
+          # exit immediately (non-zero) on that refusal -- this one is
+          # bounded by ssh's own behaviour, but still wrapped in `timeout`
+          # for the same blanket-safety reason as everywhere else here.
+          status, out = client.execute(
+              f"timeout 20 ssh {SSH_OPTS} -o ExitOnForwardFailure=yes "
+              f"-R 127.0.0.1:9001:127.0.0.1:22 -i {CLIENT_KEY} deploy@{node_ip} status 2>&1"
+          )
+          assert status != 0, f"expected -R forwarding to be refused, got status=0 output={out!r}"
+
+      with subtest("-L port forwarding is refused, proven at use time (restrict)"):
+          # Unlike -R, a -L LISTENER always succeeds locally: ssh(1) just
+          # binds a local port and waits, and only asks the server to
+          # open a "direct-tcpip" channel once something actually
+          # connects through it -- ExitOnForwardFailure does NOT fire at
+          # connect time for -L the way it does for -R's up-front
+          # tcpip-forward request. That means a bare `ssh -N -L ...`
+          # connects fine and then sits there forever (the exact hang
+          # this subtest went through during development, burning 10+
+          # minutes per build before being caught): the server only
+          # refuses the forwarded CHANNEL when something tries to use it,
+          # and a refused request doesn't itself end the session.
+          #
+          # So: start it in the BACKGROUND, under `timeout 15` as a hard
+          # backstop, with all three std fds redirected to files/devnull
+          # (not left connected to execute()'s own pipe -- execute()
+          # would otherwise block waiting for that pipe to close, same as
+          # every other backgrounded job in this file); wait (bounded)
+          # for the local listener to actually come up; prove a REAL
+          # connection through it fails; then kill it explicitly rather
+          # than waiting out the full 15s backstop.
+          client.succeed(
+              "rm -f /tmp/l-ssh.log /tmp/l-ssh.pid; "
+              f"timeout 15 ssh {SSH_OPTS} -N -L 127.0.0.1:9000:127.0.0.1:443 "
+              f"-i {CLIENT_KEY} deploy@{node_ip} "
+              "</dev/null >/tmp/l-ssh.log 2>&1 & echo $! > /tmp/l-ssh.pid"
+          )
+          # bash's /dev/tcp pseudo-device: a bare TCP connect-and-close,
+          # needs no extra package. Fails fast (connection refused) while
+          # nothing is listening yet; succeeds once ssh's local listener
+          # is up, regardless of what happens at the forwarding level.
+          client.wait_until_succeeds(
+              "timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9000 && exec 3<&-'",
+              timeout=10,
+          )
+          status, out = client.execute(
+              "curl -sk --max-time 5 -o /dev/null -w '%{http_code}' https://127.0.0.1:9000/ 2>&1"
+          )
+          assert status != 0, (
+              f"expected the forwarded connection to be refused (curl should fail outright), "
+              f"got status={status} output={out!r}"
+          )
+          client.execute("kill \"$(cat /tmp/l-ssh.pid)\" 2>/dev/null || true")
+          ssh_log = client.succeed("cat /tmp/l-ssh.log 2>/dev/null || true")
+          assert (
+              "administratively prohibited" in ssh_log.lower()
+              or "open failed" in ssh_log.lower()
+          ), f"expected ssh's own log to mention the channel being refused, got: {ssh_log!r}"
+
+      with subtest("scp and sftp are refused (the forced command applies to file-transfer subsystems too)"):
+          status, out = client.execute(
+              f"timeout 20 scp {SSH_OPTS} -O -i {CLIENT_KEY} /etc/hostname deploy@{node_ip}:/tmp/should-not-land 2>&1"
+          )
+          assert status != 0, f"expected scp to be refused, got status=0 output={out!r}"
+          node.fail("test -e /tmp/should-not-land")
+
+          status, out = client.execute(
+              f"printf 'bye\\n' | timeout 20 sftp {SSH_OPTS} -i {CLIENT_KEY} deploy@{node_ip} 2>&1"
+          )
+          assert status != 0, f"expected sftp to be refused, got status=0 output={out!r}"
+
+      with subtest("an oversized upload is refused, nothing left behind"):
+          # stackbase.deploy.maxUploadBytes = 65536 for this node (see the
+          # node's module config above) -- comfortably above every real
+          # test tarball (a few KB) and comfortably below this 100 KB blob.
+          client.succeed("dd if=/dev/urandom of=/tmp/big.bin bs=1024 count=100 status=none")
+          before_incoming = incoming_files()
+          sha = client.succeed("sha256sum /tmp/big.bin | cut -d' ' -f1").strip()
+          cmd = f"upload v3.9.0 {sha}"
+          status, out = client.execute(
+              f"timeout 20 ssh {SSH_OPTS} -i {CLIENT_KEY} deploy@{node_ip} {shlex.quote(cmd)} < /tmp/big.bin 2>&1"
+          )
+          assert status != 0, f"expected the oversized upload to be refused, got status=0 output={out!r}"
+          assert incoming_files() == before_incoming, f"an oversized upload left something under incoming/: {incoming_files()}"
+          node.fail("test -d /opt/${project}/releases/v3.9.0")
+
+      with subtest("upload with a wrong sha256 leaves nothing in releases/ or incoming/"):
+          before_incoming = incoming_files()
+          before_releases = release_set()
+          sha_bad = "0" * 64
+          real_sha = client_make_tarball("v3.10.0")
+          assert sha_bad != real_sha
+          status, out = ssh_upload("v3.10.0", sha_bad)
+          assert status != 0, f"expected the upload to fail on a sha256 mismatch, got status=0 output={out!r}"
+          assert incoming_files() == before_incoming
+          assert release_set() == before_releases
+          node.fail("test -d /opt/${project}/releases/v3.10.0")
+
+      with subtest("a key not listed in stackbase.deploy.keys is denied for the deploy account"):
+          status, out = ssh("status", key=STRANGER_KEY)
+          assert status != 0, f"expected auth failure for an unknown key, got status=0 output={out!r}"
+
+      with subtest("an admin key is not accepted for the deploy account unless also in stackbase.deploy.keys"):
+          status, out = ssh("status", key=ADMIN_KEY)
+          assert status != 0, f"expected auth failure for an admin-only key against deploy@, got status=0 output={out!r}"
+
+      with subtest("deploy has NO access to /var/lib/stackbase -- app-host.nix's root:nginx domain stays untouched"):
+          # The engine's own state lives entirely under stateDir
+          # (/var/lib/stackbase-deploy, deploy:deploy) -- nixos/deploy.nix
+          # never asserts any ownership on /var/lib/stackbase itself, which
+          # stays exactly as app-host.nix's cert-placeholder leaves it
+          # (root:nginx 0750). `deploy` is a member of neither `root` nor
+          # `nginx`, so it must have NO access whatsoever: can't list it,
+          # can't read app.env or nginx's TLS private key (origin.key),
+          # and can't create/rename/delete anything inside it (directory
+          # write, which would let it swap in its own file even without
+          # being able to read the original).
+          node.fail("runuser -u deploy -- ls /var/lib/stackbase")
+          node.fail("runuser -u deploy -- cat /var/lib/stackbase/app.env")
+          node.fail("runuser -u deploy -- cat /var/lib/stackbase/origin.key")
+          node.fail("runuser -u deploy -- touch /var/lib/stackbase/should-fail")
+          node.fail("runuser -u deploy -- rm -f /var/lib/stackbase/app.env")
+          node.fail(
+              "runuser -u deploy -- mv /var/lib/stackbase/app.env /var/lib/stackbase/app.env.moved"
+          )
+
+      with subtest("deploy's sudo grant covers ONLY the exact systemctl invocations it needs"):
+          node.fail("runuser -u deploy -- sudo -n systemctl restart nginx")
+          node.fail("runuser -u deploy -- sudo -n systemctl start ${project}@blue.service --no-block")
+          node.fail("runuser -u deploy -- sudo -n true")
+
+          # `sudo -l` groups every command sharing the same runas/tag onto
+          # ONE line, comma-separated -- not one line per grant as might
+          # be assumed. "(ALL : ALL)" there is the runas specification
+          # (which user/group sudo may run AS), not a granted COMMAND, so
+          # its presence isn't itself a broader grant; what actually
+          # matters is the comma-separated command list after "NOPASSWD:".
+          status, listing = node.execute("runuser -u deploy -- sudo -n -l 2>&1")
+          assert status == 0, f"expected sudo -n -l to succeed non-interactively, got status={status} output={listing!r}"
+          grant_lines = [l for l in listing.splitlines() if "NOPASSWD" in l]
+          assert len(grant_lines) == 1, f"expected exactly one NOPASSWD grant line, got: {listing!r}"
+          commands = [c.strip() for c in grant_lines[0].split("NOPASSWD:", 1)[1].split(",")]
+          assert len(commands) == 8, f"expected exactly 8 allowed commands, got {len(commands)}: {commands}"
+          for verb in ["start", "restart", "stop"]:
+              for color in ["blue", "green"]:
+                  expected = f"systemctl {verb} ${project}@{color}.service"
+                  assert any(c.endswith(expected) for c in commands), f"missing expected grant {expected!r} in {commands}"
+          for color in ["blue", "green"]:
+              expected = f"systemctl restart stackbase-drain@{color}.timer"
+              assert any(c.endswith(expected) for c in commands), f"missing expected grant {expected!r} in {commands}"
     '';
 }

@@ -15,11 +15,11 @@
 - All Plan 01 Global Constraints still apply (stdlib-only Python, one-line plain-English failures, secrets never on disk/in logs, shell-variable style in user-facing snippets).
 - Versions are `vMAJOR.MINOR.PATCH` exactly (`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`); anything else is rejected before touching disk. No pre-release/build suffixes.
 - Retention: keep the **5 highest by SemVer order** (numeric per component, not lexical, not by mtime) plus any release a color currently links to. Never delete a linked release.
-- State file `/var/lib/stackbase/active-color` contains exactly `blue` or `green` + newline; written atomically (tmp + `mv -T`) AFTER the socket symlink flip succeeds.
+- State file `/var/lib/stackbase-deploy/active-color` contains exactly `blue` or `green` + newline; written atomically (tmp + `mv -T`) AFTER the socket symlink flip succeeds.
 - Swap = atomic symlink replace (`ln -s … tmp && mv -T tmp /run/<project>/app.sock`). nginx is never reloaded or restarted by a deploy.
 - Old color is stopped after `drainSeconds` (default 60) following a successful swap. Exactly one color runs in steady state.
 - Health check: HTTP GET `healthPath` (default `/health`) over the idle color's unix socket; 30 tries, 2 s apart; only 2xx counts as healthy. A failed health check stops the idle color, leaves the active color and symlink untouched, exits non-zero.
-- One deploy at a time: the engine holds `flock` on `/var/lib/stackbase/deploy.lock`; a second invocation fails immediately with a clear message.
+- One deploy at a time: the engine holds `flock` on `/var/lib/stackbase-deploy/deploy.lock`; a second invocation fails immediately with a clear message.
 - The `deploy` user has no shell access: every authorized key carries `restrict,command="…stack-deploy-ssh"`. Its only privilege is `systemctl start|stop|restart <project>@blue.service` and `…@green.service` (exact unit names, no wildcards).
 - Uploaded tarballs are verified against a caller-supplied sha256 before unpacking; unpacking refuses absolute paths and `..` members.
 - The CI private key exists only in GitHub (repo-level secret `STACK_DEPLOY_KEY`) — never in the repo, never in `secrets.age`, never on the operator's persistent disk. Org-level secrets/variables are not available on the owner's GitHub plan and must not be used.
@@ -46,9 +46,9 @@ On-box layout (created by `deploy.nix` via tmpfiles, owner `deploy`, group = app
 ```
 /opt/<project>/releases/<version>/     unpacked release (binary + static/ …)
 /opt/<project>/blue/current -> ../releases/<version>      (same for green)
-/var/lib/stackbase/active-color        blue|green
+/var/lib/stackbase-deploy/             engine state, deploy:deploy 0750: active-color, pending-color, deploy.lock, incoming/, deploy-home/
+/var/lib/stackbase/                    root-managed (certs, app.env); NO access for deploy
 /var/lib/stackbase/app.env             EnvironmentFile for the app (0640 root:<app group>)
-/var/lib/stackbase/incoming/           uploads land here
 /run/<project>/app-blue.sock, app-green.sock, app.sock -> app-<active>.sock
 ```
 

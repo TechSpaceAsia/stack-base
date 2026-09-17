@@ -1,7 +1,8 @@
 # stack-deploy: blue/green release engine for a stackbase node.
 #
-# Subcommands: status, colors, deploy, rollback, prune, releases, boot,
-# internal-drain-stop. Exit codes: 0 ok, 1 failure, 2 usage, 3 lock held.
+# Subcommands: status, colors, deploy, rollback, prune, releases, unpack,
+# boot, internal-drain-stop. Exit codes: 0 ok, 1 failure, 2 usage, 3 lock
+# held.
 #
 # Project-specific values (project slug, binary name, health path, drain
 # seconds, keep count) come from /etc/stackbase/deploy.env, written by
@@ -38,7 +39,11 @@ PROJECT="$STACK_PROJECT"
 RELEASES_DIR="/opt/$PROJECT/releases"
 BLUE_DIR="/opt/$PROJECT/blue"
 GREEN_DIR="/opt/$PROJECT/green"
-STATE_DIR="/var/lib/stackbase"
+# The engine's own state directory -- deliberately NOT /var/lib/stackbase
+# itself, which app-host.nix owns exclusively (root:nginx, holds the TLS
+# placeholder cert and, later, app.env). deploy.nix creates this directory
+# deploy:deploy and never touches /var/lib/stackbase's ownership.
+STATE_DIR="${STACK_STATE_DIR:-/var/lib/stackbase-deploy}"
 ACTIVE_COLOR_FILE="$STATE_DIR/active-color"
 GENERATION_FILE="$STATE_DIR/generation"
 LOCK_FILE="$STATE_DIR/deploy.lock"
@@ -114,6 +119,18 @@ atomic_write() {
   local path="$1" content="$2" tmp
   tmp=$(mktemp "${path}.XXXXXX")
   printf '%s\n' "$content" > "$tmp"
+  # 0660, not mktemp's default 0600: STATE_DIR is setgid (group "deploy"),
+  # so a temp file created by root (the boot/drain-stop units, both
+  # root-run) still lands group "deploy" -- but only 0660 actually lets
+  # the OTHER identity read/write it back (root always bypasses DAC
+  # regardless of mode, so this only matters for deploy reading a
+  # root-written file, e.g. over the SSH door after a boot-time write).
+  # Checked explicitly, unlike mktemp/printf above: their failure already
+  # cascades into the final `mv` below also failing, correctly surfacing
+  # to the caller -- but a failed chmod here would NOT stop `mv` from
+  # still succeeding on an unmodified 0600 file, silently reintroducing
+  # the exact bug this exists to fix.
+  chmod 0660 "$tmp" || return 1
   mv -T "$tmp" "$path"
 }
 
@@ -138,6 +155,23 @@ run_systemctl() {
 
 acquire_lock() {
   exec 9>"$LOCK_FILE" || die "cannot open lock file $LOCK_FILE"
+  # Unlike atomic_write's temp file (always FRESHLY created by mktemp, so
+  # the calling process always owns it and chmod always succeeds),
+  # deploy.lock is a single long-lived file reused across every
+  # invocation for the rest of the node's life. `exec 9>` on a brand-new
+  # file creates it at the process's umask-default mode (0644 under a
+  # typical 022 umask) -- group-readable but not group-writable -- so
+  # STATE_DIR's setgid bit (fixes the GROUP) is paired with this chmod
+  # (fixes the MODE) to let the OTHER identity (root/deploy, whichever
+  # didn't create the file) open it for writing later. But only the
+  # file's actual OWNER (or root) may chmod it -- POSIX chmod(2) is not
+  # governed by the target's write permission, only by caller-is-owner-or
+  # -root -- so once some other identity already created (and, being the
+  # owner at the time, successfully chmod'd) this file, a later
+  # non-owning identity's own chmod attempt here fails with EPERM. That
+  # is expected and harmless: the file is already at the mode its actual
+  # creator set, which is exactly what this chmod would have set anyway.
+  chmod 0660 "$LOCK_FILE" 2>/dev/null || true
   if ! flock -n 9; then
     echo "✗ another deploy is already in progress (lock held: $LOCK_FILE)" >&2
     exit 3
@@ -288,6 +322,17 @@ activate_color() {
 # active-color write (see activate_color). Called at the top of
 # deploy/rollback/boot so a leftover intent from a crashed prior run is
 # always resolved before anything else touches state.
+#
+# Called PLAINLY (never in a condition context) by all three callers, so
+# ordinary `set -e` governs this function's own top-level statements --
+# but the `if ...; then <mutations>; fi` body below is still worth
+# guarding explicitly, for two reasons: (1) `run_systemctl`/`wait_healthy`
+# failing is already caught by the `if`'s own condition, but the three
+# mutations *inside* the `then` branch getting a bare `set -e` abort would
+# give the operator no diagnostic beyond bash silently exiting; (2) it
+# keeps this function consistent with activate_color's explicit
+# pre/post-flip style, which is the same class of bookkeeping this
+# function performs while resuming an interrupted swap.
 resolve_pending_color() {
   [ -f "$STATE_DIR/pending-color" ] || return 0
 
@@ -297,29 +342,38 @@ resolve_pending_color() {
 
   if [ -e "$link" ]; then
     echo "i resuming a swap to $pcolor that was interrupted before its state was persisted"
-    # `systemctl start` used to be a bare statement here: on failure (e.g.
-    # $pcolor's release binary is missing or not executable), it would
-    # abort the whole invocation via errexit -- resolve_pending_color is
-    # always called plainly (not in a condition context), so `set -e` is
-    # in effect for it -- leaving pending-color on disk and never even
-    # reaching the active-color fallback below. Folding it into the same
-    # condition as wait_healthy treats a failed start exactly like a
-    # failed health check: message, discard the intent, fall back to
-    # whatever active-color still says.
-    if systemctl start "${PROJECT}@${pcolor}.service" && wait_healthy "$pcolor"; then
-      atomic_symlink "app-${pcolor}.sock" "$SOCK_LINK"
-      atomic_write "$ACTIVE_COLOR_FILE" "$pcolor"
-      rm -f "$STATE_DIR/pending-color"
+    # run_systemctl (not a bare `systemctl start`): this path runs
+    # whenever a leftover pending-color is resolved from cmd_deploy or
+    # cmd_rollback, both reachable by the unprivileged `deploy` user via
+    # Task 2's SSH forced command -- a bare `systemctl start` would fail
+    # outright as `deploy` (no permission), silently discarding a
+    # resumable swap instead of finishing it.
+    if run_systemctl start "${PROJECT}@${pcolor}.service" && wait_healthy "$pcolor"; then
+      if ! atomic_symlink "app-${pcolor}.sock" "$SOCK_LINK"; then
+        echo "✗ FAILED to flip app.sock to $pcolor while resuming an interrupted swap. $pcolor is healthy and running -- do NOT stop it. Re-run 'stack-deploy deploy'/'rollback', or reboot -- this will be retried automatically." >&2
+        return 1
+      fi
+      if ! atomic_write "$ACTIVE_COLOR_FILE" "$pcolor"; then
+        echo "✗ traffic is on $pcolor now, but active-color could not be updated while resuming an interrupted swap -- bookkeeping is incomplete. The next 'stack-deploy deploy'/'rollback'/boot will finish this automatically." >&2
+        return 1
+      fi
+      if ! rm -f "$STATE_DIR/pending-color"; then
+        echo "✗ traffic is on $pcolor and active-color is correct, but the pending-color intent file could not be removed while resuming an interrupted swap -- bookkeeping is incomplete. The next 'stack-deploy deploy'/'rollback'/boot will finish this automatically." >&2
+        return 1
+      fi
       echo "✓ interrupted swap to $pcolor completed"
       return 0
     fi
     echo "i $pcolor did not come up healthy while resuming the interrupted swap; falling back to active-color" >&2
-    systemctl stop "${PROJECT}@${pcolor}.service" || true
+    run_systemctl stop "${PROJECT}@${pcolor}.service" || true
   else
     echo "i pending-color ($pcolor) has no linked release; discarding" >&2
   fi
 
-  rm -f "$STATE_DIR/pending-color"
+  if ! rm -f "$STATE_DIR/pending-color"; then
+    echo "✗ failed to remove the stale pending-color intent file at $STATE_DIR/pending-color" >&2
+    return 1
+  fi
 }
 
 deploy_unpack_tarball() {
@@ -416,6 +470,48 @@ deploy_unpack_tarball() {
   rm -rf "$release_dir"
   mv -T "$tmp_dir" "$release_dir"
   echo "✓ unpacked $version"
+}
+
+# Unpacks a verified tarball into releases/<version>/ without touching
+# active-color/app.sock -- i.e. everything deploy_unpack_tarball does and
+# nothing more. This is the ONE place tarball validation (sha256, member
+# type/path safety, mode normalisation, refuse-overwrite) lives; Task 2's
+# SSH `upload` dispatcher (stack-deploy-ssh.sh) calls this subcommand
+# after streaming stdin to disk under a size cap, rather than
+# re-implementing any of that validation itself.
+cmd_unpack() {
+  local version="" tarball="" sha256=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tarball)
+        [ $# -ge 2 ] || usage_die "--tarball requires a value"
+        tarball="$2"
+        shift 2
+        ;;
+      --sha256)
+        [ $# -ge 2 ] || usage_die "--sha256 requires a value"
+        sha256="$2"
+        shift 2
+        ;;
+      -*)
+        usage_die "unknown option: $1"
+        ;;
+      *)
+        [ -z "$version" ] || usage_die "unexpected argument: $1"
+        version="$1"
+        shift
+        ;;
+    esac
+  done
+
+  [ -n "$version" ] || usage_die "usage: stack-deploy unpack <version> --tarball PATH --sha256 HEX"
+  validate_version "$version"
+  [ -n "$tarball" ] || usage_die "--tarball is required"
+  [ -n "$sha256" ] || usage_die "--sha256 is required"
+
+  acquire_lock
+  deploy_unpack_tarball "$version" "$tarball" "$sha256" 0
 }
 
 cmd_deploy() {
@@ -630,7 +726,17 @@ cmd_boot() {
     die "active color $active has no linked release at $link -- state file and release directory are out of sync; redeploy to recover"
   fi
 
-  systemctl start "${PROJECT}@${active}.service"
+  # run_systemctl (not a bare `systemctl start`): cmd_boot itself is only
+  # ever invoked as root via stackbase-app-boot.service, but it shares
+  # resolve_pending_color/activate_color's code paths with cmd_deploy and
+  # cmd_rollback (both reachable by `deploy` over Task 2's SSH forced
+  # command) -- using the same sudo-aware wrapper everywhere those shared
+  # helpers can run keeps this correct regardless of caller, at zero cost
+  # when running as root (run_systemctl's root branch is a bare systemctl
+  # call).
+  if ! run_systemctl start "${PROJECT}@${active}.service"; then
+    die "failed to start $active (${PROJECT}@${active}.service) at boot"
+  fi
   if ! wait_healthy "$active"; then
     echo "✗ $active failed the health check ($STACK_HEALTH_PATH) at boot; leaving traffic unrouted" >&2
     exit 1
@@ -687,12 +793,13 @@ cmd_internal_drain_stop() {
 }
 
 main() {
-  [ $# -ge 1 ] || usage_die "usage: stack-deploy <status|colors|deploy|rollback|prune|releases> [...]"
+  [ $# -ge 1 ] || usage_die "usage: stack-deploy <status|colors|deploy|rollback|prune|releases|unpack> [...]"
   local cmd="$1"
   shift
   case "$cmd" in
     status) cmd_status "$@" ;;
     colors) cmd_colors "$@" ;;
+    unpack) cmd_unpack "$@" ;;
     deploy) cmd_deploy "$@" ;;
     rollback) cmd_rollback "$@" ;;
     prune) cmd_prune "$@" ;;

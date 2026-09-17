@@ -14,6 +14,20 @@
 let
   cfg = config.stackbase;
 
+  # The engine's OWN state directory. Deliberately NOT /var/lib/stackbase
+  # itself: that path is app-host.nix's exclusive domain (root:nginx,
+  # holds the TLS placeholder cert and, later, app.env) -- its
+  # stackbase-origin-cert-placeholder.service reruns `install -d -m 0750
+  # -o root -g nginx /var/lib/stackbase` on every nginx (re)start, which
+  # would clobber any ownership this module tried to assert on that same
+  # path. Giving the engine its own directory sidesteps the conflict
+  # entirely rather than fighting over one shared path. Single source of
+  # truth for this module; stack-deploy.sh has its own matching default
+  # (STACK_STATE_DIR, wired through deploy.env below) and
+  # tests/vm-deploy.nix has its own `stateDir` for the same reason -- one
+  # binding per file, not a cross-file constant.
+  stateDir = "/var/lib/stackbase-deploy";
+
   stackDeployPkg = pkgs.writeShellApplication {
     name = "stack-deploy";
     runtimeInputs = with pkgs; [
@@ -30,7 +44,42 @@ let
     text = builtins.readFile ./deploy/stack-deploy.sh;
   };
 
+  # The forced-command dispatcher installed as every stackbase.deploy.keys
+  # entry's `command=`. Its argv never contains anything but the fixed
+  # store path to stack-deploy plus already-validated words -- see
+  # stack-deploy-ssh.sh's own header comment for the full protocol.
+  stackDeploySshPkg = pkgs.writeShellApplication {
+    name = "stack-deploy-ssh";
+    runtimeInputs = with pkgs; [ coreutils ];
+    text = builtins.replaceStrings
+      [ "@stackDeployBin@" ]
+      [ "${stackDeployPkg}/bin/stack-deploy" ]
+      (builtins.readFile ./deploy/stack-deploy-ssh.sh);
+  };
+
   systemctlBin = "${pkgs.systemd}/bin/systemctl";
+
+  # A bare "type base64 [comment]" public key, no embedded options. Any
+  # stackbase.deploy.keys entry that doesn't match this is either
+  # malformed or -- more dangerously -- already carries its own
+  # comma-separated options (e.g. a copy-pasted
+  # "no-pty,command=...  ssh-ed25519 ..." line), which would silently
+  # combine with the "restrict,command=..." prefix this module prepends
+  # and could widen or break the forced-command confinement in ways that
+  # are easy to miss in review. Reject it outright instead (see
+  # assertions below).
+  deployKeyTypeRegex =
+    "(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\\.com|sk-ecdsa-sha2-nistp256@openssh\\.com)[ \t]+[A-Za-z0-9+/=]+([ \t]+.*)?";
+  isValidDeployKey = key:
+    !(lib.hasInfix "\n" key)
+    && !(lib.hasInfix "\"" key)
+    && (builtins.match deployKeyTypeRegex key != null);
+
+  # "restrict" denies PTY allocation, port/agent/X11 forwarding, and
+  # ~/.ssh/rc for this key outright; "command=" then forces every session
+  # on it through the dispatcher above regardless of what the client asks
+  # for -- see stack-deploy-ssh.sh for how it confines the command itself.
+  deployAuthorizedKeyLine = key: ''restrict,command="${stackDeploySshPkg}/bin/stack-deploy-ssh" ${key}'';
 
   # Exact-command NOPASSWD sudo rules for the `deploy` user's local
   # systemctl calls (distinct from the Task 2 SSH forced-command surface,
@@ -98,15 +147,38 @@ in
       default = { };
       description = ''
         Name -> SSH public key for accounts allowed to drive stack-deploy
-        over the `deploy` user's forced-command SSH channel. Declared here
-        so Task 1 (this module) and Task 2 (the forced-command dispatcher
-        and sshd wiring) can be developed independently; unused by Task 1
-        itself.
+        over the `deploy` user's forced-command SSH channel. Each value
+        must be a bare `type base64 [comment]` public key with no
+        embedded options, double quotes, or newlines -- see the
+        assertions this module adds. Every key here gets
+        `restrict,command="<store path>/bin/stack-deploy-ssh"` prepended
+        automatically; `services.openssh.settings.AllowUsers` also gains
+        `"deploy"`, but only once this attrset is non-empty.
+      '';
+    };
+
+    deploy.maxUploadBytes = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 500 * 1024 * 1024; # 500 MiB
+      description = ''
+        Hard cap on a single `upload` over the SSH forced-command channel,
+        enforced while streaming stdin to disk (never buffered in
+        memory). An oversized upload is refused and nothing is left under
+        the engine's state directory's `incoming/`.
       '';
     };
   };
 
   config = {
+    assertions = lib.mapAttrsToList
+      (name: key: {
+        assertion = isValidDeployKey key;
+        message = ''
+          stackbase.deploy.keys.${name}: must be a bare "type base64 [comment]" SSH public key (e.g. "ssh-ed25519 AAAA... name") with no embedded options, double quotes, or newlines -- got: ${key}
+        '';
+      })
+      cfg.deploy.keys;
+
     # Two distinct trust boundaries, two distinct groups -- do not merge
     # them. `<project>` is the app's own group; a later task drops
     # /var/lib/stackbase/app.env as `root:<project> 0640` (the app's own
@@ -135,12 +207,18 @@ in
       # /opt/<project>/{releases,blue,green} is deploy:deploy directly
       # (see C2 below), so no group membership is needed there either.
       extraGroups = [ "${cfg.project}-sock" ];
-      home = "/var/lib/stackbase";
-      createHome = false;
+      home = "${stateDir}/deploy-home";
+      createHome = false; # tmpfiles owns it, below, same as every other stackbase path
       description = "stackbase release engine (blue/green deploys)";
-      # Minimal for Task 1: no authorized keys yet. Task 2 adds the
-      # forced-command authorized_keys from stackbase.deploy.keys and adds
-      # "deploy" to base.nix's sshd AllowUsers.
+      # A real (functional) shell, not nologin: OpenSSH's `command=`
+      # mechanism execs the user's login shell with `-c <forced command>`
+      # -- there is no way to run a forced command without one. This is
+      # NOT a login-friendly shell in practice: every key in
+      # authorizedKeys.keys below carries `restrict,command=...`, so
+      # whatever the client asks for (a bare interactive session, `bash`,
+      # anything), sshd always runs stack-deploy-ssh instead.
+      shell = pkgs.bash;
+      openssh.authorizedKeys.keys = map deployAuthorizedKeyLine (lib.attrValues cfg.deploy.keys);
     };
 
     # nginx (app-host.nix) proxies to unix:/run/<project>/app.sock as the
@@ -163,8 +241,26 @@ in
       "d /opt/${cfg.project}/releases 0755 deploy deploy -"
       "d /opt/${cfg.project}/blue 0755 deploy deploy -"
       "d /opt/${cfg.project}/green 0755 deploy deploy -"
-      "d /var/lib/stackbase 0770 deploy deploy -"
-      "d /var/lib/stackbase/incoming 0770 deploy deploy -"
+      # The engine's own state directory (active-color, generation,
+      # pending-color, deploy.lock, drain-pending-*, incoming/,
+      # deploy-home/) -- NOT /var/lib/stackbase itself; see the `stateDir`
+      # comment above for why. Owned outright by deploy; setgid (leading
+      # "2") so a file created here by ROOT (the boot/drain-stop units,
+      # both root-run) still lands group "deploy" rather than "root" --
+      # combined with stack-deploy.sh's atomic_write/acquire_lock
+      # explicitly chmod'ing to 0660, this is what lets `deploy` read/write
+      # state a root-run unit wrote (or vice versa) regardless of which
+      # identity created it first. No "other" access at all -- only
+      # deploy (owner) and, via the setgid group, anything else running as
+      # the "deploy" group, which today is nothing but root (which
+      # bypasses DAC anyway).
+      "d ${stateDir} 2750 deploy deploy -"
+      "d ${stateDir}/incoming 0770 deploy deploy -"
+      # deploy's $HOME. Nothing stack-deploy-ssh writes here today (it
+      # streams uploads straight into incoming/ above), but sshd/the login
+      # shell it execs the forced command through both expect a real,
+      # deploy-owned home directory to exist.
+      "d ${stateDir}/deploy-home 0700 deploy deploy -"
       # /run is tmpfs, wiped every boot. Deliberately NOT RuntimeDirectory=
       # on the app template unit below: systemd's own RuntimeDirectory
       # bookkeeping removes the directory when a unit requesting it stops,
@@ -280,14 +376,25 @@ in
       }
     ];
 
+    # Appends to (never replaces) base.nix's own AllowUsers definition
+    # (admins + root) -- NixOS merges multiple `listOf str` definitions by
+    # concatenation. Only appended once there's at least one deploy key,
+    # so a project that never sets stackbase.deploy.keys doesn't open an
+    # sshd account with authorized_keys.keys == [] (which would just fail
+    # every login anyway, but there's no reason to list it in AllowUsers
+    # either).
+    services.openssh.settings.AllowUsers = lib.mkIf (cfg.deploy.keys != { }) [ "deploy" ];
+
     environment.etc."stackbase/deploy.env".text = ''
       STACK_PROJECT=${cfg.project}
       STACK_BINARY=${cfg.app.binary}
       STACK_HEALTH_PATH=${cfg.app.healthPath}
       STACK_DRAIN_SECONDS=${toString cfg.deploy.drainSeconds}
       STACK_KEEP=${toString cfg.deploy.keep}
+      STACK_MAX_UPLOAD_BYTES=${toString cfg.deploy.maxUploadBytes}
+      STACK_STATE_DIR=${stateDir}
     '';
 
-    environment.systemPackages = [ stackDeployPkg ];
+    environment.systemPackages = [ stackDeployPkg stackDeploySshPkg ];
   };
 }
