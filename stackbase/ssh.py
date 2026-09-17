@@ -10,7 +10,9 @@ talk to a host whose key hasn't been pinned yet -- there is no separate
 "insecure" mode.
 
 All subprocess invocation goes through the injected `runner` (defaulting to
-`subprocess.run`), so tests never shell out or touch the network.
+`subprocess.run`) for one-shot buffered commands, and the injected `popen`
+(defaulting to `subprocess.Popen`) for `run_stream` -- so tests never shell
+out or touch the network.
 """
 
 from __future__ import annotations
@@ -21,14 +23,16 @@ import shlex
 import socket
 import subprocess
 import time
+from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from stackbase.errors import StackError
 
 _KEY_TYPE = "ssh-ed25519"
 _WAIT_POLL_SECONDS = 5
 _STDERR_TAIL_LINES = 5
+_STREAM_TAIL_LINES = 20
 _HPANEL_STATUS_HINT = "check the VPS's status in hPanel (https://hpanel.hostinger.com/)"
 
 # ssh's own banner text when the pinned host key no longer matches what the
@@ -73,7 +77,14 @@ class Ssh:
     never trust (or pollute) keys pinned for anything else.
     """
 
-    def __init__(self, infra_dir: str | Path, host: str, user: str = "root", runner: Any = subprocess.run) -> None:
+    def __init__(
+        self,
+        infra_dir: str | Path,
+        host: str,
+        user: str = "root",
+        runner: Any = subprocess.run,
+        popen: Any = subprocess.Popen,
+    ) -> None:
         if not host or not _HOST_RE.match(host):
             raise StackError(
                 f"invalid SSH host '{host}'",
@@ -91,6 +102,7 @@ class Ssh:
         self.host = host
         self.user = user
         self._runner = runner
+        self._popen = popen
 
     # -- Waiting for the node to come up --------------------------------
 
@@ -244,30 +256,84 @@ class Ssh:
             )
         return result
 
-    def run_stream(self, cmd: str, stdin: Any, *, check: bool = True) -> subprocess.CompletedProcess:
-        """Like `run`, but streams `stdin` -- an already-open binary file object --
-        straight into the remote command instead of buffering the whole payload
-        through `input=`.
+    def run_stream(
+        self,
+        cmd: str,
+        *,
+        stdin: Any = subprocess.DEVNULL,
+        emit: Callable[[str], None] = print,
+        check: bool = True,
+    ) -> tuple[int, list[str]]:
+        """Run `cmd` on the node over ssh, streaming its combined stdout+stderr
+        to `emit` line by line as it arrives -- a multi-minute remote command
+        (a release build, a health-checked blue/green swap) doesn't look like a
+        hang the way a fully-buffered `run()` would.
 
-        Used to upload a release tarball without ever holding the full archive
-        in memory: the caller opens the file and hands the file object here, and
-        the OS pipes its bytes directly into ssh's stdin. Builds the argv via the
-        same `_ssh_argv`/`_ssh_options` every other method uses, so this carries
-        the identical BatchMode/known_hosts/StrictHostKeyChecking options --
-        nothing about the connection's security posture is weakened to support
-        streaming.
+        `stdin` defaults to `subprocess.DEVNULL` -- nothing from this
+        process's own stdin is ever silently relayed into a long-running
+        remote command. Pass an open, already-positioned binary file object
+        instead to stream its bytes straight into the remote command's stdin
+        without ever buffering the whole payload in memory -- used to upload a
+        release tarball.
+
+        A host-key-changed banner in the streamed output is ALWAYS translated
+        into the same plain-English reinstall-vs-interception hint every other
+        method gives (`host_key_mismatch_hint`) -- regardless of `check`.
+        Continuing to trust a connection whose pinned host key just stopped
+        matching is not something a caller should be able to opt out of
+        merely by asking not to raise on an ordinary non-zero exit.
+
+        Returns `(returncode, tail)` -- `tail` is the last
+        `_STREAM_TAIL_LINES` lines of the streamed output, for a caller that
+        wants to build its own error message from a specific exit code
+        (`check=False`). With `check=True` (the default), any other non-zero
+        exit raises `StackError` carrying that same tail.
+
+        Builds its argv via the same `_ssh_argv`/`_ssh_options` every other
+        method uses -- identical BatchMode/known_hosts/StrictHostKeyChecking
+        options, nothing about the connection's security posture is weakened
+        to support streaming. This is the ONE streaming path to a node --
+        replaces the old buffered `run_stream` (which used `subprocess.run`
+        under the hood despite the name, so it wasn't actually streaming) and
+        `release.py`'s hand-rolled `_stream_ssh`, which bypassed this host-key
+        translation entirely (Fix round 1, P3).
         """
         argv = self._ssh_argv(cmd)
-        result = self._exec(argv, text=True, stdin=stdin)
-        if check and result.returncode != 0:
-            stderr = result.stderr if isinstance(result.stderr, str) else ""
-            if HOST_KEY_CHANGED_MARKER in stderr:
-                raise self._host_key_mismatch_error()
-            raise StackError(
-                f"command failed on {self.host} (exit {result.returncode}): {cmd}",
-                _tail(stderr) or "no stderr output was captured -- re-run with --debug for the full command",
+        try:
+            process = self._popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                stdin=stdin,
             )
-        return result
+        except FileNotFoundError as exc:
+            raise StackError(
+                "the 'ssh' command was not found",
+                _MISSING_BINARY_HINTS["ssh"],
+            ) from exc
+
+        tail: deque[str] = deque(maxlen=_STREAM_TAIL_LINES)
+        saw_host_key_marker = False
+        with process:
+            if process.stdout is not None:
+                for line in process.stdout:
+                    line = line.rstrip("\n")
+                    if HOST_KEY_CHANGED_MARKER in line:
+                        saw_host_key_marker = True
+                    emit(line)
+                    tail.append(line)
+            returncode = process.wait()
+
+        if saw_host_key_marker:
+            raise self._host_key_mismatch_error()
+        if check and returncode != 0:
+            raise StackError(
+                f"command failed on {self.host} (exit {returncode}): {cmd}",
+                "\n".join(tail).strip() or "no output was captured -- re-run with --debug for the full command",
+            )
+        return returncode, list(tail)
 
     def fetch(self, remote_path: str) -> bytes:
         """Read `remote_path` on the node and return its raw bytes."""
@@ -351,21 +417,10 @@ class Ssh:
     def _ssh_argv(self, *extra: str) -> list[str]:
         return ["ssh", *self._ssh_options(), f"{self.user}@{self.host}", *extra]
 
-    def _exec(
-        self, argv: list[str], *, text: bool, input_data: Any = None, stdin: Any = None
-    ) -> subprocess.CompletedProcess:
-        # `stdin` (an open file object) and `input_data` (a str/bytes payload,
-        # or None) are mutually exclusive to subprocess.run -- callers only
-        # ever supply one. When `stdin` is given, the file's bytes stream
-        # straight through the OS pipe rather than being buffered in memory
-        # via `input=` (see run_stream).
-        kwargs: dict[str, Any] = {"capture_output": True, "check": False}
+    def _exec(self, argv: list[str], *, text: bool, input_data: Any = None) -> subprocess.CompletedProcess:
+        kwargs: dict[str, Any] = {"capture_output": True, "check": False, "input": input_data}
         if text:
             kwargs["text"] = True
-        if stdin is not None:
-            kwargs["stdin"] = stdin
-        else:
-            kwargs["input"] = input_data
         try:
             return self._runner(argv, **kwargs)
         except FileNotFoundError as exc:

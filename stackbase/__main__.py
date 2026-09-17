@@ -26,7 +26,17 @@ from stackbase.cloudflare import CloudflareClient
 from stackbase.config import load_config, load_state
 from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
-from stackbase.reconcile import SSH_USER, Context, Step, apply, local_facts, observe, plan, render_description
+from stackbase.reconcile import (
+    SSH_USER,
+    Context,
+    Step,
+    apply,
+    local_facts,
+    observe,
+    plan,
+    redaction_values,
+    render_description,
+)
 from stackbase.release import run_deploy, run_rollback, run_status
 from stackbase.secrets import load_secrets, redact
 from stackbase.ssh import Ssh
@@ -92,11 +102,21 @@ def main(argv: list[str] | None = None) -> None:
             _deploy(args, infra_dir)
         elif args.command == "rollback":
             _rollback(args, infra_dir)
-        else:
+        elif args.command == "status":
             _status(args, infra_dir)
+        else:
+            # argparse's subparsers are `required=True`, so this is
+            # unreachable in practice -- but an explicit branch that fails
+            # loudly beats a bare `else` silently routing an unrecognised
+            # command to whichever handler happened to be listed last
+            # (minor d, Fix round 1).
+            raise StackError(
+                f"unknown command '{args.command}'",
+                "this is a bug in stack-base -- please report it",
+            )
     except StackError as error:
         _print_traceback(debug, secrets)
-        print(error_line(error, list(secrets.values())), file=sys.stderr)
+        print(error_line(error, redaction_values(secrets)), file=sys.stderr)
         raise SystemExit(1)
     except KeyboardInterrupt:
         print("error: interrupted — nothing further was changed", file=sys.stderr)
@@ -110,7 +130,7 @@ def main(argv: list[str] | None = None) -> None:
             redact(
                 f"error: unexpected failure ({type(error).__name__}) — this is a bug in "
                 "stack-base; re-run with --debug and report it",
-                list(secrets.values()),
+                redaction_values(secrets),
             ),
             file=sys.stderr,
         )
@@ -130,9 +150,16 @@ def _print_traceback(debug: bool, secrets: dict[str, str]) -> None:
     `secrets` is read at call time on purpose: whatever has been decrypted by
     the moment of the failure is masked, and a failure before that point
     (nothing known to mask yet) still prints normally.
+
+    Masks via `redaction_values()` (P5, Fix round 1), not a plain
+    `list(secrets.values())` -- the latter only knows the "app_env" secret as
+    one whole blob, so an individual app_env line's VALUE (e.g. a session
+    secret echoed inside a remote command's stderr) would slip through
+    unmasked even though `Context.secret_values` already protects it on
+    every `ctx.emit()` line during `apply()`.
     """
     if debug:
-        print(redact(traceback.format_exc(), list(secrets.values())), file=sys.stderr, end="")
+        print(redact(traceback.format_exc(), redaction_values(secrets)), file=sys.stderr, end="")
 
 
 def error_line(error: StackError, secret_values: list[str]) -> str:
@@ -161,13 +188,13 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> N
         cloudflare = CloudflareClient(cloudflare_token)
     else:
         cloudflare = None
-        print(redact(_NO_CLOUDFLARE_WARNING, list(secrets.values())))
+        print(redact(_NO_CLOUDFLARE_WARNING, redaction_values(secrets)))
 
     stackbase_src = os.environ.get("STACKBASE_SRC") or None
     local = local_facts(infra_dir, secrets, stackbase_src=stackbase_src)
     observed = observe(cfg, state, hostinger, cloudflare, local=local)
     for warning in observed.cloudflare_ip_warnings:
-        print(redact(f"! {warning}", list(secrets.values())))
+        print(redact(f"! {warning}", redaction_values(secrets)))
     steps = plan(cfg, state, observed)
 
     if args.plan:
@@ -196,7 +223,7 @@ def _print_plan(steps: list[Step], secrets: dict[str, str]) -> None:
     if not steps:
         print("nothing to do")
         return
-    values = list(secrets.values())
+    values = redaction_values(secrets)
     has_cloudflare_token = bool(secrets.get("cloudflare_token"))
     print("would do:")
     for number, step in enumerate(steps, start=1):

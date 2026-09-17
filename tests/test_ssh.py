@@ -9,8 +9,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from stackbase.errors import StackError
-from stackbase.ssh import Ssh
-from tests.fakes import FakeRunner
+from stackbase.ssh import HOST_KEY_CHANGED_MARKER, Ssh
+from tests.fakes import FakePopen, FakeRunner
 
 _HOST = "1.2.3.4"
 _KEYSCAN_LINE = f"{_HOST} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAImatchbody\n"
@@ -164,53 +164,104 @@ class RunTests(unittest.TestCase):
 
 
 class RunStreamTests(unittest.TestCase):
-    """`run_stream` streams an open file object as stdin, never `input=`."""
+    """`run_stream`: the one true streaming path (Popen, line-by-line `emit`).
 
-    def test_streams_the_file_object_as_stdin_not_input(self) -> None:
+    Fix round 1, P3: replaces the old buffered `run_stream` (which used
+    `subprocess.run`/`runner` under the hood despite the name) and
+    `release.py`'s hand-rolled `_stream_ssh`.
+    """
+
+    def test_streams_the_file_object_as_stdin_not_devnull(self) -> None:
         with TemporaryDirectory() as tmp:
             payload = Path(tmp) / "payload.tar.gz"
             payload.write_bytes(b"\x1f\x8b\x00fake-tarball-bytes")
-            runner = FakeRunner()
-            runner.script(_cp_text(["ssh"], returncode=0, stdout="✓ unpacked v1.0.0\n", stderr=""))
-            ssh = Ssh(Path(tmp), _HOST, user="deploy", runner=runner)
+            popen = FakePopen()
+            popen.script(returncode=0, output="✓ unpacked v1.0.0\n")
+            ssh = Ssh(Path(tmp), _HOST, user="deploy", popen=popen)
+            emitted: list[str] = []
 
             with payload.open("rb") as fh:
-                result = ssh.run_stream("upload v1.0.0 " + "a" * 64, fh)
+                returncode, tail = ssh.run_stream("upload v1.0.0 " + "a" * 64, stdin=fh, emit=emitted.append)
 
-            self.assertEqual(result.stdout, "✓ unpacked v1.0.0\n")
-            call = runner.calls[0]
+            self.assertEqual(returncode, 0)
+            self.assertEqual(emitted, ["✓ unpacked v1.0.0"])
+            self.assertEqual(tail, ["✓ unpacked v1.0.0"])
+            call = popen.calls[0]
             self.assertEqual(call["argv"][-1], "upload v1.0.0 " + "a" * 64)
             self.assertEqual(call["argv"][-2], "deploy@" + _HOST)
             self.assertIs(call["kwargs"]["stdin"], fh)
-            self.assertNotIn("input", call["kwargs"])
             self.assertIn("BatchMode=yes", call["argv"])
             self.assertIn(f"UserKnownHostsFile={Path(tmp) / 'known_hosts'}", call["argv"])
 
-    def test_check_true_raises_on_nonzero_same_as_run(self) -> None:
+    def test_stdin_defaults_to_devnull(self) -> None:
         with TemporaryDirectory() as tmp:
-            payload = Path(tmp) / "payload.tar.gz"
-            payload.write_bytes(b"x")
-            runner = FakeRunner()
-            runner.script(_cp_text(["ssh"], returncode=1, stdout="", stderr="✗ sha256 mismatch"))
-            ssh = Ssh(Path(tmp), _HOST, runner=runner)
+            popen = FakePopen()
+            popen.script(returncode=0, output="active=blue (v1.0.0)\n")
+            ssh = Ssh(Path(tmp), _HOST, popen=popen)
 
-            with payload.open("rb") as fh, self.assertRaises(StackError) as ctx:
-                ssh.run_stream("upload v1.0.0 " + "a" * 64, fh)
+            ssh.run_stream("status", emit=lambda _l: None)
+
+            self.assertIs(popen.calls[0]["kwargs"]["stdin"], subprocess.DEVNULL)
+
+    def test_check_true_raises_on_nonzero_carrying_the_tail(self) -> None:
+        with TemporaryDirectory() as tmp:
+            popen = FakePopen()
+            popen.script(returncode=1, output="✗ sha256 mismatch\n")
+            ssh = Ssh(Path(tmp), _HOST, popen=popen)
+
+            with self.assertRaises(StackError) as ctx:
+                ssh.run_stream("upload v1.0.0 " + "a" * 64, emit=lambda _l: None)
 
             self.assertIn("sha256 mismatch", ctx.exception.hint)
 
-    def test_check_false_returns_the_completed_process(self) -> None:
+    def test_check_false_returns_the_returncode_and_tail_without_raising(self) -> None:
         with TemporaryDirectory() as tmp:
-            payload = Path(tmp) / "payload.tar.gz"
-            payload.write_bytes(b"x")
-            runner = FakeRunner()
-            runner.script(_cp_text(["ssh"], returncode=3, stdout="", stderr="✗ another deploy is already in progress"))
-            ssh = Ssh(Path(tmp), _HOST, runner=runner)
+            popen = FakePopen()
+            popen.script(returncode=3, output="✗ another deploy is already in progress\n")
+            ssh = Ssh(Path(tmp), _HOST, popen=popen)
 
-            with payload.open("rb") as fh:
-                result = ssh.run_stream("upload v1.0.0 " + "a" * 64, fh, check=False)
+            returncode, tail = ssh.run_stream("upload v1.0.0 " + "a" * 64, emit=lambda _l: None, check=False)
 
-            self.assertEqual(result.returncode, 3)
+            self.assertEqual(returncode, 3)
+            self.assertEqual(tail, ["✗ another deploy is already in progress"])
+
+    def test_host_key_changed_raises_the_pin_hint_even_with_check_false(self) -> None:
+        """A host-key mismatch is never something a caller can opt out of
+        surfacing by passing check=False -- Fix round 1, P3.
+        """
+        with TemporaryDirectory() as tmp:
+            popen = FakePopen()
+            popen.script(returncode=255, output=f"@@@ {HOST_KEY_CHANGED_MARKER} @@@\n")
+            ssh = Ssh(Path(tmp), _HOST, popen=popen)
+
+            with self.assertRaises(StackError) as ctx:
+                ssh.run_stream("status", emit=lambda _l: None, check=False)
+
+            self.assertIn("reinstalled", ctx.exception.hint)
+
+    def test_host_key_changed_raises_instead_of_the_generic_failure(self) -> None:
+        with TemporaryDirectory() as tmp:
+            popen = FakePopen()
+            popen.script(returncode=255, output=f"@@@ {HOST_KEY_CHANGED_MARKER} @@@\n")
+            ssh = Ssh(Path(tmp), _HOST, popen=popen)
+
+            with self.assertRaises(StackError) as ctx:
+                ssh.run_stream("status", emit=lambda _l: None)
+
+            self.assertIn("does not match the pinned entry", str(ctx.exception))
+
+    def test_ssh_binary_not_found_names_the_install_hint(self) -> None:
+        with TemporaryDirectory() as tmp:
+
+            def missing_popen(argv: list[str], **_kwargs: object) -> None:
+                raise FileNotFoundError(argv[0])
+
+            ssh = Ssh(Path(tmp), _HOST, popen=missing_popen)
+
+            with self.assertRaises(StackError) as ctx:
+                ssh.run_stream("status", emit=lambda _l: None)
+
+            self.assertIn("openssh-client", ctx.exception.hint)
 
 
 class FetchTests(unittest.TestCase):

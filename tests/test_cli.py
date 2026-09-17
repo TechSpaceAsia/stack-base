@@ -59,12 +59,18 @@ _LOCK = {
 }
 
 
-def _project(root: Path, *, cloudflare_token: str | None = _CLOUDFLARE_TOKEN) -> tuple[Path, Path]:
+def _project(
+    root: Path, *, cloudflare_token: str | None = _CLOUDFLARE_TOKEN, app_env: str | None = None
+) -> tuple[Path, Path]:
     """Build an infra/ directory with a real encrypted secrets.age.
 
     `cloudflare_token=None` omits "cloudflare_token" from the secrets payload
     entirely (Task 7b: Cloudflare is optional -- absent, not just empty, is
     the normal way an operator would create secrets.age without one).
+
+    `app_env`, when given, is stored as the "app_env" secret -- used to prove
+    each individual app_env line VALUE is masked (via
+    `reconcile.redaction_values`), not just the whole blob (P5, Fix round 1).
 
     Returns `(infra_dir, age_identity)`.
     """
@@ -86,6 +92,8 @@ def _project(root: Path, *, cloudflare_token: str | None = _CLOUDFLARE_TOKEN) ->
     secrets: dict[str, str] = {"hostinger_token": _HOSTINGER_TOKEN}
     if cloudflare_token is not None:
         secrets["cloudflare_token"] = cloudflare_token
+    if app_env is not None:
+        secrets["app_env"] = app_env
     payload = json.dumps(secrets)
     subprocess.run(
         ["age", "-R", str(infra_dir / "age-recipients.txt"), "-o", str(infra_dir / "secrets.age")],
@@ -444,6 +452,55 @@ class FailureTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 1)
             self.assertIn("RuntimeError", stderr.getvalue())
             self.assertEqual(len(stderr.getvalue().strip().splitlines()), 1)
+
+    def test_an_app_env_line_value_is_masked_on_the_final_error_line(self) -> None:
+        """P5, Fix round 1: __main__.py must mask each app_env line VALUE, not
+        just the whole app_env blob -- see reconcile.redaction_values.
+        """
+        app_env_secret = "sess-super-secret-value-1234"
+        with TemporaryDirectory() as tmp, FakeServer() as server:
+            infra_dir, identity = _project(Path(tmp), app_env=f"SESSION_SECRET={app_env_secret}\n")
+            leaky = StackError(
+                f"command failed on the node: echo {app_env_secret}",
+                f"stderr said: {app_env_secret}",
+            )
+            stderr = io.StringIO()
+
+            with _cli(server, identity):
+                with mock.patch("stackbase.__main__.observe", side_effect=leaky):
+                    with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+                        main(["--infra-dir", str(infra_dir), "up", "--plan"])
+
+            self.assertEqual(caught.exception.code, 1)
+            line = stderr.getvalue().strip()
+            self.assertEqual(len(line.splitlines()), 1, f"expected one line, got: {line}")
+            self.assertNotIn(app_env_secret, line)
+            self.assertIn("***REDACTED***", line)
+
+    def test_an_app_env_line_value_is_masked_in_the_debug_traceback(self) -> None:
+        app_env_secret = "sess-super-secret-value-5678"
+        with TemporaryDirectory() as tmp, FakeServer() as server:
+            infra_dir, identity = _project(Path(tmp), app_env=f"SESSION_SECRET={app_env_secret}\n")
+            leaky = StackError(
+                f"command failed on the node: echo {app_env_secret}",
+                f"stderr said: {app_env_secret}",
+            )
+            stdout, stderr = io.StringIO(), io.StringIO()
+
+            with _cli(server, identity):
+                with mock.patch("stackbase.__main__.observe", side_effect=leaky):
+                    with (
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                        self.assertRaises(SystemExit) as caught,
+                    ):
+                        main(["--infra-dir", str(infra_dir), "up", "--plan", "--debug"])
+
+            self.assertEqual(caught.exception.code, 1)
+            everything = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("Traceback (most recent call last)", everything)
+            self.assertNotIn(app_env_secret, everything)
+            self.assertIn("***REDACTED***", everything)
 
     def test_a_missing_secrets_file_names_the_command_that_creates_it(self) -> None:
         with TemporaryDirectory() as tmp, FakeServer() as server:

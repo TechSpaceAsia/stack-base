@@ -272,6 +272,7 @@ def build(
     worktree: Path,
     project: Project,
     *,
+    work_dir: Path,
     runner: Any = subprocess.run,
     popen: Any = subprocess.Popen,
     emit: Callable[[str], None] = print,
@@ -283,12 +284,25 @@ def build(
     binary, then the Tailwind CSS build, bundled the same way the workflow
     does -- the binary at the top level, plus `static/`, `migrations/`,
     `config/` when present. Every subprocess is streamed to the terminal via
-    `emit`, so a multi-minute cargo build doesn't look like a hang. Returns
-    the bundle directory (a fresh temp dir, independent of `worktree` --
-    `release_worktree` removes `worktree` once the caller's `with` block
-    exits, and the bundle must outlive that).
+    `emit`, so a multi-minute cargo build doesn't look like a hang.
+
+    `work_dir` is a PRIVATE, per-run directory the caller (`run_deploy`) owns
+    and removes -- the bundle is created as a subdirectory of it
+    (`work_dir/bundle`), never directly under the shared system temp root
+    (Fix round 1, P2: the old `tempfile.mkdtemp(prefix="stackbase-bundle-")`
+    here was never cleaned up, and `package()`'s own default output
+    directory -- `bundle_dir.parent` -- landed the finished tarball straight
+    in `/tmp` at a predictable, version-named path). Returns the bundle
+    directory.
     """
-    env = {**os.environ, "RUSTFLAGS": "-C target-feature=+crt-static"}
+    # Append to, never overwrite, an operator-set RUSTFLAGS (minor e, Fix
+    # round 1) -- someone building on a machine that already needs its own
+    # RUSTFLAGS (a linker override, a lint allow-list) would otherwise have
+    # it silently discarded by this static-musl requirement.
+    existing_rustflags = os.environ.get("RUSTFLAGS", "").strip()
+    crt_static = "-C target-feature=+crt-static"
+    rustflags = f"{existing_rustflags} {crt_static}" if existing_rustflags else crt_static
+    env = {**os.environ, "RUSTFLAGS": rustflags}
     emit("→ building the release binary (cargo build --release --target x86_64-unknown-linux-musl)")
     returncode, tail = _stream_local(
         ["cargo", "build", "--release", "--target", "x86_64-unknown-linux-musl"],
@@ -310,7 +324,8 @@ def build(
             f"binary '{project.binary}'",
         )
 
-    bundle_dir = Path(tempfile.mkdtemp(prefix="stackbase-bundle-"))
+    bundle_dir = work_dir / "bundle"
+    bundle_dir.mkdir(parents=True)
     shutil.copy2(binary_path, bundle_dir / project.binary)
     (bundle_dir / project.binary).chmod(0o755)
     for extra in _TAR_EXTENSIONS:
@@ -437,6 +452,11 @@ def package(
     backslash before being written -- `nixos/deploy/stack-deploy.sh`'s
     `deploy_unpack_tarball` refuses all of those server-side too; this
     refuses them before the tarball even exists.
+
+    `output_dir`, when omitted, defaults to `bundle_dir.parent` -- a sibling
+    of the bundle inside the caller's own private, per-run work dir (see
+    `build`/`run_deploy`), never a bare fallback into the shared system temp
+    root (Fix round 1, P2).
     """
     if output_dir is None:
         output_dir = bundle_dir.parent
@@ -450,7 +470,16 @@ def package(
         # mtime=0: no timestamp either -- both are needed for byte-identical
         # output across two runs.
         with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
-            with tarfile.open(fileobj=gz, mode="w") as tar:
+            # format=PAX_FORMAT pinned explicitly (minor a, Fix round 1) --
+            # it already matches tarfile's own DEFAULT_FORMAT today, but
+            # pinning it means a future stdlib default change can never
+            # silently change what byte-identical output means here. PAX
+            # only emits an extended header block for a member whose
+            # metadata doesn't fit the plain ustar fields (very long names,
+            # huge sizes/uids); every member this function ever writes
+            # (short ascii names, uid/gid forced to 0) fits, so no such
+            # block is ever produced -- see PackageTests for the assertion.
+            with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
                 for path, arcname in members:
                     _validate_member_name(arcname)
                     tarinfo = tar.gettarinfo(str(path), arcname=arcname)
@@ -551,6 +580,22 @@ def _select_nodes(cfg: StackConfig, order: list[str], only: str | None) -> list[
     return [only]
 
 
+def _emit_untouched_notice(cfg: StackConfig, only: str | None, emit: Callable[[str], None]) -> None:
+    """With `--node`, tell the operator how many OTHER configured nodes this
+    run never touched -- easy to miss otherwise, since a `--node`-filtered
+    run's output looks identical in shape to an unfiltered one (minor c,
+    Fix round 1).
+    """
+    if only is None:
+        return
+    other = len(cfg.nodes) - 1
+    if other <= 0:
+        return
+    noun = "node" if other == 1 else "nodes"
+    verb = "was" if other == 1 else "were"
+    emit(f"i --node {only}: {other} other configured {noun} {verb} not touched")
+
+
 def _node_ip(state: StackState, name: str) -> str:
     node_state = state.nodes.get(name)
     ip = node_state.ipv4 if node_state else None
@@ -572,61 +617,63 @@ def ship(
     *,
     node: str | None = None,
     runner: Any = subprocess.run,
+    popen: Any = subprocess.Popen,
     emit: Callable[[str], None] = print,
 ) -> dict[str, str]:
     """Upload and switch `version` on every selected node, replicas first, primary last.
 
     Per node: `upload <version> <sha256>` with the tarball streamed on
-    stdin, then `deploy <version>`. An "already exists" upload (a re-run
-    after a partial failure) is treated as already-uploaded and the run
-    continues straight to `deploy` -- idempotent, matching the engine's own
-    check-then-act contract. Exit code 3 from the door means another deploy
-    holds the node's lock. Stops at the first genuine failure and prints a
-    summary of every selected node's current release (via `colors`) so the
-    operator knows exactly what is live where.
+    stdin, then `deploy <version>`. Both go through `Ssh.run_stream` (the
+    one streaming path to a node, `check=False`), so the door's own output
+    (including an "already uploaded (same content)" info line) is echoed
+    live via `emit` as it arrives -- there is nothing left here to
+    re-print, and NO text is matched to decide what happens next (Fix
+    round 1, P1): exit 0 always continues (whether the upload was fresh or
+    the SAME content was already there), exit 3 means another deploy holds
+    the node's lock, exit 4 means the version already exists on this node
+    with DIFFERENT content (refused -- a published version must never
+    change), and any other non-zero is a generic upload/deploy failure.
+    Stops at the first failure and prints a summary of every selected
+    node's current release (via `colors`) so the operator knows exactly
+    what is live where.
     """
     order = _select_nodes(cfg, _node_order(cfg, primary_first=False), node)
+    _emit_untouched_notice(cfg, node, emit)
     results: dict[str, str] = {}
     try:
         for name in order:
-            ssh = Ssh(infra_dir, _node_ip(state, name), user=_DEPLOY_SSH_USER, runner=runner)
+            ssh = Ssh(infra_dir, _node_ip(state, name), user=_DEPLOY_SSH_USER, runner=runner, popen=popen)
 
             emit(f"→ node {name}: uploading {version}")
             with tarball.open("rb") as fh:
-                upload = ssh.run_stream(f"upload {version} {sha256}", fh, check=False)
-            _emit_lines(emit, upload.stdout)
-            _emit_lines(emit, upload.stderr)
-            if upload.returncode == 3:
-                raise StackError(
-                    f"another deploy is running on {name}",
-                    "wait for it to finish, then re-run",
+                upload_rc, upload_tail = ssh.run_stream(
+                    f"upload {version} {sha256}", stdin=fh, emit=emit, check=False
                 )
-            already_uploaded = "already exists" in ((upload.stderr or "") + (upload.stdout or ""))
-            if upload.returncode != 0 and not already_uploaded:
+            if upload_rc == 3:
+                raise StackError(f"another deploy is running on {name}", "wait for it to finish, then re-run")
+            if upload_rc == 4:
                 raise StackError(
-                    f"uploading {version} to node {name} failed (exit {upload.returncode})",
-                    "check the output above -- fix the issue and re-run; nothing was switched on this node",
+                    f"node {name} already has {version} with different content",
+                    "a released version must never change -- create a new version (bump, tag) and deploy that",
                 )
-            if already_uploaded:
-                emit(f"i node {name}: {version} was already uploaded -- continuing to deploy")
+            if upload_rc != 0:
+                raise StackError(
+                    f"uploading {version} to node {name} failed (exit {upload_rc})",
+                    _tail_hint(upload_tail, "fix the issue and re-run; nothing was switched on this node"),
+                )
 
             emit(f"→ node {name}: switching traffic to {version}")
-            deployed = ssh.run(f"deploy {version}", check=False)
-            _emit_lines(emit, deployed.stdout)
-            _emit_lines(emit, deployed.stderr)
-            if deployed.returncode == 3:
+            deploy_rc, deploy_tail = ssh.run_stream(f"deploy {version}", emit=emit, check=False)
+            if deploy_rc == 3:
+                raise StackError(f"another deploy is running on {name}", "wait for it to finish, then re-run")
+            if deploy_rc != 0:
                 raise StackError(
-                    f"another deploy is running on {name}",
-                    "wait for it to finish, then re-run",
-                )
-            if deployed.returncode != 0:
-                raise StackError(
-                    f"deploying {version} to node {name} failed (exit {deployed.returncode})",
-                    "check the output above -- traffic on this node was not switched; fix the issue and re-run",
+                    f"deploying {version} to node {name} failed (exit {deploy_rc})",
+                    _tail_hint(deploy_tail, "traffic on this node was not switched; fix the issue and re-run"),
                 )
             results[name] = version
     finally:
-        _print_summary(infra_dir, cfg, state, order, runner=runner, emit=emit)
+        _print_summary(infra_dir, cfg, state, order, runner=runner, popen=popen, emit=emit)
 
     return results
 
@@ -643,16 +690,17 @@ def rollback_nodes(
 ) -> None:
     """Run `rollback` on every selected node, primary first -- getting traffic back is the priority."""
     order = _select_nodes(cfg, _node_order(cfg, primary_first=True), node)
+    _emit_untouched_notice(cfg, node, emit)
     for name in order:
-        ssh = Ssh(infra_dir, _node_ip(state, name), user=_DEPLOY_SSH_USER, runner=runner)
+        ssh = Ssh(infra_dir, _node_ip(state, name), user=_DEPLOY_SSH_USER, runner=runner, popen=popen)
         emit(f"→ node {name}: rollback")
-        returncode = _stream_ssh(ssh, "rollback", popen=popen, emit=emit)
+        returncode, tail = ssh.run_stream("rollback", emit=emit, check=False)
         if returncode == 3:
             raise StackError(f"another deploy is running on {name}", "wait for it to finish, then re-run")
         if returncode != 0:
             raise StackError(
                 f"rollback failed on node {name} (exit {returncode})",
-                "check the output above -- fix the issue and re-run",
+                _tail_hint(tail, "fix the issue and re-run"),
             )
 
 
@@ -668,40 +716,16 @@ def status_nodes(
 ) -> None:
     """Run `status` on every selected node, one ssh call each."""
     order = _select_nodes(cfg, _node_order(cfg, primary_first=True), node)
+    _emit_untouched_notice(cfg, node, emit)
     for name in order:
-        ssh = Ssh(infra_dir, _node_ip(state, name), user=_DEPLOY_SSH_USER, runner=runner)
+        ssh = Ssh(infra_dir, _node_ip(state, name), user=_DEPLOY_SSH_USER, runner=runner, popen=popen)
         emit(f"node {name}:")
-        returncode = _stream_ssh(ssh, "status", popen=popen, emit=emit)
+        returncode, tail = ssh.run_stream("status", emit=emit, check=False)
         if returncode != 0:
             raise StackError(
                 f"status failed on node {name} (exit {returncode})",
-                "check the output above",
+                _tail_hint(tail, "check the output above"),
             )
-
-
-def _stream_ssh(ssh: Ssh, cmd: str, *, popen: Any, emit: Callable[[str], None]) -> int:
-    """Run one door command on `ssh`, echoing output line by line. See `_stream_local`."""
-    argv = [*ssh.argv(), cmd]
-    try:
-        process = popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            stdin=subprocess.DEVNULL,
-        )
-    except FileNotFoundError as exc:
-        raise StackError(
-            "the 'ssh' command was not found",
-            _MISSING_TOOL_HINTS["ssh"],
-        ) from exc
-    with process:
-        if process.stdout is not None:
-            for line in process.stdout:
-                emit(line.rstrip("\n"))
-        returncode = process.wait()
-    return returncode
 
 
 def _print_summary(
@@ -711,13 +735,17 @@ def _print_summary(
     nodes: list[str],
     *,
     runner: Any,
+    popen: Any,
     emit: Callable[[str], None],
 ) -> None:
     """Print each selected node's current release (from `colors`), best-effort.
 
     Called whether `ship` succeeded or stopped at a failing node -- either
     way the operator needs to know exactly what is live on every node it
-    touched, not just the one that failed.
+    touched, not just the one that failed. Goes through `Ssh.run_stream`
+    like every other door call now (Fix round 1, P3) -- a host-key change
+    surfaces the same reinstall-vs-interception hint here too, instead of a
+    bare "could not read status".
     """
     emit("node status:")
     for name in nodes:
@@ -727,23 +755,16 @@ def _print_summary(
             emit(f"  {name}: {exc}")
             continue
         try:
-            ssh = Ssh(infra_dir, ip, user=_DEPLOY_SSH_USER, runner=runner)
-            result = ssh.run("colors", check=False)
+            ssh = Ssh(infra_dir, ip, user=_DEPLOY_SSH_USER, runner=runner, popen=popen)
+            lines: list[str] = []
+            returncode, _tail_lines = ssh.run_stream("colors", emit=lines.append, check=False)
         except StackError as exc:
             emit(f"  {name}: could not read status ({exc})")
             continue
-        if result.returncode == 0:
-            emit(f"  {name}: {(result.stdout or '').strip()}")
+        if returncode == 0:
+            emit(f"  {name}: {' '.join(lines).strip()}")
         else:
-            emit(f"  {name}: could not read status (exit {result.returncode})")
-
-
-def _emit_lines(emit: Callable[[str], None], text: str | None) -> None:
-    if not text:
-        return
-    for line in text.splitlines():
-        if line:
-            emit(line)
+            emit(f"  {name}: could not read status (exit {returncode})")
 
 
 def _tail_hint(tail: list[str], advice: str) -> str:
@@ -790,21 +811,37 @@ def run_deploy(
     repo_dir = infra_dir.parent
 
     if skip_build:
+        # No private work dir is ever created on this path: the tarball is
+        # the OPERATOR's own file (e.g. built by CI elsewhere), and it must
+        # never be deleted or moved out from under them (Fix round 1, P2).
         validate_version_format(version)
         assert tarball_path is not None  # guarded above
         tarball = Path(tarball_path).expanduser()
         if not tarball.is_file():
             raise StackError(f"tarball not found: {tarball}", "check the --tarball path")
         sha256 = _sha256_file(tarball)
-    else:
+        ship(infra_dir, cfg, state, version, tarball, sha256, node=node, runner=runner, popen=popen, emit=emit)
+        return
+
+    # A private, per-run work dir (`tempfile.mkdtemp`'s own default mode,
+    # 0700 -- readable/writable only by whoever is running this) holding
+    # both the build's bundle directory and the packaged tarball. Removed
+    # unconditionally in `finally` -- success, a build/ship failure, or
+    # Ctrl-C -- so a release never leaves build artefacts (up to and
+    # including the compiled binary) behind, and the tarball never lands at
+    # a predictable, version-named path in the shared, world-writable /tmp
+    # root (P2, Fix round 1).
+    work_dir = Path(tempfile.mkdtemp(prefix="stackbase-release-"))
+    try:
         verify_version(repo_dir, version, runner=runner)
         mtime = tag_commit_timestamp(repo_dir, version, runner=runner)
         with release_worktree(repo_dir, version, runner=runner) as worktree:
             project = read_project(worktree)
-            bundle_dir = build(worktree, project, runner=runner, popen=popen, emit=emit)
+            bundle_dir = build(worktree, project, work_dir=work_dir, runner=runner, popen=popen, emit=emit)
             tarball, sha256 = package(bundle_dir, version, mtime, binary_name=project.binary)
-
-    ship(infra_dir, cfg, state, version, tarball, sha256, node=node, runner=runner, emit=emit)
+        ship(infra_dir, cfg, state, version, tarball, sha256, node=node, runner=runner, popen=popen, emit=emit)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def run_rollback(

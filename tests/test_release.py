@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import tarfile
+import tempfile
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -72,8 +73,19 @@ def _init_repo(
     cargo_version: str = "1.4.2",
     tag: str | None = "v1.4.2",
     package_name: str = "stack-demo",
+    with_binary: bool = False,
 ) -> Path:
-    """A throwaway git repo with a committed Cargo.toml, optionally tagged."""
+    """A throwaway git repo with a committed Cargo.toml, optionally tagged.
+
+    `with_binary=True` also commits a dummy file at the exact path
+    `build()` expects cargo to have produced
+    (`target/x86_64-unknown-linux-musl/release/<binary>`) -- unrealistic for
+    a real project, but it means a REAL `git worktree add` checkout of the
+    tag already contains that file, so a test can drive the full
+    `run_deploy` path with a FAKE `popen` for cargo (which never touches the
+    filesystem) while `build()`'s own "was the binary actually produced"
+    check still finds something real.
+    """
     repo_dir = root / "repo"
     repo_dir.mkdir()
     _run_git(repo_dir, "init", "-q")
@@ -82,6 +94,12 @@ def _init_repo(
         encoding="utf-8",
     )
     _run_git(repo_dir, "add", "Cargo.toml")
+    if with_binary:
+        binary_name = package_name.replace("-", "_")
+        binary_dir = repo_dir / "target" / "x86_64-unknown-linux-musl" / "release"
+        binary_dir.mkdir(parents=True)
+        (binary_dir / binary_name).write_bytes(b"#!/bin/sh\necho pretend-binary\n")
+        _run_git(repo_dir, "add", "-f", str((binary_dir / binary_name).relative_to(repo_dir)))
     _run_git(repo_dir, "commit", "-q", "-m", "initial")
     if tag:
         _run_git(repo_dir, "tag", tag)
@@ -261,7 +279,7 @@ class BuildTests(unittest.TestCase):
             emitted: list[str] = []
             project = Project(version="1.0.0", binary="stack_demo")
 
-            bundle_dir = build(worktree, project, popen=popen, emit=emitted.append)
+            bundle_dir = build(worktree, project, work_dir=Path(tmp), popen=popen, emit=emitted.append)
 
             self.assertTrue((bundle_dir / "stack_demo").is_file())
             self.assertEqual((bundle_dir / "stack_demo").stat().st_mode & 0o777, 0o755)
@@ -276,6 +294,22 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(cargo_call["kwargs"]["env"]["RUSTFLAGS"], "-C target-feature=+crt-static")
             self.assertEqual(cargo_call["kwargs"]["stdin"], subprocess.DEVNULL)
 
+    def test_an_operator_set_rustflags_is_appended_to_not_overwritten(self) -> None:
+        """Minor e, Fix round 1: -C target-feature=+crt-static must not clobber
+        a RUSTFLAGS the operator already set (a linker override, a lint
+        allow-list, ...).
+        """
+        with TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"RUSTFLAGS": "-D warnings"}):
+            worktree = _worktree(Path(tmp))
+            popen = FakePopen()
+            popen.script(returncode=0, output="ok\n")
+            project = Project(version="1.0.0", binary="stack_demo")
+
+            build(worktree, project, work_dir=Path(tmp), popen=popen, emit=lambda _line: None)
+
+            cargo_call = popen.calls[0]
+            self.assertEqual(cargo_call["kwargs"]["env"]["RUSTFLAGS"], "-D warnings -C target-feature=+crt-static")
+
     def test_migrations_and_config_are_bundled_when_present(self) -> None:
         with TemporaryDirectory() as tmp:
             worktree = _worktree(Path(tmp))
@@ -287,7 +321,7 @@ class BuildTests(unittest.TestCase):
             popen.script(returncode=0, output="ok\n")
             project = Project(version="1.0.0", binary="stack_demo")
 
-            bundle_dir = build(worktree, project, popen=popen, emit=lambda _line: None)
+            bundle_dir = build(worktree, project, work_dir=Path(tmp), popen=popen, emit=lambda _line: None)
 
             self.assertTrue((bundle_dir / "migrations" / "001_initial.sql").is_file())
             self.assertTrue((bundle_dir / "config" / "app.toml").is_file())
@@ -301,7 +335,7 @@ class BuildTests(unittest.TestCase):
             popen.script(returncode=0, output="npm run build:css ok\n")
             project = Project(version="1.0.0", binary="stack_demo")
 
-            build(worktree, project, popen=popen, emit=lambda _line: None)
+            build(worktree, project, work_dir=Path(tmp), popen=popen, emit=lambda _line: None)
 
             argvs = [" ".join(call["argv"]) for call in popen.calls]
             self.assertIn("npm ci", argvs)
@@ -315,7 +349,7 @@ class BuildTests(unittest.TestCase):
             popen.script(returncode=0, output="tailwind ok\n")
             project = Project(version="1.0.0", binary="stack_demo")
 
-            build(worktree, project, popen=popen, emit=lambda _line: None)
+            build(worktree, project, work_dir=Path(tmp), popen=popen, emit=lambda _line: None)
 
             tailwind_call = popen.calls[1]
             self.assertTrue(tailwind_call["argv"][0].endswith("tools/tailwindcss"))
@@ -336,7 +370,7 @@ class BuildTests(unittest.TestCase):
             project = Project(version="1.0.0", binary="stack_demo")
 
             with self.assertRaises(StackError) as ctx:
-                build(worktree, project, popen=popen, emit=lambda _line: None)
+                build(worktree, project, work_dir=Path(tmp), popen=popen, emit=lambda _line: None)
             self.assertIn("rustup target add x86_64-unknown-linux-musl", ctx.exception.hint)
 
     def test_missing_musl_gcc_gets_a_specific_hint(self) -> None:
@@ -347,7 +381,7 @@ class BuildTests(unittest.TestCase):
             project = Project(version="1.0.0", binary="stack_demo")
 
             with self.assertRaises(StackError) as ctx:
-                build(worktree, project, popen=popen, emit=lambda _line: None)
+                build(worktree, project, work_dir=Path(tmp), popen=popen, emit=lambda _line: None)
             self.assertIn("musl-tools", ctx.exception.hint)
 
     def test_missing_cargo_binary_names_rustup(self) -> None:
@@ -359,7 +393,7 @@ class BuildTests(unittest.TestCase):
 
             project = Project(version="1.0.0", binary="stack_demo")
             with self.assertRaises(StackError) as ctx:
-                build(worktree, project, popen=missing_popen, emit=lambda _line: None)
+                build(worktree, project, work_dir=Path(tmp), popen=missing_popen, emit=lambda _line: None)
             self.assertIn("rustup.rs", ctx.exception.hint)
 
     def test_binary_not_produced_raises(self) -> None:
@@ -371,7 +405,7 @@ class BuildTests(unittest.TestCase):
             project = Project(version="1.0.0", binary="stack_demo")
 
             with self.assertRaises(StackError) as ctx:
-                build(worktree, project, popen=popen, emit=lambda _line: None)
+                build(worktree, project, work_dir=Path(tmp), popen=popen, emit=lambda _line: None)
             self.assertIn("stack_demo", str(ctx.exception))
 
     def test_streams_cargo_output_line_by_line(self) -> None:
@@ -382,7 +416,7 @@ class BuildTests(unittest.TestCase):
             emitted: list[str] = []
             project = Project(version="1.0.0", binary="stack_demo")
 
-            build(worktree, project, popen=popen, emit=emitted.append)
+            build(worktree, project, work_dir=Path(tmp), popen=popen, emit=emitted.append)
 
             self.assertIn("line1", emitted)
             self.assertIn("line2", emitted)
@@ -422,6 +456,21 @@ class PackageTests(unittest.TestCase):
             outside = Path(tmp) / "outside.txt"
             outside.write_text("x", encoding="utf-8")
             (bundle_dir / "sneaky").symlink_to(outside)
+
+            with self.assertRaises(StackError) as ctx:
+                package(bundle_dir, "v1.0.0", 0, binary_name="stack_demo")
+            self.assertIn("symlink", str(ctx.exception))
+
+    def test_refuses_a_symlinked_directory(self) -> None:
+        """Minor b, Fix round 1: a symlinked DIRECTORY, not just a symlinked file."""
+        with TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "bundle"
+            bundle_dir.mkdir()
+            (bundle_dir / "stack_demo").write_bytes(b"bin")
+            real_dir = Path(tmp) / "outside-dir"
+            (real_dir / "nested.txt").parent.mkdir(parents=True)
+            (real_dir / "nested.txt").write_text("x", encoding="utf-8")
+            (bundle_dir / "static").symlink_to(real_dir, target_is_directory=True)
 
             with self.assertRaises(StackError) as ctx:
                 package(bundle_dir, "v1.0.0", 0, binary_name="stack_demo")
@@ -488,6 +537,23 @@ class PackageTests(unittest.TestCase):
                 gz.read(1)  # force the header to be parsed
                 self.assertEqual(gz.mtime, 0)
 
+    def test_pinned_pax_format_emits_no_extended_headers_for_a_normal_bundle(self) -> None:
+        """Minor a, Fix round 1: format is pinned to PAX_FORMAT explicitly, but
+        a normal bundle (short ascii names, uid/gid forced to 0) must never
+        actually need an extended header block -- that would break byte
+        determinism between two otherwise-identical runs.
+        """
+        with TemporaryDirectory() as tmp:
+            bundle_dir = self._bundle(Path(tmp))
+            tar_path, _ = package(bundle_dir, "v1.0.0", 1_700_000_000, binary_name="stack_demo")
+
+            with tarfile.open(tar_path, "r:gz") as tar:
+                self.assertEqual(tar.format, tarfile.PAX_FORMAT)
+                members = tar.getmembers()
+                self.assertTrue(members)
+                for member in members:
+                    self.assertEqual(member.pax_headers, {}, f"unexpected PAX extended header on {member.name!r}")
+
 
 # --------------------------------------------------------------------------
 # ship()
@@ -507,41 +573,48 @@ class ShipTests(unittest.TestCase):
             tarball = self._tarball(tmp)
             cfg = _cfg({"a": "primary", "b": "replica"})
             state = _state({"a": "10.0.0.1", "b": "10.0.0.2"})
-            runner = FakeRunner()
+            popen = FakePopen()
             for _ in range(4):
-                runner.script(_cp(returncode=0, stdout="✓ ok\n"))
+                popen.script(returncode=0, output="✓ ok\n")
             for _ in range(2):
-                runner.script(_cp(returncode=0, stdout="active=blue (v1.0.0)  idle=green (-)\n"))
+                popen.script(returncode=0, output="active=blue (v1.0.0)  idle=green (-)\n")
             emitted: list[str] = []
 
-            results = ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, runner=runner, emit=emitted.append)
+            results = ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, popen=popen, emit=emitted.append)
 
             self.assertEqual(results, {"b": "v1.0.0", "a": "v1.0.0"})
-            hosts = [call["argv"][-2] for call in runner.calls[:4]]
+            hosts = [call["argv"][-2] for call in popen.calls[:4]]
             self.assertEqual(hosts, ["deploy@10.0.0.2", "deploy@10.0.0.2", "deploy@10.0.0.1", "deploy@10.0.0.1"])
-            cmds = [call["argv"][-1] for call in runner.calls[:4]]
+            cmds = [call["argv"][-1] for call in popen.calls[:4]]
             self.assertEqual(cmds[0], f"upload v1.0.0 {_SHA}")
             self.assertEqual(cmds[1], "deploy v1.0.0")
             self.assertEqual(cmds[2], f"upload v1.0.0 {_SHA}")
             self.assertEqual(cmds[3], "deploy v1.0.0")
+            # the summary's own colors calls, one per node touched.
+            summary_hosts = {call["argv"][-2] for call in popen.calls[4:]}
+            self.assertEqual(summary_hosts, {"deploy@10.0.0.1", "deploy@10.0.0.2"})
 
-    def test_node_filter_restricts_to_one_node(self) -> None:
+    def test_node_filter_restricts_to_one_node_and_notes_the_others_untouched(self) -> None:
         with TemporaryDirectory() as tmp:
             infra_dir = Path(tmp) / "infra"
             infra_dir.mkdir()
             tarball = self._tarball(tmp)
             cfg = _cfg({"a": "primary", "b": "replica"})
             state = _state({"a": "10.0.0.1", "b": "10.0.0.2"})
-            runner = FakeRunner()
-            runner.script(_cp(returncode=0, stdout="✓ ok\n"))
-            runner.script(_cp(returncode=0, stdout="✓ ok\n"))
-            runner.script(_cp(returncode=0, stdout="active=blue (v1.0.0)\n"))
+            popen = FakePopen()
+            popen.script(returncode=0, output="✓ ok\n")
+            popen.script(returncode=0, output="✓ ok\n")
+            popen.script(returncode=0, output="active=blue (v1.0.0)\n")
+            emitted: list[str] = []
 
-            results = ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, node="b", runner=runner, emit=lambda _l: None)
+            results = ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, node="b", popen=popen, emit=emitted.append)
 
             self.assertEqual(results, {"b": "v1.0.0"})
-            self.assertEqual(len(runner.calls), 3)
-            self.assertTrue(all(call["argv"][-2] == "deploy@10.0.0.2" for call in runner.calls))
+            self.assertEqual(len(popen.calls), 3)
+            self.assertTrue(all(call["argv"][-2] == "deploy@10.0.0.2" for call in popen.calls))
+            # minor c, Fix round 1: --node tells the operator how many OTHER
+            # configured nodes this run never touched.
+            self.assertTrue(any("1 other configured node" in line and "not touched" in line for line in emitted))
 
     def test_unknown_node_raises_and_lists_known_names(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -551,26 +624,82 @@ class ShipTests(unittest.TestCase):
             state = _state({"a": "10.0.0.1", "b": "10.0.0.2"})
 
             with self.assertRaises(StackError) as ctx:
-                ship(infra_dir, cfg, state, "v1.0.0", Path("/nonexistent.tar.gz"), _SHA, node="nope", runner=FakeRunner())
+                ship(infra_dir, cfg, state, "v1.0.0", Path("/nonexistent.tar.gz"), _SHA, node="nope")
             self.assertIn("known nodes", str(ctx.exception))
 
-    def test_already_uploaded_release_continues_to_deploy(self) -> None:
+    def test_upload_exit_0_with_already_uploaded_message_continues_to_deploy(self) -> None:
+        """P1, Fix round 1: control flow is the upload's EXIT CODE alone (0 =
+        proceed) -- the door's own "already uploaded (same content)" line is
+        only ever echoed for display via `emit`, never matched for control
+        flow (the old "already exists" substring match is gone entirely).
+        """
         with TemporaryDirectory() as tmp:
             infra_dir = Path(tmp) / "infra"
             infra_dir.mkdir()
             tarball = self._tarball(tmp)
             cfg = _cfg({"a": "primary"})
             state = _state({"a": "10.0.0.1"})
-            runner = FakeRunner()
-            runner.script(_cp(returncode=1, stderr="✗ release v1.0.0 already exists at /opt/acme/releases/v1.0.0; pass --force to overwrite\n"))
-            runner.script(_cp(returncode=0, stdout="✓ traffic switched to blue\n"))
-            runner.script(_cp(returncode=0, stdout="active=blue (v1.0.0)\n"))
+            popen = FakePopen()
+            popen.script(returncode=0, output="release v1.0.0 is already uploaded (same content)\n")
+            popen.script(returncode=0, output="✓ traffic switched to blue\n")
+            popen.script(returncode=0, output="active=blue (v1.0.0)\n")
             emitted: list[str] = []
 
-            results = ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, runner=runner, emit=emitted.append)
+            results = ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, popen=popen, emit=emitted.append)
 
             self.assertEqual(results, {"a": "v1.0.0"})
-            self.assertTrue(any("already uploaded" in line for line in emitted))
+            self.assertTrue(any("already uploaded (same content)" in line for line in emitted))
+            # deploy WAS reached (not skipped) -- its own line shows up too.
+            self.assertTrue(any("traffic switched to blue" in line for line in emitted))
+
+    def test_upload_exit_4_raises_and_never_reaches_deploy(self) -> None:
+        """P1, Fix round 1: exit 4 means the version already exists on the
+        node with DIFFERENT content -- refused, distinctly from a lock (3)
+        or a generic failure (any other non-zero).
+        """
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            tarball = self._tarball(tmp)
+            cfg = _cfg({"a": "primary"})
+            state = _state({"a": "10.0.0.1"})
+            popen = FakePopen()
+            popen.script(
+                returncode=4,
+                output="✗ release v1.0.0 already exists with different content -- a published version "
+                "must never change; bump the version instead\n",
+            )
+            popen.script(returncode=0, output="active=blue (v0.9.0)\n")  # summary colors call
+
+            with self.assertRaises(StackError) as ctx:
+                ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, popen=popen, emit=lambda _l: None)
+
+            self.assertIn("node a already has v1.0.0 with different content", str(ctx.exception))
+            self.assertIn("bump", ctx.exception.hint)
+            # only the upload ran -- deploy was never reached.
+            self.assertEqual(len(popen.calls), 2)  # upload + summary colors call
+            self.assertEqual(popen.calls[0]["argv"][-1], f"upload v1.0.0 {_SHA}")
+
+    def test_upload_generic_failure_stops_before_deploy(self) -> None:
+        """P4, Fix round 1: after P1, ANY upload exit other than 0 must stop
+        the rollout -- not just the two now-special-cased codes (3, 4).
+        """
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            tarball = self._tarball(tmp)
+            cfg = _cfg({"a": "primary"})
+            state = _state({"a": "10.0.0.1"})
+            popen = FakePopen()
+            popen.script(returncode=1, output="✗ sha256 mismatch for /tmp/x: expected aaa, got bbb\n")
+            popen.script(returncode=0, output="active=blue (v0.9.0)\n")  # summary colors call
+
+            with self.assertRaises(StackError) as ctx:
+                ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, popen=popen, emit=lambda _l: None)
+
+            self.assertIn("uploading v1.0.0 to node a failed (exit 1)", str(ctx.exception))
+            self.assertEqual(len(popen.calls), 2)  # upload + summary colors call -- deploy never ran
+            self.assertEqual(popen.calls[0]["argv"][-1], f"upload v1.0.0 {_SHA}")
 
     def test_upload_lock_held_raises_another_deploy_is_running(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -579,12 +708,12 @@ class ShipTests(unittest.TestCase):
             tarball = self._tarball(tmp)
             cfg = _cfg({"a": "primary"})
             state = _state({"a": "10.0.0.1"})
-            runner = FakeRunner()
-            runner.script(_cp(returncode=3, stderr="✗ another deploy is already in progress (lock held)\n"))
-            runner.script(_cp(returncode=0, stdout="active=blue (v0.9.0)\n"))  # summary colors call
+            popen = FakePopen()
+            popen.script(returncode=3, output="✗ another deploy is already in progress (lock held)\n")
+            popen.script(returncode=0, output="active=blue (v0.9.0)\n")  # summary colors call
 
             with self.assertRaises(StackError) as ctx:
-                ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, runner=runner, emit=lambda _l: None)
+                ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, popen=popen, emit=lambda _l: None)
             self.assertIn("another deploy is running on a", str(ctx.exception))
 
     def test_deploy_lock_held_raises_another_deploy_is_running(self) -> None:
@@ -594,13 +723,13 @@ class ShipTests(unittest.TestCase):
             tarball = self._tarball(tmp)
             cfg = _cfg({"a": "primary"})
             state = _state({"a": "10.0.0.1"})
-            runner = FakeRunner()
-            runner.script(_cp(returncode=0, stdout="✓ unpacked v1.0.0\n"))
-            runner.script(_cp(returncode=3, stderr="✗ another deploy is already in progress (lock held)\n"))
-            runner.script(_cp(returncode=0, stdout="active=blue (v0.9.0)\n"))  # summary colors call
+            popen = FakePopen()
+            popen.script(returncode=0, output="✓ unpacked v1.0.0\n")
+            popen.script(returncode=3, output="✗ another deploy is already in progress (lock held)\n")
+            popen.script(returncode=0, output="active=blue (v0.9.0)\n")  # summary colors call
 
             with self.assertRaises(StackError) as ctx:
-                ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, runner=runner, emit=lambda _l: None)
+                ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, popen=popen, emit=lambda _l: None)
             self.assertIn("another deploy is running on a", str(ctx.exception))
 
     def test_first_failure_stops_further_nodes_and_summary_names_versions(self) -> None:
@@ -610,24 +739,47 @@ class ShipTests(unittest.TestCase):
             tarball = self._tarball(tmp)
             cfg = _cfg({"a": "primary", "b": "replica", "c": "replica"})
             state = _state({"a": "10.0.0.1", "b": "10.0.0.2", "c": "10.0.0.3"})
-            runner = FakeRunner()
+            popen = FakePopen()
             # order is b, c, a (replicas first) -- b fails at the deploy step.
-            runner.script(_cp(returncode=0, stdout="✓ unpacked v1.0.0\n"))  # b upload
-            runner.script(_cp(returncode=1, stderr="✗ blue failed the health check\n"))  # b deploy
-            runner.script(_cp(returncode=0, stdout="active=blue (v1.0.0)  idle=green (-)\n"))  # summary b
-            runner.script(_cp(returncode=0, stdout="active=blue (v0.9.0)  idle=green (-)\n"))  # summary c
-            runner.script(_cp(returncode=0, stdout="active=blue (v0.9.0)  idle=green (-)\n"))  # summary a
+            popen.script(returncode=0, output="✓ unpacked v1.0.0\n")  # b upload
+            popen.script(returncode=1, output="✗ blue failed the health check\n")  # b deploy
+            popen.script(returncode=0, output="active=blue (v1.0.0)  idle=green (-)\n")  # summary b
+            popen.script(returncode=0, output="active=blue (v0.9.0)  idle=green (-)\n")  # summary c
+            popen.script(returncode=0, output="active=blue (v0.9.0)  idle=green (-)\n")  # summary a
             emitted: list[str] = []
 
             with self.assertRaises(StackError):
-                ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, runner=runner, emit=emitted.append)
+                ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, popen=popen, emit=emitted.append)
 
             # c and a were never touched -- only b's upload+deploy ran before the failure.
-            touched_hosts = {call["argv"][-2] for call in runner.calls[:2]}
+            touched_hosts = {call["argv"][-2] for call in popen.calls[:2]}
             self.assertEqual(touched_hosts, {"deploy@10.0.0.2"})
             summary_text = "\n".join(emitted)
             self.assertIn("v1.0.0", summary_text)
             self.assertIn("v0.9.0", summary_text)
+
+    def test_host_key_changed_during_deploy_yields_the_pin_hint(self) -> None:
+        """P3, Fix round 1: ship's own `deploy` step used to call
+        `ssh.run(..., check=False)`, which -- like `run()` generally --
+        never surfaced the host-key hint when check=False. The unified
+        `run_stream` surfaces it unconditionally.
+        """
+        from stackbase.ssh import HOST_KEY_CHANGED_MARKER
+
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            tarball = self._tarball(tmp)
+            cfg = _cfg({"a": "primary"})
+            state = _state({"a": "10.0.0.1"})
+            popen = FakePopen()
+            popen.script(returncode=0, output="✓ unpacked v1.0.0\n")  # upload
+            popen.script(returncode=255, output=f"@@@ {HOST_KEY_CHANGED_MARKER} @@@\n")  # deploy
+            popen.script(returncode=0, output="active=blue (v0.9.0)\n")  # summary colors call
+
+            with self.assertRaises(StackError) as ctx:
+                ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, popen=popen, emit=lambda _l: None)
+            self.assertIn("does not match the pinned entry", str(ctx.exception))
 
     def test_ssh_argv_uses_deploy_user_and_the_pinned_known_hosts(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -636,36 +788,37 @@ class ShipTests(unittest.TestCase):
             tarball = self._tarball(tmp)
             cfg = _cfg({"a": "primary"})
             state = _state({"a": "10.0.0.1"})
-            runner = FakeRunner()
-            runner.script(_cp(returncode=0, stdout="✓ ok\n"))
-            runner.script(_cp(returncode=0, stdout="✓ ok\n"))
-            runner.script(_cp(returncode=0, stdout="active=blue (v1.0.0)\n"))
+            popen = FakePopen()
+            popen.script(returncode=0, output="✓ ok\n")
+            popen.script(returncode=0, output="✓ ok\n")
+            popen.script(returncode=0, output="active=blue (v1.0.0)\n")
 
-            ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, runner=runner, emit=lambda _l: None)
+            ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, popen=popen, emit=lambda _l: None)
 
-            upload_call = runner.calls[0]
+            upload_call = popen.calls[0]
             self.assertIn("BatchMode=yes", upload_call["argv"])
             self.assertIn(f"UserKnownHostsFile={infra_dir / 'known_hosts'}", upload_call["argv"])
             self.assertEqual(upload_call["argv"][-2], "deploy@10.0.0.1")
 
-    def test_tarball_is_streamed_as_stdin_not_buffered_via_input(self) -> None:
+    def test_tarball_is_streamed_as_stdin_not_devnull(self) -> None:
         with TemporaryDirectory() as tmp:
             infra_dir = Path(tmp) / "infra"
             infra_dir.mkdir()
             tarball = self._tarball(tmp)
             cfg = _cfg({"a": "primary"})
             state = _state({"a": "10.0.0.1"})
-            runner = FakeRunner()
-            runner.script(_cp(returncode=0, stdout="✓ ok\n"))
-            runner.script(_cp(returncode=0, stdout="✓ ok\n"))
-            runner.script(_cp(returncode=0, stdout="active=blue (v1.0.0)\n"))
+            popen = FakePopen()
+            popen.script(returncode=0, output="✓ ok\n")
+            popen.script(returncode=0, output="✓ ok\n")
+            popen.script(returncode=0, output="active=blue (v1.0.0)\n")
 
-            ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, runner=runner, emit=lambda _l: None)
+            ship(infra_dir, cfg, state, "v1.0.0", tarball, _SHA, popen=popen, emit=lambda _l: None)
 
-            upload_kwargs = runner.calls[0]["kwargs"]
-            self.assertIn("stdin", upload_kwargs)
+            upload_kwargs = popen.calls[0]["kwargs"]
             self.assertTrue(hasattr(upload_kwargs["stdin"], "read"))
-            self.assertNotIn("input", upload_kwargs)
+            # the deploy call (not an upload) must NOT relay any local stdin.
+            deploy_kwargs = popen.calls[1]["kwargs"]
+            self.assertIs(deploy_kwargs["stdin"], subprocess.DEVNULL)
 
 
 # --------------------------------------------------------------------------
@@ -690,7 +843,7 @@ class RollbackNodesTests(unittest.TestCase):
             self.assertEqual(hosts, ["deploy@10.0.0.1", "deploy@10.0.0.2", "deploy@10.0.0.3"])
             self.assertTrue(all(call["argv"][-1] == "rollback" for call in popen.calls))
 
-    def test_node_filter_restricts_to_one_node(self) -> None:
+    def test_node_filter_restricts_to_one_node_and_notes_the_others_untouched(self) -> None:
         with TemporaryDirectory() as tmp:
             infra_dir = Path(tmp) / "infra"
             infra_dir.mkdir()
@@ -698,11 +851,13 @@ class RollbackNodesTests(unittest.TestCase):
             state = _state({"a": "10.0.0.1", "b": "10.0.0.2"})
             popen = FakePopen()
             popen.script(returncode=0, output="✓ rollback complete\n")
+            emitted: list[str] = []
 
-            rollback_nodes(infra_dir, cfg, state, node="b", popen=popen, emit=lambda _l: None)
+            rollback_nodes(infra_dir, cfg, state, node="b", popen=popen, emit=emitted.append)
 
             self.assertEqual(len(popen.calls), 1)
             self.assertEqual(popen.calls[0]["argv"][-2], "deploy@10.0.0.2")
+            self.assertTrue(any("1 other configured node" in line and "not touched" in line for line in emitted))
 
     def test_unknown_node_raises_and_lists_known_names(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -714,6 +869,26 @@ class RollbackNodesTests(unittest.TestCase):
             with self.assertRaises(StackError) as ctx:
                 rollback_nodes(infra_dir, cfg, state, node="nope", popen=FakePopen(), emit=lambda _l: None)
             self.assertIn("known nodes", str(ctx.exception))
+
+    def test_host_key_changed_yields_the_pin_hint(self) -> None:
+        """P3, Fix round 1: rollback/status/deploy must ALL surface the same
+        reinstall-vs-interception hint on a host-key change -- previously
+        only run()/fetch()/rsync_to() did, and rollback/status bypassed it
+        entirely via the old hand-rolled `_stream_ssh`.
+        """
+        from stackbase.ssh import HOST_KEY_CHANGED_MARKER
+
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            cfg = _cfg({"a": "primary"})
+            state = _state({"a": "10.0.0.1"})
+            popen = FakePopen()
+            popen.script(returncode=255, output=f"@@@ {HOST_KEY_CHANGED_MARKER} @@@\n")
+
+            with self.assertRaises(StackError) as ctx:
+                rollback_nodes(infra_dir, cfg, state, popen=popen, emit=lambda _l: None)
+            self.assertIn("does not match the pinned entry", str(ctx.exception))
 
     def test_lock_held_raises_another_deploy_is_running(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -760,6 +935,21 @@ class StatusNodesTests(unittest.TestCase):
 
             self.assertEqual(len(popen.calls), 1)
             self.assertEqual(popen.calls[0]["argv"][-2], "deploy@10.0.0.1")
+
+    def test_host_key_changed_yields_the_pin_hint(self) -> None:
+        from stackbase.ssh import HOST_KEY_CHANGED_MARKER
+
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            cfg = _cfg({"a": "primary"})
+            state = _state({"a": "10.0.0.1"})
+            popen = FakePopen()
+            popen.script(returncode=255, output=f"@@@ {HOST_KEY_CHANGED_MARKER} @@@\n")
+
+            with self.assertRaises(StackError) as ctx:
+                status_nodes(infra_dir, cfg, state, popen=popen, emit=lambda _l: None)
+            self.assertIn("does not match the pinned entry", str(ctx.exception))
 
 
 # --------------------------------------------------------------------------
@@ -818,14 +1008,14 @@ class RunDeploySkipBuildTests(unittest.TestCase):
             tarball.write_bytes(b"a prebuilt release archive")
             expected_sha = hashlib.sha256(tarball.read_bytes()).hexdigest()
 
-            runner = FakeRunner()
-            runner.script(_cp(returncode=0, stdout="✓ ok\n"))
-            runner.script(_cp(returncode=0, stdout="✓ ok\n"))
-            runner.script(_cp(returncode=0, stdout="active=blue (v1.0.0)\n"))
+            popen = FakePopen()
+            popen.script(returncode=0, output="✓ ok\n")
+            popen.script(returncode=0, output="✓ ok\n")
+            popen.script(returncode=0, output="active=blue (v1.0.0)\n")
 
-            run_deploy(infra_dir, "v1.0.0", skip_build=True, tarball_path=str(tarball), runner=runner, emit=lambda _l: None)
+            run_deploy(infra_dir, "v1.0.0", skip_build=True, tarball_path=str(tarball), popen=popen, emit=lambda _l: None)
 
-            upload_cmd = runner.calls[0]["argv"][-1]
+            upload_cmd = popen.calls[0]["argv"][-1]
             self.assertEqual(upload_cmd, f"upload v1.0.0 {expected_sha}")
 
     def test_skip_build_never_touches_git(self) -> None:
@@ -836,11 +1026,177 @@ class RunDeploySkipBuildTests(unittest.TestCase):
             tarball.write_bytes(b"bytes")
 
             def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
-                if argv[0] == "git":
-                    raise AssertionError("skip_build must never touch git")
-                return _cp(returncode=0, stdout="✓ ok\n")
+                raise AssertionError(f"skip_build must never call the runner (git or otherwise): {argv}")
 
-            run_deploy(infra_dir, "v1.0.0", skip_build=True, tarball_path=str(tarball), runner=runner, emit=lambda _l: None)
+            popen = FakePopen()
+            popen.script(returncode=0, output="✓ ok\n")
+            popen.script(returncode=0, output="✓ ok\n")
+            popen.script(returncode=0, output="active=blue (v1.0.0)\n")
+
+            run_deploy(
+                infra_dir, "v1.0.0", skip_build=True, tarball_path=str(tarball), runner=runner, popen=popen, emit=lambda _l: None
+            )
+
+    def test_skip_build_never_creates_a_work_dir_and_never_touches_the_operator_tarball(self) -> None:
+        """P2, Fix round 1: the operator's own --tarball file must never be
+        deleted or moved -- no private work dir is created for this path at
+        all.
+        """
+        with TemporaryDirectory() as tmp:
+            infra_dir = self._project(Path(tmp))
+            tarball = Path(tmp) / "prebuilt.tar.gz"
+            original_bytes = b"a prebuilt release archive"
+            tarball.write_bytes(original_bytes)
+
+            popen = FakePopen()
+            popen.script(returncode=0, output="✓ ok\n")
+            popen.script(returncode=0, output="✓ ok\n")
+            popen.script(returncode=0, output="active=blue (v1.0.0)\n")
+
+            def failing_mkdtemp(*_args: object, **_kwargs: object) -> str:
+                raise AssertionError("skip_build must never create a private work dir")
+
+            with mock.patch("stackbase.release.tempfile.mkdtemp", side_effect=failing_mkdtemp):
+                run_deploy(infra_dir, "v1.0.0", skip_build=True, tarball_path=str(tarball), popen=popen, emit=lambda _l: None)
+
+            self.assertTrue(tarball.is_file())
+            self.assertEqual(tarball.read_bytes(), original_bytes)
+
+
+# --------------------------------------------------------------------------
+# run_deploy(): P2, Fix round 1 -- the private per-run work dir
+# --------------------------------------------------------------------------
+
+
+class RunDeployWorkDirTests(unittest.TestCase):
+    """The full (non-skip-build) `run_deploy` path, against a REAL git repo
+    (cheap -- matches this file's own stated philosophy) but a FAKE `popen`
+    for both cargo (via `with_binary=True`'s git-committed dummy binary --
+    see `_init_repo`) and every ssh call, so no real cargo/ssh ever runs.
+    """
+
+    def _infra(self, repo_dir: Path) -> Path:
+        infra_dir = repo_dir / "infra"
+        (infra_dir / "keys").mkdir(parents=True)
+        (infra_dir / "stack.toml").write_text(
+            "\n".join(
+                [
+                    'project    = "acme"',
+                    'domain     = "acme.example.com"',
+                    'owner      = "matt"',
+                    'datacenter = "kul"',
+                    'plan       = "KVM 1"',
+                    'admins     = ["matt"]',
+                    "",
+                    "[nodes.a]",
+                    'role   = "primary"',
+                    "vps_id = 1",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (infra_dir / "keys" / "matt.pub").write_text(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAExample matt@laptop\n", encoding="utf-8"
+        )
+        (infra_dir / "stack.state.json").write_text(
+            json.dumps({"version": 1, "nodes": {"a": {"ipv4": "10.0.0.1"}}}), encoding="utf-8"
+        )
+        return infra_dir
+
+    def _spy_mkdtemp(self):
+        """Wraps the real `tempfile.mkdtemp` -- records every (path, mode-at-
+        creation) it produces, so a test can find the "stackbase-release-"
+        prefixed one and check both its mode and, after the run, that it no
+        longer exists.
+        """
+        created: list[tuple[Path, int]] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def spying(*args: object, **kwargs: object) -> str:
+            path = real_mkdtemp(*args, **kwargs)
+            created.append((Path(path), os.stat(path).st_mode & 0o777))
+            return path
+
+        return spying, created
+
+    def test_work_dir_is_private_and_removed_on_success(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo_dir = _init_repo(Path(tmp), cargo_version="1.0.0", tag="v1.0.0", with_binary=True)
+            infra_dir = self._infra(repo_dir)
+            spying_mkdtemp, created = self._spy_mkdtemp()
+
+            popen = FakePopen()
+            popen.script(returncode=0, output="Compiling stack-demo\nFinished release\n")  # cargo build
+            popen.script(returncode=0, output="✓ ok\n")  # upload
+            popen.script(returncode=0, output="✓ ok\n")  # deploy
+            popen.script(returncode=0, output="active=blue (v1.0.0)\n")  # colors summary
+
+            with mock.patch("stackbase.release.tempfile.mkdtemp", side_effect=spying_mkdtemp):
+                run_deploy(infra_dir, "v1.0.0", popen=popen, emit=lambda _l: None)
+
+            work_dirs = [(p, mode) for p, mode in created if p.name.startswith("stackbase-release-")]
+            self.assertEqual(len(work_dirs), 1, f"expected exactly one private work dir, got: {created}")
+            work_dir, mode = work_dirs[0]
+            self.assertEqual(mode, 0o700, f"expected the work dir to be private (0700), got {oct(mode)}")
+            self.assertFalse(work_dir.exists(), "the private work dir must be removed after a successful run")
+
+    def test_work_dir_is_removed_on_a_mid_ship_failure(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo_dir = _init_repo(Path(tmp), cargo_version="1.0.0", tag="v1.0.0", with_binary=True)
+            infra_dir = self._infra(repo_dir)
+            spying_mkdtemp, created = self._spy_mkdtemp()
+
+            popen = FakePopen()
+            popen.script(returncode=0, output="Compiling stack-demo\nFinished release\n")  # cargo build
+            popen.script(returncode=1, output="✗ sha256 mismatch\n")  # upload fails
+            popen.script(returncode=0, output="active=blue (v0.9.0)\n")  # colors summary
+
+            with mock.patch("stackbase.release.tempfile.mkdtemp", side_effect=spying_mkdtemp):
+                with self.assertRaises(StackError):
+                    run_deploy(infra_dir, "v1.0.0", popen=popen, emit=lambda _l: None)
+
+            work_dirs = [p for p, _mode in created if p.name.startswith("stackbase-release-")]
+            self.assertEqual(len(work_dirs), 1)
+            self.assertFalse(work_dirs[0].exists(), "the private work dir must be removed even after a ship failure")
+
+    def test_tarball_is_not_written_directly_into_the_bundles_own_parent_outside_work_dir(self) -> None:
+        """The finished tarball lives INSIDE the private work dir (a sibling
+        of the bundle), never at a bare, predictable path in the shared
+        system temp root -- P2's actual security-relevant point.
+        """
+        with TemporaryDirectory() as tmp:
+            repo_dir = _init_repo(Path(tmp), cargo_version="1.0.0", tag="v1.0.0", with_binary=True)
+            infra_dir = self._infra(repo_dir)
+            seen_tarball_dirs: list[Path] = []
+
+            real_package = package
+            bundle_was_a_sibling: list[bool] = []
+
+            def spying_package(bundle_dir: Path, *args: object, **kwargs: object):
+                tar_path, sha = real_package(bundle_dir, *args, **kwargs)
+                # checked HERE, not after run_deploy() returns -- the private
+                # work dir (this tarball's own parent) is removed in
+                # run_deploy's `finally` before this test function regains
+                # control.
+                bundle_was_a_sibling.append(tar_path.parent == bundle_dir.parent)
+                seen_tarball_dirs.append(tar_path.parent)
+                return tar_path, sha
+
+            popen = FakePopen()
+            popen.script(returncode=0, output="ok\n")
+            popen.script(returncode=0, output="✓ ok\n")
+            popen.script(returncode=0, output="✓ ok\n")
+            popen.script(returncode=0, output="active=blue (v1.0.0)\n")
+
+            with mock.patch("stackbase.release.package", side_effect=spying_package):
+                run_deploy(infra_dir, "v1.0.0", popen=popen, emit=lambda _l: None)
+
+            self.assertEqual(len(seen_tarball_dirs), 1)
+            self.assertEqual(bundle_was_a_sibling, [True])
+            tarball_dir = seen_tarball_dirs[0]
+            self.assertNotEqual(str(tarball_dir), str(Path(tempfile.gettempdir())))
+            self.assertTrue(str(tarball_dir).startswith(str(Path(tempfile.gettempdir()))))
 
 
 # --------------------------------------------------------------------------
