@@ -19,6 +19,13 @@
 # fails its own strict pattern -- exits 2 with a usage line and has NO
 # side effects.
 #
+# Exit codes (matching stack-deploy's own): 0 ok, 1 failure, 2 usage (this
+# script's own protocol violations), 3 lock held, 4 version already
+# exists with DIFFERENT content (`upload`/`deploy` only). `upload`'s exit
+# code is always whatever `stack-deploy unpack` exited with -- see the
+# `upload` block below, which runs under `set -euo pipefail` (this script
+# is a writeShellApplication) and does NOT swallow or renumber it.
+#
 # $SSH_ORIGINAL_COMMAND is attacker-controlled: it is the literal string
 # the client passed after `ssh deploy@host`. It is NEVER eval'd and NEVER
 # handed to a shell for re-parsing. A command containing a newline is
@@ -169,6 +176,16 @@ if [ "$subcommand" = upload ]; then
     exit 1
   fi
 
+  # P1 (Fix round 1): exit code passthrough verified, not re-implemented.
+  # This script runs under `set -euo pipefail` (writeShellApplication).
+  # Under errexit, a plain (non-conditional) simple command that fails
+  # aborts the WHOLE script immediately with THAT command's own exit
+  # status -- `exit 0` on the next line is therefore only ever reached
+  # when unpack itself already exited 0. So `stack-deploy unpack`'s real
+  # exit code (0 ok, 1 failure, 4 already-exists-with-different-content)
+  # already reaches the ssh client unchanged; nothing here needs to catch
+  # or re-raise it. The `trap 'rm -f "$tmp"' EXIT` set above still fires
+  # on every one of these exit paths, success or failure alike.
   "$STACK_DEPLOY_BIN" unpack "$version" --tarball "$tmp" --sha256 "$sha256"
   exit 0
 fi

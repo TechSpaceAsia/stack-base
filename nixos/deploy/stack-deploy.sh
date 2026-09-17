@@ -2,7 +2,9 @@
 #
 # Subcommands: status, colors, deploy, rollback, prune, releases, unpack,
 # boot, internal-drain-stop. Exit codes: 0 ok, 1 failure, 2 usage, 3 lock
-# held.
+# held, 4 version already exists with DIFFERENT content (unpack/deploy
+# --tarball only -- see deploy_unpack_tarball's sha256 dedup check, Fix
+# round 1 P1).
 #
 # Project-specific values (project slug, binary name, health path, drain
 # seconds, keep count) come from /etc/stackbase/deploy.env, written by
@@ -65,6 +67,21 @@ die() {
 usage_die() {
   echo "✗ $*" >&2
   exit 2
+}
+
+# Exit code 4: a distinct, machine-readable signal that `unpack`/`deploy
+# --tarball` refused to touch an EXISTING release because the newly
+# uploaded content does not match what is already there -- never
+# conflated with a plain `die` (exit 1, "something went wrong") or
+# `usage_die` (exit 2, "you called this wrong"). See
+# deploy_unpack_tarball's sha256 dedup check (Fix round 1, P1): the caller
+# (stack-deploy-ssh.sh, and stackbase/release.py above it) needs to tell
+# "already uploaded, identical -- safe, continue" apart from "already
+# exists with DIFFERENT content -- unsafe, stop" without resorting to
+# matching human-readable text.
+die_exists_diff() {
+  echo "✗ $*" >&2
+  exit 4
 }
 
 color_dir() {
@@ -385,8 +402,33 @@ deploy_unpack_tarball() {
 
   [ -f "$tarball" ] || die "tarball not found: $tarball"
 
+  # P1 (Fix round 1): a release directory that already exists is no longer
+  # an automatic refusal -- it's only refused when the content actually
+  # differs. Re-uploading the EXACT SAME tarball (a retried `upload` after
+  # a dropped connection, a re-run deploy) is safe and idempotent; silently
+  # keeping stale content because a caller re-tagged and rebuilt the same
+  # version WITHOUT bumping it is not, so that case is refused, distinctly
+  # (exit 4, not the generic exit 1), rather than accepted. Compared
+  # against the CALLER-SUPPLIED $sha256 here, before the tarball is even
+  # opened: the "same content" branch below touches NOTHING on disk (no
+  # extraction, no rename), so there is no integrity exposure in trusting
+  # the caller's claim for this decision alone -- the real tarball bytes
+  # are only ever trusted, and verified against $sha256, in the path that
+  # actually writes something (further down). --force (only reachable from
+  # `stack-deploy deploy --tarball ... --force`) skips this branch
+  # entirely and always overwrites, same as before this change; because
+  # the sha256 file below is written unconditionally, a --force overwrite
+  # always ends up with a `.stackbase-sha256` matching the NEW content.
   if [ -e "$release_dir" ] && [ "$force" -ne 1 ]; then
-    die "release $version already exists at $release_dir; pass --force to overwrite"
+    local recorded_sha=""
+    if [ -r "$release_dir/.stackbase-sha256" ]; then
+      recorded_sha=$(head -n1 "$release_dir/.stackbase-sha256" 2>/dev/null || true)
+    fi
+    if [ -n "$recorded_sha" ] && [ "$recorded_sha" = "$sha256" ]; then
+      echo "release $version is already uploaded (same content)"
+      return 0
+    fi
+    die_exists_diff "release $version already exists with different content -- a published version must never change; bump the version instead"
   fi
 
   # Open the tarball exactly once, on a dedicated fd, and run every
@@ -469,6 +511,18 @@ deploy_unpack_tarball() {
   if [ -f "$tmp_dir/$STACK_BINARY" ]; then
     chmod 0755 "$tmp_dir/$STACK_BINARY"
   fi
+
+  # P1 (Fix round 1): record the verified tarball sha256 beside the
+  # unpacked release, INSIDE tmp_dir and BEFORE the rename below -- so a
+  # release directory under releases/ never exists without this file (the
+  # dedup check above treats a missing/unreadable one as "unknown
+  # content", never as "same content"). Written after the mode-
+  # normalisation find calls above and chmod'd explicitly here, so it is
+  # never swept into the executable-bit branch (that only ever touches
+  # $STACK_BINARY by name) -- this file must never become executable, and
+  # must never be mistaken by the app for one of its own static assets.
+  printf '%s\n' "$actual_sha" > "$tmp_dir/.stackbase-sha256"
+  chmod 0644 "$tmp_dir/.stackbase-sha256"
 
   rm -rf "$release_dir"
   mv -T "$tmp_dir" "$release_dir"

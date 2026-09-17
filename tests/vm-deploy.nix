@@ -952,7 +952,75 @@ pkgs.testers.runNixOSTest {
           assert release_set() == before_releases
           node.fail("test -d /opt/${project}/releases/v3.10.0")
 
-      with subtest("two concurrent uploads of the SAME new version: exactly one wins, nothing left behind (F2)"):
+      with subtest("re-uploading the SAME tarball under an existing version is idempotent -- exit 0 (P1)"):
+          sha = client_make_tarball("v3.11.0")
+          status, out = ssh_upload("v3.11.0", sha)
+          assert status == 0, f"first upload failed: status={status} output={out!r}"
+
+          sha_file = "/opt/${project}/releases/v3.11.0/.stackbase-sha256"
+          recorded_sha = node.succeed(f"cat {sha_file}").strip()
+          assert recorded_sha == sha, f"expected .stackbase-sha256 to hold the uploaded tarball's sha, got {recorded_sha!r} vs {sha!r}"
+          mode = node.succeed(f"stat -c '%a' {sha_file}").strip()
+          assert mode == "644", f"expected .stackbase-sha256 to be mode 0644, got {mode}"
+
+          before_binary_sha = node.succeed(
+              "sha256sum /opt/${project}/releases/v3.11.0/${project} | cut -d' ' -f1"
+          ).strip()
+          before_incoming = incoming_files()
+
+          status, out = ssh_upload("v3.11.0", sha)
+          assert status == 0, f"re-uploading the SAME content must exit 0, got status={status} output={out!r}"
+          assert "already uploaded" in out and "same content" in out, (
+              f"expected an 'already uploaded (same content)' info line, got: {out!r}"
+          )
+          assert incoming_files() == before_incoming, (
+              f"a same-content re-upload left something under incoming/: {incoming_files()}"
+          )
+
+          after_binary_sha = node.succeed(
+              "sha256sum /opt/${project}/releases/v3.11.0/${project} | cut -d' ' -f1"
+          ).strip()
+          assert after_binary_sha == before_binary_sha, "the release's own content must be untouched"
+          after_recorded_sha = node.succeed(f"cat {sha_file}").strip()
+          assert after_recorded_sha == sha
+
+      with subtest("re-uploading DIFFERENT content under an EXISTING version is refused -- exit 4 (P1)"):
+          sha_v1 = client_make_tarball("v3.12.0", health_code=200)
+          status, out = ssh_upload("v3.12.0", sha_v1)
+          assert status == 0, f"first upload failed: status={status} output={out!r}"
+
+          sha_file = "/opt/${project}/releases/v3.12.0/.stackbase-sha256"
+          before_recorded_sha = node.succeed(f"cat {sha_file}").strip()
+          before_binary_sha = node.succeed(
+              "sha256sum /opt/${project}/releases/v3.12.0/${project} | cut -d' ' -f1"
+          ).strip()
+          before_incoming = incoming_files()
+
+          # A DIFFERENT tarball (different fake-app health code -> different
+          # bytes -> different, correctly-computed sha256), re-tagged and
+          # rebuilt under the SAME version string -- exactly the case P1
+          # closes: silently keeping the old content is unsafe, so this must
+          # be refused, distinctly (exit 4), not treated as a duplicate.
+          sha_v2 = client_make_tarball("v3.12.0", health_code=201)
+          assert sha_v2 != sha_v1, "the two tarballs must actually differ for this test to mean anything"
+          status, out = ssh_upload("v3.12.0", sha_v2)
+          assert status == 4, f"expected exit 4 for same-version/different-content, got status={status} output={out!r}"
+          assert "already exists with different content" in out, f"expected the P1 refusal message, got: {out!r}"
+          assert "bump the version" in out, f"expected the bump-the-version hint, got: {out!r}"
+
+          assert incoming_files() == before_incoming, (
+              f"a refused upload left something under incoming/: {incoming_files()}"
+          )
+          after_recorded_sha = node.succeed(f"cat {sha_file}").strip()
+          assert after_recorded_sha == before_recorded_sha == sha_v1, (
+              "the recorded sha must be unchanged after a refused upload"
+          )
+          after_binary_sha = node.succeed(
+              "sha256sum /opt/${project}/releases/v3.12.0/${project} | cut -d' ' -f1"
+          ).strip()
+          assert after_binary_sha == before_binary_sha, "the release's own content must be unchanged after a refusal"
+
+      with subtest("two concurrent uploads of the SAME new version: BOTH succeed, nothing left behind (F2, P1)"):
           # F2 (Fix round 1): the first implementation streamed into fixed
           # names (incoming/<version>.tar.gz.partial -> .tar.gz), so two
           # concurrent uploads of the same version raced on those SAME two
@@ -960,7 +1028,21 @@ pkgs.testers.runNixOSTest {
           # OTHER session's file. Now each session gets its own mktemp'd
           # path, so the only place they can still collide is inside
           # `stack-deploy unpack` itself, which already holds the engine
-          # lock and refuses to overwrite an existing release.
+          # lock -- serialising the two sessions there.
+          #
+          # P1 (Fix round 1) changed what "collide" means: both uploads
+          # carry the exact SAME content (same tarball, same sha256). If the
+          # loser's OWN `acquire_lock` call lands after the winner has
+          # already released the lock, it now finds a release already there
+          # with a MATCHING recorded sha256 -- "already uploaded (same
+          # content)", exit 0, not the old "already exists -- pass --force"
+          # refusal. But `acquire_lock` uses `flock -n` (non-blocking): if
+          # the loser's call instead lands WHILE the winner still holds the
+          # lock, it fails immediately with exit 3 ("another deploy is
+          # already in progress") -- a real, expected outcome of a genuine
+          # race, not a bug. So the loser's status is 0 OR 3, never the old
+          # unconditional-refusal exit 1 (which, for genuinely IDENTICAL
+          # content, can no longer happen at all).
           #
           # Both ssh sessions are launched fully DETACHED (all three std
           # fds redirected to files/devnull, not left connected to
@@ -1006,10 +1088,25 @@ pkgs.testers.runNixOSTest {
           log_a = client.succeed("cat /tmp/race-a.log")
           log_b = client.succeed("cat /tmp/race-b.log")
 
-          winners = [s for s in (status_a, status_b) if s == "0"]
-          assert len(winners) == 1, (
-              f"expected exactly one of the two concurrent uploads to succeed, got "
+          statuses = {status_a, status_b}
+          assert "0" in statuses, (
+              f"expected at least one of the two concurrent uploads to succeed, got "
               f"status_a={status_a} status_b={status_b} (log_a={log_a!r} log_b={log_b!r})"
+          )
+          assert statuses <= {"0", "3"}, (
+              f"a concurrent upload of IDENTICAL content must only ever succeed (0, possibly via the "
+              f"P1 dedup fast path) or hit the non-blocking lock (3, the other upload still in flight) -- "
+              f"never the old unconditional 'already exists' refusal; got status_a={status_a} "
+              f"status_b={status_b} (log_a={log_a!r} log_b={log_b!r})"
+          )
+          # At most one of the two ever reaches the dedup fast path (it only
+          # exists once a release is already there): 0 if the loser instead
+          # hit the lock (3) before the winner had unpacked anything yet, 1
+          # if it landed after.
+          combined_logs = log_a + log_b
+          assert combined_logs.count("already uploaded (same content)") <= 1, (
+              f"expected at most one of the two racers to observe the dedup fast path, got: "
+              f"log_a={log_a!r} log_b={log_b!r}"
           )
 
           node.succeed("test -d /opt/${project}/releases/v4.0.0")
