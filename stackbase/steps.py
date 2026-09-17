@@ -413,7 +413,12 @@ def _stream(ctx: Context, ssh: Ssh, command: str) -> tuple[int, list[str]]:
     """
     argv = [*ssh.argv(), command]
     try:
-        process = ctx.popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        # bufsize=1 is line buffering: without it the output arrives in 8KB
+        # bursts, which for a ten-minute build means ten minutes of nothing
+        # followed by a wall of text.
+        process = ctx.popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        )
     except FileNotFoundError as exc:
         raise StackError(
             "the 'ssh' command was not found",
