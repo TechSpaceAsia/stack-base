@@ -1,0 +1,26 @@
+# Who can decrypt infra/secrets.age.
+#
+# One age public key per line -- one for each teammate who needs to run
+# ./infra/up. Lines starting with # are ignored. Commit this file: public
+# keys are not secret.
+#
+# To add yourself:
+#
+#   1. Make a key, once, on your own machine:
+#
+#        mkdir -p ~/.age && age-keygen -o ~/.age/key.txt
+#
+#      Keep ~/.age/key.txt private and never commit it. (If you already
+#      keep an age identity elsewhere, point $STACKBASE_AGE_IDENTITY at it
+#      instead of making a new one.)
+#
+#   2. Print your PUBLIC key and paste it below as a new line:
+#
+#        age-keygen -y ~/.age/key.txt
+#
+#      It looks like: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+#
+#   3. Commit this file, then ask someone who can already decrypt
+#      secrets.age to re-encrypt it for the new list. Removing a line here
+#      does the same in reverse -- it does not take effect until someone
+#      re-encrypts.

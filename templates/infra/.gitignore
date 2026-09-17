@@ -1,0 +1,5 @@
+# Nix leaves a `result` symlink behind after a local build. Nothing else in
+# this directory is generated, and nothing in it is secret: secrets.age is
+# encrypted (commit it), and stack.state.json, known_hosts, flake.lock and
+# nodes/ are all records the whole team needs -- commit them too.
+result

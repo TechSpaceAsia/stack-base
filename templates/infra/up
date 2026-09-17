@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Run stack-base against this project's infra/ directory.
+
+This little script is the whole entry point: `./infra/up --plan`, `./infra/up`.
+It works out which version of stack-base this project is pinned to, downloads
+that exact version into ~/.cache/stack-base/<rev> (once), and hands over to it.
+
+It depends on nothing but Python 3, git and ssh -- you do not need Nix, and
+you do not need stack-base checked out anywhere.
+
+While stack-base itself is unpublished, point $STACKBASE_SRC at a local
+checkout instead and this script runs that directly:
+
+    STACKBASE_SRC=~/code/stack-base ./infra/up --plan
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+INFRA_DIR = Path(__file__).resolve().parent
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "stack-base"
+
+
+def fail(message: str, hint: str) -> None:
+    print(f"error: {message} — {hint}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def run(argv: list[str]) -> None:
+    result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        fail(
+            f"`{' '.join(argv[:2])}` failed while downloading stack-base",
+            detail[-1] if detail else "check your network connection and try again",
+        )
+
+
+def locked_stack_base(lock_path: Path) -> tuple[str, str]:
+    """The git URL and commit this project pins stack-base to."""
+    try:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"{lock_path} could not be read", str(exc))
+
+    nodes = lock.get("nodes", {})
+    root = nodes.get(lock.get("root", "root"), {})
+    ref = root.get("inputs", {}).get("stack-base")
+    if isinstance(ref, list):
+        ref = ref[0] if ref else None
+    node = nodes.get(ref) if isinstance(ref, str) else None
+    if not isinstance(node, dict):
+        node = nodes.get("stack-base")
+    locked = node.get("locked") if isinstance(node, dict) else None
+    if not isinstance(locked, dict) or not isinstance(locked.get("rev"), str):
+        fail(
+            f"{lock_path} does not pin a 'stack-base' input",
+            "set $STACKBASE_SRC to a local stack-base checkout, or ask whoever set this project "
+            "up to commit a working infra/flake.lock",
+        )
+
+    rev = locked["rev"]
+    if locked.get("type") == "github":
+        return f"https://github.com/{locked['owner']}/{locked['repo']}.git", rev
+    if isinstance(locked.get("url"), str):
+        return locked["url"], rev
+    fail(
+        f"{lock_path} pins stack-base from an unsupported source",
+        "stack-base must be pinned from GitHub or a plain git URL",
+    )
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def fetch(url: str, rev: str) -> Path:
+    """Download exactly `rev` into the cache, once. Returns the checkout."""
+    checkout = CACHE_DIR / rev
+    if (checkout / "bin" / "up").exists():
+        return checkout
+
+    # A plain `git clone` cannot ask for one arbitrary commit, so: an empty
+    # repository, one shallow fetch of that exact rev, one checkout. It lands
+    # in a temporary directory and is renamed into place, so an interrupted
+    # download never leaves a half-empty cache entry that later runs trust.
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    staging = CACHE_DIR / f".{rev}.partial.{os.getpid()}"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    try:
+        run(["git", "init", "--quiet", str(staging)])
+        run(["git", "-C", str(staging), "fetch", "--depth", "1", url, rev])
+        run(["git", "-C", str(staging), "checkout", "--quiet", "FETCH_HEAD"])
+        os.replace(staging, checkout)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return checkout
+
+
+def entry_point() -> Path:
+    source = os.environ.get("STACKBASE_SRC")
+    if source:
+        entry = Path(source).expanduser().resolve() / "bin" / "up"
+        if not entry.exists():
+            fail(
+                f"$STACKBASE_SRC does not look like a stack-base checkout ({entry} is missing)",
+                "point $STACKBASE_SRC at the root of a stack-base clone",
+            )
+        return entry
+
+    lock_path = INFRA_DIR / "flake.lock"
+    if not lock_path.exists():
+        fail(
+            f"{lock_path} is missing, so this project does not pin a version of stack-base",
+            "either commit an infra/flake.lock (stack-base writes one for you after the first "
+            "successful run), or set $STACKBASE_SRC to a local stack-base checkout",
+        )
+    url, rev = locked_stack_base(lock_path)
+    return fetch(url, rev) / "bin" / "up"
+
+
+def main() -> None:
+    entry = entry_point()
+    # --infra-dir goes first: it is a global option, and argparse wants
+    # globals before the subcommand.
+    argv = [sys.executable, str(entry), "--infra-dir", str(INFRA_DIR), *sys.argv[1:]]
+    os.execv(sys.executable, argv)
+
+
+if __name__ == "__main__":
+    main()

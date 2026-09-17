@@ -1,0 +1,53 @@
+# This file describes the servers this project should have. Edit it, run
+# `./infra/up --plan` to see what would change, then `./infra/up` to do it.
+# Copy it to stack.toml and fill it in.
+
+# Short name for this project. Lowercase letters, digits and dashes.
+# It names the database, the app's socket directory and the firewall.
+project = "acme"
+
+# The public web address this project serves. Its Cloudflare zone is found
+# automatically (acme.example.com is served by the example.com zone).
+domain = "acme.example.com"
+
+# Whoever owns this project -- a GitHub handle. Informational.
+owner = "your-github-handle"
+
+# Which Hostinger data centre the servers live in. Run
+# `./infra/up --plan` with a wrong value and the error lists the valid ones.
+datacenter = "kul"
+
+# The VPS plan, exactly as Hostinger names it. This is what you type back
+# when confirming a purchase ("buy KVM 1 x1"), so keep it accurate.
+plan = "KVM 1"
+
+# Only needed to BUY a server. It is Hostinger's catalog price-item id for
+# the plan above (something like "hostingercom-vps-kvm1-usd-1m"). Leave it
+# empty if you already own every server listed below -- stack-base cannot
+# buy anything without it.
+price_item = ""
+
+# Install security updates automatically. Leave this on.
+auto_patch = true
+
+# Everyone who gets an account and SSH access on every server. Each name
+# needs a matching infra/keys/<name>.pub file, committed to this repository.
+# Removing a name here removes that person's access on the next run.
+admins = ["your-name"]
+
+# One section per server. The name ("a") is what you type in
+# `./infra/up ssh a`, and it becomes the machine's hostname.
+[nodes.a]
+# Exactly one node must be "primary": that is the one the domain points at.
+# Any others are "replica".
+role = "primary"
+
+# The Hostinger id of a server you already own. You can read it off the URL
+# in hPanel. Leave this line out entirely if you want stack-base to buy the
+# server for you -- it will then ask you to confirm, in writing, first.
+vps_id = 1984476
+
+# A second server would look like this:
+#
+# [nodes.b]
+# role = "replica"
