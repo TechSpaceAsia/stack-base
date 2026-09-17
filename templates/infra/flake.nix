@@ -8,7 +8,12 @@
 #     boot settings, copied off the machine on the first run
 #   - ./nodes/<name>/extra.nix -- OPTIONAL. Create that file for anything
 #     specific to one server (a network quirk, an extra package) and it is
-#     picked up automatically.
+#     picked up automatically. This is also where a first-run bootloader gap
+#     gets fixed: hardware-configuration.nix alone sometimes lacks
+#     boot.loader.*/networking.* settings a provider image needs (they live
+#     in the sibling ./nodes/<name>/configuration.nix instead) -- copy them
+#     into extra.nix if the first rebuild fails with a boot.loader or
+#     fileSystems error (see the README).
 #
 # Only stack.toml is read here. stack.state.json records what stack-base has
 # observed and done (IP addresses, record ids, fingerprints), but none of that

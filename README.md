@@ -17,8 +17,9 @@ That's it — no Nix.
 ```bash
 # Debian/Ubuntu
 sudo apt install python3 git openssh-client rsync age openssl
-# macOS
-brew install git rsync age openssl
+# macOS (python3, git, ssh and openssl ship with Xcode Command Line Tools on
+# most Macs already, but installing them here is harmless if they don't)
+brew install python3 git openssh rsync age openssl
 ```
 
 You also need:
@@ -160,12 +161,28 @@ Every failure is one line: what went wrong, then what to check.
 | `node(s) a have no vps_id…` | Either set `vps_id`, or re-run with `--allow-purchase` |
 | `buying a server needs a price_item` | Copy the plan's catalog id from Hostinger into `price_item` |
 | `the new configuration failed to build` | The build output is above the error. Fix `infra/`, run again — nothing was made permanent |
+| `You must set the option boot.loader…` or a `fileSystems` error | Usually the very first run on a fresh provider image — see "First run on a new provider image" below |
 | `node a stopped answering SSH…` | See below |
 | `the SSH host key … does not match` | Either the server was reinstalled (delete its line from `infra/known_hosts`) or something is wrong. If you didn't reinstall it, stop and investigate |
 | `infra/flake.lock is missing` | First run against an unpublished stack-base: set `STACKBASE_SRC` (below) |
 
 A failed run changes nothing further and can always simply be run again: it
 picks up exactly where it stopped.
+
+## First run on a new provider image
+
+The very first rebuild on a brand new server sometimes fails with an error
+like `You must set the option boot.loader.grub.devices…` or a `fileSystems`
+assertion. This project's flake only imports the server's own
+`hardware-configuration.nix` — but the disk/boot layout an image actually
+needs (`boot.loader.*`, and sometimes static `networking.*`) is written by
+the provider into a separate `configuration.nix`, which stack-base also
+copies down to `infra/nodes/<name>/configuration.nix` for exactly this
+reason. Open that file, copy the `boot.loader.*` (and any static
+`networking.*`) lines into `infra/nodes/<name>/extra.nix` (create it if it
+doesn't exist yet), and run `./infra/up` again. This fails at the *test*
+stage, before anything is activated, so nothing on the server changes until
+it builds cleanly.
 
 ## If you get locked out
 
@@ -212,3 +229,7 @@ config and used directly, so edits to stack-base take effect on the next run.
 | `nodes/<name>/` | Each server's own disk and boot settings, copied off the machine. Commit |
 | `nodes/<name>/extra.nix` | Optional, yours: anything specific to one server |
 | `flake.nix`, `flake.lock` | Which version of stack-base this project uses. Commit |
+
+`stack.state.json` contains the servers' real IPs — if this repository is
+public, so is the origin address (nginx still refuses any connection that
+doesn't arrive via Cloudflare, but SSH is reachable at that address).
