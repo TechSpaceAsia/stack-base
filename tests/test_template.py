@@ -34,20 +34,29 @@ role   = "primary"
 vps_id = 1984476
 """
 
-# Enough of a hardware-configuration.nix to make the module system happy:
-# a root filesystem and a boot loader device.
-_FAKE_HARDWARE = """\
-{ ... }:
-{
-  fileSystems."/" = { device = "/dev/vda1"; fsType = "ext4"; };
-  boot.loader.grub.device = "/dev/vda";
-}
-"""
+# The exact `nixos-generate-config --show-hardware-config` output captured
+# from a real Hostinger VPS (task-8a-brief.md) -- it carries no
+# boot.loader.* of its own, so evaluating the template with it only
+# succeeds if the Hostinger provider module (nixos/providers/hostinger.nix)
+# is what supplies the bootloader, which is the real situation on that box.
+_HOSTINGER_HARDWARE = (_REPO_ROOT / "tests" / "fixtures" / "hostinger-hardware-configuration.nix").read_text(
+    encoding="utf-8"
+)
 
 _EXTRA_NIX = """\
 { ... }:
 {
   networking.domain = "set-by-extra-nix";
+}
+"""
+
+# Proves extra.nix can still override a value the provider module sets with
+# mkDefault (boot.loader.grub.device) -- the provider module must not use a
+# priority extra.nix can't beat.
+_EXTRA_NIX_OVERRIDES_GRUB_DEVICE = """\
+{ ... }:
+{
+  boot.loader.grub.device = "/dev/sdz";
 }
 """
 
@@ -62,7 +71,9 @@ def _instantiate_template(directory: Path) -> None:
         encoding="utf-8",
     )
     (directory / "nodes" / "a").mkdir(parents=True, exist_ok=True)
-    (directory / "nodes" / "a" / "hardware-configuration.nix").write_text(_FAKE_HARDWARE, encoding="utf-8")
+    (directory / "nodes" / "a" / "hardware-configuration.nix").write_text(
+        _HOSTINGER_HARDWARE, encoding="utf-8"
+    )
 
 
 def _nix_eval(directory: Path) -> dict:
@@ -74,6 +85,12 @@ def _nix_eval(directory: Path) -> dict:
         " domain = node.config.networking.domain;"
         " project = node.config.stackbase.project;"
         " adminKeys = node.config.users.users.root.openssh.authorizedKeys.keys;"
+        " grubDevice = node.config.boot.loader.grub.device;"
+        " cloudInitEnable = node.config.services.cloud-init.enable;"
+        " cloudInitNetworkEnable = node.config.services.cloud-init.network.enable;"
+        " networkdEnable = node.config.systemd.network.enable;"
+        " passwordAuthentication = node.config.services.openssh.settings.PasswordAuthentication;"
+        " firewallPorts = node.config.networking.firewall.allowedTCPPorts;"
         " }"
     )
     result = subprocess.run(
@@ -116,6 +133,25 @@ class TemplateFlakeEvaluatesTests(unittest.TestCase):
                 "the trailing newline must be stripped off keys/<admin>.pub",
             )
 
+    def test_the_hostinger_provider_module_supplies_boot_and_cloud_init_networking(self) -> None:
+        """The generated hardware config (task-8a-brief.md) sets no
+        boot.loader.* of its own -- these must all come from
+        nixos/providers/hostinger.nix, and base.nix's sshd/firewall settings
+        must win over anything cloud-init implies.
+        """
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+
+            facts = _nix_eval(directory)
+
+            self.assertEqual(facts["grubDevice"], "/dev/sda")
+            self.assertTrue(facts["cloudInitEnable"])
+            self.assertTrue(facts["cloudInitNetworkEnable"])
+            self.assertTrue(facts["networkdEnable"])
+            self.assertFalse(facts["passwordAuthentication"])
+            self.assertEqual(facts["firewallPorts"], [22, 443])
+
     def test_an_extra_nix_beside_the_hardware_config_is_picked_up(self) -> None:
         with TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -125,6 +161,22 @@ class TemplateFlakeEvaluatesTests(unittest.TestCase):
             (directory / "nodes" / "a" / "extra.nix").write_text(_EXTRA_NIX, encoding="utf-8")
 
             self.assertEqual(_nix_eval(directory)["domain"], "set-by-extra-nix")
+
+    def test_an_extra_nix_can_override_the_providers_mkdefault_grub_device(self) -> None:
+        """The provider module must set boot.loader.grub.device with
+        mkDefault, not a plain value -- otherwise a node whose disk genuinely
+        differs (an operator override in extra.nix) could never win.
+        """
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+            self.assertEqual(_nix_eval(directory)["grubDevice"], "/dev/sda")
+
+            (directory / "nodes" / "a" / "extra.nix").write_text(
+                _EXTRA_NIX_OVERRIDES_GRUB_DEVICE, encoding="utf-8"
+            )
+
+            self.assertEqual(_nix_eval(directory)["grubDevice"], "/dev/sdz")
 
 
 class TemplateUpScriptTests(unittest.TestCase):

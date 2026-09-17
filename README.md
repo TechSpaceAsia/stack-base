@@ -174,7 +174,7 @@ Every failure is one line: what went wrong, then what to check.
 | `node(s) a have no vps_id…` | Either set `vps_id`, or re-run with `--allow-purchase` |
 | `buying a server needs a price_item` | Copy the plan's catalog id from Hostinger into `price_item` |
 | `the new configuration failed to build` | The build output is above the error. Fix `infra/`, run again — nothing was made permanent |
-| `You must set the option boot.loader…` or a `fileSystems` error | Usually the very first run on a fresh provider image — see "First run on a new provider image" below |
+| `You must set the option boot.loader…` or a `fileSystems` error | The provider module's defaults don't match this node's disk/network — see "First run on a new provider image" below |
 | `node a stopped answering SSH…` | See below |
 | `the SSH host key … does not match` | Either the server was reinstalled (delete its line from `infra/known_hosts`) or something is wrong. If you didn't reinstall it, stop and investigate |
 | `infra/flake.lock is missing` | First run against an unpublished stack-base: set `STACKBASE_SRC` (below) |
@@ -184,18 +184,29 @@ picks up exactly where it stopped.
 
 ## First run on a new provider image
 
-The very first rebuild on a brand new server sometimes fails with an error
+Hostinger's NixOS image ships with an **empty `/etc/nixos`** — it's a
+prebuilt cloud-init image, not a machine that was ever `nixos-install`ed with
+its own configuration. So there is no `configuration.nix` on the server to
+copy settings out of. Instead:
+
+- stack-base generates the disk facts itself, by running
+  `nixos-generate-config --show-hardware-config` on the node and saving the
+  result as `infra/nodes/<name>/hardware-configuration.nix`.
+- The boot loader (GRUB on `/dev/sda`) and the networking stack that keeps
+  the node reachable after a reboot (cloud-init's static IP hand-off to
+  systemd-networkd) are supplied declaratively by stack-base's own
+  Hostinger provider module — you never need to write these by hand.
+
+The very first rebuild on a brand new server can still fail with an error
 like `You must set the option boot.loader.grub.devices…` or a `fileSystems`
-assertion. This project's flake only imports the server's own
-`hardware-configuration.nix` — but the disk/boot layout an image actually
-needs (`boot.loader.*`, and sometimes static `networking.*`) is written by
-the provider into a separate `configuration.nix`, which stack-base also
-copies down to `infra/nodes/<name>/configuration.nix` for exactly this
-reason. Open that file, copy the `boot.loader.*` (and any static
-`networking.*`) lines into `infra/nodes/<name>/extra.nix` (create it if it
-doesn't exist yet), and run `./infra/up` again. This fails at the *test*
-stage, before anything is activated, so nothing on the server changes until
-it builds cleanly.
+assertion, if a particular node's disk or network genuinely differs from
+what the provider module assumes (a non-default disk layout, a different
+provider image entirely). When that happens, the fix is the same escape
+hatch every node has: create `infra/nodes/<name>/extra.nix` and set the
+option(s) that need to differ there — it's loaded alongside the provider
+module's defaults and can override any of them — then run `./infra/up`
+again. This fails at the *test* stage, before anything is activated, so
+nothing on the server changes until it builds cleanly.
 
 ## If you get locked out
 

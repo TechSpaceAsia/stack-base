@@ -55,6 +55,13 @@ _LIST_NIX_FILES = 'for f in /etc/nixos/*.nix; do [ -e "$f" ] && basename "$f"; d
 
 _HARDWARE_FILE = "hardware-configuration.nix"
 
+# Hostinger's NixOS image ships with an EMPTY /etc/nixos (see
+# task-8a-brief.md) -- there is nothing to fetch on a node that has never
+# been rebuilt with stack-base yet. `nixos-generate-config` is the tool
+# NixOS itself ships for exactly this: it prints a hardware-configuration.nix
+# derived from the running machine's disks/CPU, with no side effects.
+_GENERATE_HARDWARE_CMD = "nixos-generate-config --show-hardware-config"
+
 
 def execute(ctx: Context, step: Step) -> str:
     """Run one step and return the line describing what it did."""
@@ -223,13 +230,21 @@ def _pin_host_key(ctx: Context, step: Step) -> str:
 
 
 def _capture_hardware(ctx: Context, step: Step) -> str:
-    """Copy the node's own `/etc/nixos/*.nix` into `infra/nodes/<node>/`.
+    """Save the node's disk/CPU facts to `infra/nodes/<node>/`.
 
-    Only `hardware-configuration.nix` is imported by the project's flake, but
-    the provider's `configuration.nix` is kept alongside it: it is the only
-    record of any boot/network settings the image needed, and folding those
-    into `nodes/<node>/extra.nix` is how an operator would fix a node that
-    won't boot after the first rebuild.
+    Only `hardware-configuration.nix` is imported by the project's flake. If
+    `/etc/nixos` already has one (a provider whose image ships a populated
+    `/etc/nixos`, or a node stack-base has already rebuilt at least once),
+    today's behaviour is unchanged: fetch every `*.nix` file listed there,
+    keeping any sibling `configuration.nix` around as a record.
+
+    Hostinger's own image ships with an EMPTY `/etc/nixos` (see
+    task-8a-brief.md) -- nothing to fetch there. In that case, generate the
+    hardware facts on the node with `nixos-generate-config
+    --show-hardware-config` instead; the boot/network settings that a
+    populated `/etc/nixos`'s `configuration.nix` would otherwise have carried
+    are supplied declaratively by the provider module
+    (`nixos/providers/hostinger.nix`) instead.
     """
     node = _node(step)
     ssh = ctx.ssh(node)
@@ -239,17 +254,23 @@ def _capture_hardware(ctx: Context, step: Step) -> str:
         for line in (listing.stdout or "").splitlines()
         if line.strip().endswith(".nix") and "/" not in line.strip()
     ]
-    if _HARDWARE_FILE not in names:
-        raise StackError(
-            f"node {node} has no /etc/nixos/{_HARDWARE_FILE}",
-            "stack-base needs the provider's disk and boot settings -- check that the VPS really "
-            "is running NixOS (reinstall it from hPanel with the NixOS template if not)",
-        )
 
     destination = ctx.infra_dir / "nodes" / node
     destination.mkdir(parents=True, exist_ok=True)
-    for name in names:
-        (destination / name).write_bytes(ssh.fetch(f"/etc/nixos/{name}"))
+
+    if _HARDWARE_FILE in names:
+        for name in names:
+            (destination / name).write_bytes(ssh.fetch(f"/etc/nixos/{name}"))
+    else:
+        result = ssh.run(_GENERATE_HARDWARE_CMD, check=False)
+        output = result.stdout or ""
+        if result.returncode != 0 or not output.strip() or "fileSystems" not in output:
+            raise StackError(
+                f"node {node}: `{_GENERATE_HARDWARE_CMD}` produced no usable hardware-configuration.nix",
+                "check that the VPS is really running NixOS (reinstall it from hPanel with the "
+                "NixOS template if not)",
+            )
+        (destination / _HARDWARE_FILE).write_text(output, encoding="utf-8")
 
     ctx.node_state(node).hardware_captured = True
     return f"node {node}: disk and boot settings saved to infra/nodes/{node}/ (commit them)"
@@ -525,14 +546,16 @@ _REBOOT_ADVICE = (
 def _test_failure_advice(node: str, tail: list[str]) -> str:
     """The advice half of the `nixos-rebuild test` failure hint.
 
-    `nixos-generate-config` puts a provider image's `boot.loader.*` (and
-    often static `networking.*`) into `configuration.nix`, which this
-    project's flake does not import -- only `hardware-configuration.nix`
-    does (see `_capture_hardware`). So the very first `test` on a fresh
-    provider image commonly fails eval with a `boot.loader`/`fileSystems`
-    assertion, before anything is activated. When the build output looks
-    like that, point the operator straight at the fix instead of the
-    generic "go fix infra/" advice.
+    The Hostinger provider module (`nixos/providers/hostinger.nix`) supplies
+    `boot.loader.*` and the cloud-init/networkd settings a node needs via
+    `mkDefault`, so a first-run `boot.loader`/`fileSystems` gap should now be
+    rare -- but a node whose disk or network genuinely differs from those
+    defaults (a different provider image, a non-default disk layout) can
+    still hit one. When the build output looks like that, point the operator
+    at the one escape hatch every node has for exactly this:
+    `infra/nodes/<node>/extra.nix`, loaded alongside the provider module's
+    defaults and able to override any of them -- rather than the generic "go
+    fix infra/" advice.
 
     Either way, the reboot instruction is appended unconditionally: a
     config that drops networking kills the streaming ssh connection with
@@ -542,9 +565,8 @@ def _test_failure_advice(node: str, tail: list[str]) -> str:
     combined = "\n".join(tail)
     if any(marker in combined for marker in _BOOT_GAP_MARKERS):
         specific = (
-            f"this looks like a first-run bootloader/network gap -- the provider's boot/network "
-            f"settings live in infra/nodes/{node}/configuration.nix; copy the boot.loader.* (and any "
-            f"static networking.*) lines into infra/nodes/{node}/extra.nix and run `up` again"
+            f"this looks like a first-run bootloader/network gap -- override the mismatched "
+            f"boot.loader.*/networking.* option(s) in infra/nodes/{node}/extra.nix and run `up` again"
         )
     else:
         specific = "fix the configuration in infra/ and run `up` again -- nothing was made permanent"

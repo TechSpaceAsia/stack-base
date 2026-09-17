@@ -1172,20 +1172,64 @@ class ApplyStepTests(unittest.TestCase):
             self.assertTrue((infra_dir / "nodes" / "a" / "configuration.nix").exists())
             self.assertTrue(ctx.state.nodes["a"].hardware_captured)
 
-    def test_capture_hardware_fails_clearly_without_a_hardware_configuration(self) -> None:
+    def test_capture_hardware_generates_config_when_etc_nixos_is_empty(self) -> None:
+        """Hostinger's real image ships an EMPTY /etc/nixos (task-8a-brief.md) --
+        there is nothing to fetch, so `_capture_hardware` must fall back to
+        running `nixos-generate-config --show-hardware-config` on the node.
+        """
+        generated = (
+            '{ config, lib, pkgs, modulesPath, ... }:\n'
+            '{ fileSystems."/" = { device = "/dev/disk/by-uuid/abc"; fsType = "ext4"; }; }\n'
+        )
+
         def handler(argv, kwargs):
-            if "basename" in " ".join(argv):
-                return _cp(argv, stdout="configuration.nix\n")
+            joined = " ".join(argv)
+            if "basename" in joined:
+                return _cp(argv, stdout="")  # /etc/nixos is empty
+            if "nixos-generate-config" in joined:
+                return _cp(argv, stdout=generated)
             return None
 
         with Infra() as infra_dir:
-            state = StackState(nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4)})
+            state = StackState(nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)})
             ctx, _ = _context(infra_dir, state=state, runner=FakeRunner(handler=handler))
 
-            with self.assertRaises(StackError) as caught:
-                apply([Step(Action.CAPTURE_HARDWARE, "a")], ctx, allow_purchase=False)
+            apply([Step(Action.CAPTURE_HARDWARE, "a")], ctx, allow_purchase=False)
 
-            self.assertIn("hardware-configuration.nix", str(caught.exception))
+            captured = infra_dir / "nodes" / "a" / "hardware-configuration.nix"
+            self.assertEqual(captured.read_text(encoding="utf-8"), generated)
+            self.assertTrue(ctx.state.nodes["a"].hardware_captured)
+            gen_calls = [c for c in ctx.runner.calls if "nixos-generate-config" in " ".join(c["argv"])]
+            self.assertEqual(len(gen_calls), 1)
+            self.assertIn("--show-hardware-config", gen_calls[0]["argv"][-1])
+
+    def test_capture_hardware_rejects_empty_garbage_or_failed_generated_output(self) -> None:
+        cases = {
+            "empty output": _cp(["ssh"], returncode=0, stdout=""),
+            "output without fileSystems": _cp(["ssh"], returncode=0, stdout="not nix at all\n"),
+            "command itself failed": _cp(["ssh"], returncode=1, stdout="", stderr="not NixOS\n"),
+        }
+        for label, generate_result in cases.items():
+            with self.subTest(label=label):
+
+                def handler(argv, kwargs, generate_result=generate_result):
+                    joined = " ".join(argv)
+                    if "basename" in joined:
+                        return _cp(argv, stdout="")  # /etc/nixos is empty
+                    if "nixos-generate-config" in joined:
+                        return generate_result
+                    return None
+
+                with Infra() as infra_dir:
+                    state = StackState(nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)})
+                    ctx, _ = _context(infra_dir, state=state, runner=FakeRunner(handler=handler))
+
+                    with self.assertRaises(StackError) as caught:
+                        apply([Step(Action.CAPTURE_HARDWARE, "a")], ctx, allow_purchase=False)
+
+                    message = str(caught.exception)
+                    self.assertIn("nixos-generate-config", message)
+                    self.assertIn("NixOS", message)
 
 
 class OriginCertTests(unittest.TestCase):
@@ -1428,7 +1472,6 @@ class RebuildTests(unittest.TestCase):
                 apply([Step(Action.REBUILD, "a")], ctx, allow_purchase=False)
 
             hint = str(caught.exception)
-            self.assertIn("infra/nodes/a/configuration.nix", hint)
             self.assertIn("infra/nodes/a/extra.nix", hint)
             self.assertIn("reboot", hint.lower())
 

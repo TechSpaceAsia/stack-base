@@ -3,17 +3,22 @@
 # adding a server means adding a few lines to stack.toml, not to Nix.
 #
 # Each node gets:
-#   - the hardened stack-base modules (ssh, nginx, postgres, firewall)
-#   - ./nodes/<name>/hardware-configuration.nix -- the server's own disk and
-#     boot settings, copied off the machine on the first run
+#   - the hardened stack-base modules (ssh, nginx, postgres, firewall) plus
+#     the Hostinger provider module (boot.loader.*, cloud-init, networkd --
+#     see stack-base's nixos/providers/hostinger.nix), via `mkNode`'s default
+#     `provider = "hostinger"`
+#   - ./nodes/<name>/hardware-configuration.nix -- the server's own disk
+#     facts. Hostinger's image ships with an EMPTY /etc/nixos, so stack-base
+#     generates this file itself (`nixos-generate-config
+#     --show-hardware-config` run on the node) rather than copying it off an
+#     existing one
 #   - ./nodes/<name>/extra.nix -- OPTIONAL. Create that file for anything
 #     specific to one server (a network quirk, an extra package) and it is
-#     picked up automatically. This is also where a first-run bootloader gap
-#     gets fixed: hardware-configuration.nix alone sometimes lacks
-#     boot.loader.*/networking.* settings a provider image needs (they live
-#     in the sibling ./nodes/<name>/configuration.nix instead) -- copy them
-#     into extra.nix if the first rebuild fails with a boot.loader or
-#     fileSystems error (see the README).
+#     picked up automatically. It's also the escape hatch for a first-run
+#     bootloader/network gap: it loads alongside the provider module's
+#     defaults and can override any of them -- set the mismatched
+#     boot.loader.*/networking.* option(s) there if the first rebuild fails
+#     with a boot.loader or fileSystems error (see the README).
 #
 # Only stack.toml is read here. stack.state.json records what stack-base has
 # observed and done (IP addresses, record ids, fingerprints), but none of that

@@ -24,12 +24,27 @@
       nixosModules.base = import ./nixos/base.nix;
       nixosModules.appHost = import ./nixos/app-host.nix;
       nixosModules.postgres = import ./nixos/postgres.nix;
+      nixosModules.hostinger = import ./nixos/providers/hostinger.nix;
       nixosModules.default = { imports = baseModules; };
 
-      lib.mkNode = { system ? "x86_64-linux", modules }:
+      # `provider` selects the module that reproduces one hosting provider's
+      # image-level boot/networking assumptions (see nixos/providers/*.nix).
+      # "hostinger" (the default -- every node this template builds targets
+      # Hostinger) includes nixosModules.hostinger; `null` includes none (the
+      # VM tests build nodes straight from baseModules and never pass
+      # `provider` at all, so they are unaffected either way). Any other
+      # value is almost certainly a typo, so it throws rather than silently
+      # building a node with no provider module.
+      lib.mkNode = { system ? "x86_64-linux", provider ? "hostinger", modules }:
+        let
+          providerModules =
+            if provider == null then [ ]
+            else if provider == "hostinger" then [ self.nixosModules.hostinger ]
+            else throw "stack-base: unknown provider '${provider}' -- known providers: \"hostinger\", or null for none";
+        in
         lib.nixosSystem {
           inherit system;
-          modules = baseModules ++ [
+          modules = baseModules ++ providerModules ++ [
             { system.stateVersion = lib.mkDefault "26.05"; }
           ] ++ modules;
         };
