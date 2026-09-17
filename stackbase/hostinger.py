@@ -250,7 +250,22 @@ class HostingerClient:
                 "public_key": {"name": name, "key": key},
             },
         }
-        result = self._call("POST", "/api/vps/v1/virtual-machines", json_body=body, retries=1)
+        try:
+            result = self._call("POST", "/api/vps/v1/virtual-machines", json_body=body, retries=1)
+        except ApiError as exc:
+            if exc.status == 0:
+                # A network-level failure (timeout, connection reset, ...):
+                # the request may never have reached Hostinger, or it may
+                # have reached it and the *response* was what got lost --
+                # either way the purchase's fate is unknown, so this must
+                # not be silently retried on the next run.
+                raise StackError(
+                    exc.message,
+                    "the purchase may have gone through -- "
+                    + _HPANEL_HINT
+                    + "; do not retry the purchase blindly, it may have already gone through",
+                ) from exc
+            raise
         vm = result.get("virtual_machine") if isinstance(result, dict) else None
         if not isinstance(vm, dict) or "id" not in vm:
             raise StackError(
@@ -365,6 +380,11 @@ class HostingerClient:
             current_page = meta.get("current_page", page)
             per_page = meta.get("per_page", len(data) or 1)
             total = meta.get("total", len(items))
+            # A non-positive per_page would make `current_page * per_page`
+            # never reach `total` -- stop rather than loop forever on a
+            # malformed/hostile response.
+            if not isinstance(per_page, (int, float)) or per_page <= 0:
+                break
             if current_page * per_page >= total:
                 break
             page += 1

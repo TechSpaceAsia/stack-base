@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
+from stackbase.http import ApiError
 from tests.fakes import FakeServer
 
 
@@ -177,6 +179,25 @@ class EnsurePublicKeyTests(unittest.TestCase):
 _KEY = ("matt", "ssh-ed25519 AAAA matt@laptop")
 
 
+class ListPaginatedTests(unittest.TestCase):
+    def test_a_non_positive_per_page_stops_rather_than_looping_forever(self) -> None:
+        with FakeServer() as server:
+            server.script(
+                "GET",
+                "/api/vps/v1/public-keys?page=1",
+                200,
+                # per_page=0 would make current_page * per_page never reach
+                # total -- without a guard this loops forever.
+                {"data": [{"id": 1, "name": "a", "key": "k"}], "meta": {"current_page": 1, "per_page": 0, "total": 5}},
+            )
+            client = HostingerClient("tok", base_url=server.url)
+
+            result = client.list_public_keys()
+
+            self.assertEqual(len(result), 1)
+            self.assertEqual(len(server.requests), 1, "must not request a second page")
+
+
 class SetupVmTests(unittest.TestCase):
     def test_sends_inline_public_key_and_attaches_extras_then_returns_no_warnings(self) -> None:
         with FakeServer() as server:
@@ -338,6 +359,26 @@ class PurchaseVmTests(unittest.TestCase):
 
             # Exactly the one purchase request -- no retry, no attach attempt.
             self.assertEqual(len(server.requests), 1)
+
+    def test_a_network_level_failure_warns_the_purchase_may_have_gone_through(self) -> None:
+        network_error = ApiError(
+            "POST https://developers.hostinger.com/api/vps/v1/virtual-machines failed: timed out",
+            "check network connectivity and that the host is reachable",
+            status=0,
+            body="",
+        )
+        client = HostingerClient("tok", base_url="http://127.0.0.1:0")
+
+        with mock.patch("stackbase.hostinger.request", side_effect=network_error):
+            with self.assertRaises(StackError) as ctx:
+                client.purchase_vm(
+                    price_item="x", template_id=1, data_center_id=1, hostname="a", public_key=_KEY
+                )
+
+        message = str(ctx.exception).lower()
+        self.assertIn("hpanel", message)
+        self.assertIn("do not retry", message)
+        self.assertIn("may have gone through", message)
 
     def test_purchase_failure_is_not_retried(self) -> None:
         with FakeServer() as server:
