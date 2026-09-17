@@ -45,6 +45,20 @@ in
   };
 
   config = {
+    assertions = [
+      {
+        assertion = cfg.admins != { };
+        message = ''
+          stackbase.admins must not be empty. With
+          services.openssh.authorizedKeysInHomedir disabled below, root's
+          only source of SSH keys is users.users.root.openssh.authorizedKeys.keys,
+          which base.nix populates entirely from stackbase.admins -- an empty
+          admin set would leave no key able to log in as anyone at all,
+          including root, on the very first boot.
+        '';
+      }
+    ];
+
     # A single computed value (rather than a separate `users.users.root.…`
     # binding) -- Nix's attrset-literal merging can't combine a plain
     # `mapAttrs` result at `users.users` with a further nested-path binding
@@ -78,6 +92,25 @@ in
       enable = true;
       openFirewall = false; # networking.firewall below is the single source of truth
       listenAddresses = map (addr: { inherit addr; }) cfg.ssh.listenAddresses;
+      # Declarative-only key sources. NixOS defaults this to true, which
+      # makes AuthorizedKeysFile include "%h/.ssh/authorized_keys" ahead of
+      # "/etc/ssh/authorized_keys.d/%u" -- a second, WRITABLE key source for
+      # every account with a home directory it can write to. deploy.nix's
+      # `deploy` user owns its own home (stateDir/deploy-home); anything
+      # able to write there as `deploy` could plant an unrestricted key and
+      # bypass every `restrict,command=` guarantee that module builds. With
+      # this off, the ONLY trusted source for every account is
+      # /etc/ssh/authorized_keys.d/%u, generated purely from
+      # users.users.<name>.openssh.authorizedKeys.keys -- i.e. purely from
+      # stackbase.admins/stackbase.deploy.keys. This also makes dropping an
+      # admin from config a REAL revocation (a stray homedir key would
+      # otherwise survive it) and stops a provider's cloud-init-delivered
+      # root key (Hostinger's default cloud-init "ssh" module writes root's
+      # first metadata key into ~root/.ssh/authorized_keys) from being a
+      # second, out-of-band source -- root already gets every admin key
+      # declaratively above, confirmed by `nix eval` against a real mkNode
+      # config (see nixos/deploy.nix's Task 2 report, Fix round 1).
+      authorizedKeysInHomedir = false;
       settings = {
         PasswordAuthentication = false;
         KbdInteractiveAuthentication = false;

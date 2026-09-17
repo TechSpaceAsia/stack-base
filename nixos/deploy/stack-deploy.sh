@@ -51,8 +51,11 @@ RUN_DIR="/run/$PROJECT"
 SOCK_LINK="$RUN_DIR/app.sock"
 
 # Anchored on both ends: vMAJOR.MINOR.PATCH exactly, no leading zeros, no
-# pre-release/build suffixes.
-VERSION_GREP='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+# pre-release/build suffixes. Substituted by nixos/deploy.nix at build time
+# from its own `versionRegex` binding -- the SAME substitution lands in
+# stack-deploy-ssh.sh's VERSION_RE, so the two scripts can never disagree
+# on what a valid version string looks like (Fix round 1, F3).
+VERSION_GREP='@versionRegex@'
 
 die() {
   echo "✗ $*" >&2

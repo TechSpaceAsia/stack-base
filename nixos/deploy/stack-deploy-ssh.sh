@@ -59,10 +59,12 @@ STACK_MAX_UPLOAD_BYTES="${STACK_MAX_UPLOAD_BYTES:-524288000}"
 STACK_STATE_DIR="${STACK_STATE_DIR:-/var/lib/stackbase-deploy}"
 INCOMING_DIR="$STACK_STATE_DIR/incoming"
 
-# Anchored on both ends, matching stack-deploy.sh's own VERSION_GREP
-# exactly: vMAJOR.MINOR.PATCH, no leading zeros, no pre-release/build
-# suffix.
-VERSION_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+# Substituted by nixos/deploy.nix at build time from the SAME
+# `versionRegex` binding that produces stack-deploy.sh's VERSION_GREP --
+# one source of truth for vMAJOR.MINOR.PATCH (no leading zeros, no
+# pre-release/build suffix), not a hand-copied duplicate kept in sync by a
+# comment (Fix round 1, F3).
+VERSION_RE='@versionRegex@'
 SHA256_RE='^[0-9a-f]{64}$'
 
 if [ -z "${SSH_ORIGINAL_COMMAND:-}" ]; then
@@ -119,28 +121,55 @@ esac
 # from $SSH_ORIGINAL_COMMAND passed through verbatim into something that
 # could re-interpret them.
 if [ "$subcommand" = upload ]; then
-  partial="$INCOMING_DIR/${version}.tar.gz.partial"
-  final="$INCOMING_DIR/${version}.tar.gz"
+  # F2 (Fix round 1): a UNIQUE per-connection temp file, not the fixed
+  # "$version.tar.gz.partial" -> "$version.tar.gz" pair the first
+  # implementation used. Two concurrent `upload`s of the SAME version used
+  # to share those two fixed names -- no lock held while streaming, so
+  # whichever session's EXIT trap fired first deleted the OTHER session's
+  # still-in-flight or freshly-landed file out from under it. mktemp here
+  # gives each session its own path, so two racing uploads never touch the
+  # same file at all; the only place they can still collide is inside
+  # `stack-deploy unpack`, which already takes the engine lock and refuses
+  # to overwrite an existing release -- exactly one wins, the other fails
+  # cleanly with "release already exists", and neither leaves a stray file
+  # under incoming/. mktemp's own default mode (0600) is already what's
+  # wanted here -- no client but the one that created it can even read the
+  # bytes it's uploading while they're still in flight.
+  tmp=$(mktemp "$INCOMING_DIR/${version}.XXXXXX.tar.gz") || {
+    echo "✗ upload failed: could not create a temp file under $INCOMING_DIR" >&2
+    exit 1
+  }
 
   # Always removed afterwards, success or failure: this trap fires on
   # every exit path out of the rest of the script, including the `set -e`
   # abort triggered by a failing "$STACK_DEPLOY_BIN" unpack call below.
-  trap 'rm -f "$partial" "$final"' EXIT
+  # Only ever this session's OWN temp file -- never a name shared with
+  # another session -- so one session's cleanup can never delete another
+  # session's in-flight or already-handed-off upload.
+  trap 'rm -f "$tmp"' EXIT
 
   # Stream stdin straight to disk, never buffered in memory. head -c
   # reads at most cap+1 bytes; if the client sends more, the resulting
   # file is still capped at exactly cap+1 bytes (head stops reading once
   # satisfied), so this is a bounded read regardless of how much the
   # client actually tries to push.
-  head -c "$((STACK_MAX_UPLOAD_BYTES + 1))" >"$partial"
-  size=$(stat -c '%s' "$partial")
+  #
+  # M2 (Fix round 1): checked explicitly rather than left to a bare
+  # `set -e` abort -- a write failure here (e.g. disk full) would
+  # otherwise kill the script with no diagnostic at all beyond head's own
+  # exit code.
+  if ! head -c "$((STACK_MAX_UPLOAD_BYTES + 1))" >"$tmp"; then
+    echo "✗ upload failed while writing to disk (disk full?) -- nothing was kept" >&2
+    exit 1
+  fi
+
+  size=$(stat -c '%s' "$tmp")
   if [ "$size" -gt "$STACK_MAX_UPLOAD_BYTES" ]; then
     echo "✗ upload exceeds the ${STACK_MAX_UPLOAD_BYTES}-byte cap" >&2
     exit 1
   fi
 
-  mv -T "$partial" "$final"
-  "$STACK_DEPLOY_BIN" unpack "$version" --tarball "$final" --sha256 "$sha256"
+  "$STACK_DEPLOY_BIN" unpack "$version" --tarball "$tmp" --sha256 "$sha256"
   exit 0
 fi
 

@@ -97,6 +97,18 @@ pkgs.testers.runNixOSTest {
           node.succeed("sshd -T | grep -qxi 'kbdinteractiveauthentication no'")
           node.succeed("sshd -T | grep -qxi 'maxauthtries 3'")
 
+      with subtest("authorized_keys is declarative-only: no ~/.ssh/authorized_keys homedir source (F1)"):
+          # services.openssh.authorizedKeysInHomedir defaults to true, which
+          # would put "%h/.ssh/authorized_keys" ahead of
+          # "/etc/ssh/authorized_keys.d/%u" in AuthorizedKeysFile -- a
+          # second, WRITABLE key source for any account that owns its own
+          # home directory. base.nix turns this off for every account on
+          # every stackbase node; confirm the exact resulting value rather
+          # than just that it changed from the default.
+          node.succeed(
+              "sshd -T | grep -qxi 'authorizedkeysfile /etc/ssh/authorized_keys.d/%u'"
+          )
+
       with subtest("sshd only offers publickey auth (behavioural check, not just config parsing)"):
           # Config-parsing assertions above can't catch every way key-only
           # auth could fail to actually apply, so also prove it from a real

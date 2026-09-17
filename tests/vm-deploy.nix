@@ -685,6 +685,24 @@ pkgs.testers.runNixOSTest {
           # than assuming it's the first line.
           assert "active=" in out, f"unexpected status output: {out!r}"
 
+      with subtest("VERSION_GREP (engine) and VERSION_RE (ssh dispatcher) come from one substituted source and stay identical (F3)"):
+          # Both scripts get their version-grammar regex substituted at
+          # build time from the SAME nixos/deploy.nix `versionRegex`
+          # binding -- previously each script carried its own hand-copied
+          # literal, kept in sync only by a comment. Read each BUILT
+          # script's own constant back (not the Nix source) so a future
+          # substitution or quoting mistake would actually be caught here.
+          engine_re = node.succeed(
+              "awk -F\"'\" '/^VERSION_GREP=/{print $2}' \"$(command -v stack-deploy)\""
+          ).strip()
+          ssh_re = node.succeed(
+              "awk -F\"'\" '/^VERSION_RE=/{print $2}' \"$(command -v stack-deploy-ssh)\""
+          ).strip()
+          expected = r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
+          assert engine_re == expected, f"stack-deploy's VERSION_GREP diverged from the expected grammar: {engine_re!r}"
+          assert ssh_re == expected, f"stack-deploy-ssh's VERSION_RE diverged from the expected grammar: {ssh_re!r}"
+          assert engine_re == ssh_re, f"VERSION_GREP and VERSION_RE diverged: {engine_re!r} vs {ssh_re!r}"
+
       with subtest("full upload -> deploy -> status -> rollback round trip over ssh, as deploy"):
           before_active, before_idle = parse_colors(node.succeed("stack-deploy colors").strip())
 
@@ -934,6 +952,76 @@ pkgs.testers.runNixOSTest {
           assert release_set() == before_releases
           node.fail("test -d /opt/${project}/releases/v3.10.0")
 
+      with subtest("two concurrent uploads of the SAME new version: exactly one wins, nothing left behind (F2)"):
+          # F2 (Fix round 1): the first implementation streamed into fixed
+          # names (incoming/<version>.tar.gz.partial -> .tar.gz), so two
+          # concurrent uploads of the same version raced on those SAME two
+          # paths -- whichever session's EXIT trap fired first deleted the
+          # OTHER session's file. Now each session gets its own mktemp'd
+          # path, so the only place they can still collide is inside
+          # `stack-deploy unpack` itself, which already holds the engine
+          # lock and refuses to overwrite an existing release.
+          #
+          # Both ssh sessions are launched fully DETACHED (all three std
+          # fds redirected to files/devnull, not left connected to
+          # execute()'s own pipe) -- the same pattern already used for the
+          # -L port-forwarding subtest above, and for the same reason: a
+          # backgrounded job whose fds are still attached to execute()'s
+          # pipe makes execute() block waiting for that pipe to close.
+          # Launching both, then polling (bounded) for their status files
+          # to appear, sidesteps relying on a plain shell `wait` correctly
+          # tracking two backgrounded subshells through however the test
+          # driver's own exec wrapper runs the launching command.
+          #
+          # The test driver runs every command under `set -euo pipefail`
+          # (nixos/lib/test-driver's own `execute()`), which IS inherited
+          # into these backgrounded subshells: a bare `cmd; echo $? > file`
+          # never reaches the `echo` at all when `cmd` fails, because
+          # errexit aborts the subshell right at the failing command --
+          # confirmed locally before writing this. `cmd || rc=$?` is
+          # immune (the `||` alternative makes the whole simple-or-list
+          # succeed regardless of `cmd`'s own exit status), so the exit
+          # code is captured that way instead of a bare `echo $?`.
+          sha = client_make_tarball("v4.0.0")
+          before_incoming = incoming_files()
+          node.fail("test -d /opt/${project}/releases/v4.0.0")
+
+          upload_cmd = (
+              f"timeout 20 ssh {SSH_OPTS} -i {CLIENT_KEY} deploy@{node_ip} "
+              f"{shlex.quote('upload v4.0.0 ' + sha)} < /tmp/v4.0.0.tar.gz"
+          )
+          client.succeed(
+              "rm -f /tmp/race-a.status /tmp/race-b.status /tmp/race-a.log /tmp/race-b.log; "
+              f"( rc=0; {upload_cmd} > /tmp/race-a.log 2>&1 || rc=$?; echo $rc > /tmp/race-a.status ) "
+              "</dev/null >/dev/null 2>&1 & "
+              f"( rc=0; {upload_cmd} > /tmp/race-b.log 2>&1 || rc=$?; echo $rc > /tmp/race-b.status ) "
+              "</dev/null >/dev/null 2>&1 &"
+          )
+          client.wait_until_succeeds(
+              "test -f /tmp/race-a.status && test -f /tmp/race-b.status", timeout=25
+          )
+
+          status_a = client.succeed("cat /tmp/race-a.status").strip()
+          status_b = client.succeed("cat /tmp/race-b.status").strip()
+          log_a = client.succeed("cat /tmp/race-a.log")
+          log_b = client.succeed("cat /tmp/race-b.log")
+
+          winners = [s for s in (status_a, status_b) if s == "0"]
+          assert len(winners) == 1, (
+              f"expected exactly one of the two concurrent uploads to succeed, got "
+              f"status_a={status_a} status_b={status_b} (log_a={log_a!r} log_b={log_b!r})"
+          )
+
+          node.succeed("test -d /opt/${project}/releases/v4.0.0")
+          assert incoming_files() == before_incoming, (
+              f"incoming/ must be back to its pre-race state once the race resolves, got {incoming_files()}"
+          )
+
+          # The winning release must be genuinely intact/deployable, not
+          # just present on disk -- prove it with a real deploy.
+          node.succeed("${fastHealth} stack-deploy deploy v4.0.0")
+          assert "v4.0.0" in node.succeed("stack-deploy releases")
+
       with subtest("a key not listed in stackbase.deploy.keys is denied for the deploy account"):
           status, out = ssh("status", key=STRANGER_KEY)
           assert status != 0, f"expected auth failure for an unknown key, got status=0 output={out!r}"
@@ -941,6 +1029,74 @@ pkgs.testers.runNixOSTest {
       with subtest("an admin key is not accepted for the deploy account unless also in stackbase.deploy.keys"):
           status, out = ssh("status", key=ADMIN_KEY)
           assert status != 0, f"expected auth failure for an admin-only key against deploy@, got status=0 output={out!r}"
+
+      # -------------------------------------------------------------
+      # F1 (Fix round 1): base.nix now disables
+      # services.openssh.authorizedKeysInHomedir, so the ONLY trusted key
+      # source for every account is /etc/ssh/authorized_keys.d/%u
+      # (declarative config). Prove that planting a key into either
+      # deploy's or an admin's OWN homedir ~/.ssh/authorized_keys -- which
+      # anything able to write there as that user could always do -- grants
+      # NOTHING, and that the real declarative sources still work.
+      # -------------------------------------------------------------
+
+      STRANGER_PUB = "${pubKeyOf strangerKeypair}"
+
+      with subtest("a key planted into deploy's own ~/.ssh/authorized_keys grants no access (F1a)"):
+          node.succeed(
+              f"install -d -m 0700 -o deploy -g deploy {STATE_DIR}/deploy-home/.ssh && "
+              f"printf '%s\\n' {shlex.quote(STRANGER_PUB)} > /tmp/planted-deploy-authorized_keys && "
+              f"install -m 0600 -o deploy -g deploy /tmp/planted-deploy-authorized_keys "
+              f"{STATE_DIR}/deploy-home/.ssh/authorized_keys"
+          )
+          status, out = ssh("status", key=STRANGER_KEY)
+          assert status != 0, (
+              f"a key planted into deploy's own ~/.ssh/authorized_keys must NOT grant access "
+              f"(authorizedKeysInHomedir must be off), got status=0 output={out!r}"
+          )
+          node.succeed(f"rm -rf {STATE_DIR}/deploy-home/.ssh")
+
+      with subtest("a key planted into an admin's own ~/.ssh/authorized_keys grants no access (F1b)"):
+          admin_group = node.succeed("id -gn testadmin").strip()
+          node.succeed(
+              f"install -d -m 0700 -o testadmin -g {admin_group} /home/testadmin/.ssh && "
+              f"printf '%s\\n' {shlex.quote(STRANGER_PUB)} > /tmp/planted-admin-authorized_keys && "
+              f"install -m 0600 -o testadmin -g {admin_group} /tmp/planted-admin-authorized_keys "
+              f"/home/testadmin/.ssh/authorized_keys"
+          )
+          status, out = client.execute(
+              f"timeout 20 ssh {SSH_OPTS} -n -i {STRANGER_KEY} testadmin@{node_ip} true 2>&1"
+          )
+          assert status != 0, (
+              f"a key planted into an admin's own ~/.ssh/authorized_keys must NOT grant access, "
+              f"got status=0 output={out!r}"
+          )
+          node.succeed("rm -rf /home/testadmin/.ssh")
+
+      with subtest("positive controls: the listed deploy key and a declarative admin key still work (F1c)"):
+          # The negative subtests above (this one, F1a, F1b, plus the
+          # earlier "a key not listed"/"an admin key is not accepted"
+          # subtests) are FOUR genuine SSH authentication failures from
+          # this client's one source IP in quick succession.
+          # PerSourcePenalties (base.nix, Task 6: `PerSourcePenalties
+          # yes`) accrues an authfail penalty (default 5s) per failure and
+          # starts enforcing once the accrued total crosses its default
+          # 15s minimum -- four failures cross that, and the next
+          # connection attempt can get refused outright at the
+          # TCP/protocol level ("kex_exchange_identification: read:
+          # Connection reset by peer") even though the key itself is
+          # perfectly valid. That's a real, if noisy, side effect of a
+          # real hardening feature working as designed, not a bug in
+          # either -- poll (bounded) rather than assert once, the same way
+          # a real client behind that same source IP would just retry.
+          client.wait_until_succeeds(
+              f"timeout 20 ssh {SSH_OPTS} -n -i {CLIENT_KEY} deploy@{node_ip} status 2>&1 | grep -q 'active='",
+              timeout=60,
+          )
+          client.wait_until_succeeds(
+              f"timeout 20 ssh {SSH_OPTS} -n -i {ADMIN_KEY} testadmin@{node_ip} true 2>&1",
+              timeout=60,
+          )
 
       with subtest("deploy has NO access to /var/lib/stackbase -- app-host.nix's root:nginx domain stays untouched"):
           # The engine's own state lives entirely under stateDir

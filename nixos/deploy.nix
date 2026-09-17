@@ -28,6 +28,16 @@ let
   # binding per file, not a cross-file constant.
   stateDir = "/var/lib/stackbase-deploy";
 
+  # Single source of truth for the vMAJOR.MINOR.PATCH grammar (see
+  # global-constraints.md), substituted into stack-deploy.sh (as
+  # VERSION_GREP) and stack-deploy-ssh.sh (as VERSION_RE) at build time --
+  # the same @token@ substitution mechanism already used for
+  # @stackDeployBin@ below. Previously hand-duplicated between the two
+  # scripts, kept in sync only by a comment (Fix round 1, F3): a future
+  # edit to one copy and not the other would have let the SSH door accept
+  # (or reject) a version string the engine itself disagrees with.
+  versionRegex = "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$";
+
   stackDeployPkg = pkgs.writeShellApplication {
     name = "stack-deploy";
     runtimeInputs = with pkgs; [
@@ -41,7 +51,10 @@ let
       gnugrep
       gnused
     ];
-    text = builtins.readFile ./deploy/stack-deploy.sh;
+    text = builtins.replaceStrings
+      [ "@versionRegex@" ]
+      [ versionRegex ]
+      (builtins.readFile ./deploy/stack-deploy.sh);
   };
 
   # The forced-command dispatcher installed as every stackbase.deploy.keys
@@ -52,8 +65,8 @@ let
     name = "stack-deploy-ssh";
     runtimeInputs = with pkgs; [ coreutils ];
     text = builtins.replaceStrings
-      [ "@stackDeployBin@" ]
-      [ "${stackDeployPkg}/bin/stack-deploy" ]
+      [ "@stackDeployBin@" "@versionRegex@" ]
+      [ "${stackDeployPkg}/bin/stack-deploy" versionRegex ]
       (builtins.readFile ./deploy/stack-deploy-ssh.sh);
   };
 
@@ -256,6 +269,14 @@ in
       # bypasses DAC anyway).
       "d ${stateDir} 2750 deploy deploy -"
       "d ${stateDir}/incoming 0770 deploy deploy -"
+      # M1: a hard-killed upload session never runs its EXIT trap (see
+      # stack-deploy-ssh.sh's own comment on this), leaving an orphaned
+      # per-connection temp file under incoming/ forever. Age-based
+      # cleanup via a separate "e" line (adjusts/cleans an existing path,
+      # never creates it) rather than folding an age field into the "d"
+      # line above, so the directory's own creation/ownership rule stays
+      # exactly as simple as every other stateDir entry.
+      "e ${stateDir}/incoming - - - 1d"
       # deploy's $HOME. Nothing stack-deploy-ssh writes here today (it
       # streams uploads straight into incoming/ above), but sshd/the login
       # shell it execs the forced command through both expect a real,
