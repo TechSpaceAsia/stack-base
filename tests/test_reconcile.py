@@ -17,6 +17,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest import mock
 
 from stackbase.cloudflare import CloudflareClient
@@ -431,6 +432,26 @@ def _cp(argv, *, returncode=0, stdout="", stderr="") -> subprocess.CompletedProc
     return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+class FakeConnector:
+    """Stands in for socket.create_connection: records addresses, never connects."""
+
+    def __init__(self, *, refuse_first: int = 0) -> None:
+        self.addresses: list[tuple] = []
+        self._refusals = refuse_first
+
+    def __call__(self, address, timeout=None):
+        self.addresses.append(address)
+        if self._refusals > 0:
+            self._refusals -= 1
+            raise OSError("connection refused")
+        return _ClosedSocket()
+
+
+class _ClosedSocket:
+    def close(self) -> None:
+        pass
+
+
 def _context(
     infra_dir: Path,
     *,
@@ -440,6 +461,7 @@ def _context(
     server: FakeServer | None = None,
     runner: FakeRunner | None = None,
     popen: FakePopen | None = None,
+    connector: Any = None,
     stackbase_src: str | None = None,
     isatty: bool = True,
     secrets: dict[str, str] | None = None,
@@ -458,6 +480,7 @@ def _context(
         stackbase_src=stackbase_src,
         runner=runner or FakeRunner(),
         popen=popen or FakePopen(),
+        connector=connector or FakeConnector(),
         out=lines.append,
         isatty=lambda: isatty,
     )
@@ -588,15 +611,19 @@ class ApplyStepTests(unittest.TestCase):
             attach = next(r for r in server.requests if "attach" in r["path"])
             self.assertEqual(attach["body"], {"ids": [12]})
 
-    def test_wait_running_records_both_addresses(self) -> None:
+    def test_wait_running_records_both_addresses_and_waits_for_sshd(self) -> None:
         with Infra() as infra_dir, FakeServer() as server:
             server.script("GET", f"/api/vps/v1/virtual-machines/{_VPS_ID}", 200, _vm_body())
-            ctx, _ = _context(infra_dir, server=server)
+            # Hostinger reports "running" a little before sshd is listening,
+            # so the first probe is refused and the step must keep waiting.
+            connector = FakeConnector(refuse_first=1)
+            ctx, _ = _context(infra_dir, server=server, connector=connector)
 
             apply([Step(Action.WAIT_RUNNING, "a")], ctx, allow_purchase=False)
 
             self.assertEqual(ctx.state.nodes["a"].ipv4, _IPV4)
             self.assertEqual(ctx.state.nodes["a"].ipv6, _IPV6)
+            self.assertEqual(connector.addresses, [(_IPV4, 22), (_IPV4, 22)])
 
     def test_ensure_firewall_opens_22_and_443_and_activates_it_on_the_node(self) -> None:
         with Infra() as infra_dir, FakeServer() as server:

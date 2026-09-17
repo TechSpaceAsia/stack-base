@@ -26,8 +26,9 @@ from stackbase.cloudflare import CloudflareClient
 from stackbase.config import load_config, load_state
 from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
-from stackbase.reconcile import Context, Step, apply, local_facts, observe, plan
+from stackbase.reconcile import SSH_USER, Context, Step, apply, local_facts, observe, plan
 from stackbase.secrets import load_secrets, redact
+from stackbase.ssh import Ssh
 
 _DEFAULT_INFRA_DIR = "./infra"
 
@@ -141,16 +142,14 @@ def _ssh(args: argparse.Namespace, infra_dir: Path) -> None:
             f"known nodes: {known}",
         )
 
-    ctx = Context(
-        infra_dir=infra_dir,
-        cfg=cfg,
-        state=state,
-        secrets={},
-        hostinger=HostingerClient(""),
-        cloudflare=CloudflareClient(""),
-        observed=None,  # type: ignore[arg-type] - `ssh` never observes
-    )
-    ssh = ctx.ssh(args.node)
+    node_state = state.nodes.get(args.node)
+    ipv4 = node_state.ipv4 if node_state else None
+    if not ipv4:
+        raise StackError(
+            f"stack-base does not know an address for node '{args.node}' yet",
+            "run `up` first -- the address is recorded once the server is running",
+        )
+    ssh = Ssh(infra_dir, ipv4, user=SSH_USER)
 
     command = list(args.rest)
     if command and command[0] == "--":

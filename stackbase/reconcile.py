@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -552,9 +553,10 @@ class Context:
     """Everything a step executor needs, with every side effect injectable.
 
     `runner`/`popen` are the subprocess entry points (ssh, rsync, openssl,
-    and the streamed nixos-rebuild); `out` is where operator-facing lines go;
-    `isatty` answers "is a human watching?" for the purchase confirmation.
-    Tests replace all four, which is why nothing in this package ever has to
+    and the streamed nixos-rebuild); `connector` opens the TCP probe that
+    waits for sshd; `out` is where operator-facing lines go; `isatty`
+    answers "is a human watching?" for the purchase confirmation. Tests
+    replace all of them, which is why nothing in this package ever has to
     reach a real server to be exercised.
     """
 
@@ -568,6 +570,7 @@ class Context:
     stackbase_src: str | None = None
     runner: Any = subprocess.run
     popen: Any = subprocess.Popen
+    connector: Any = socket.create_connection
     out: Callable[[str], None] = print
     isatty: Callable[[], bool] = field(default=lambda: sys.stdin.isatty())
 

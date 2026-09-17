@@ -37,7 +37,7 @@ def run(argv: list[str]) -> None:
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip().splitlines()
         fail(
-            f"`{' '.join(argv[:2])}` failed while downloading stack-base",
+            f"{argv[0]} failed while downloading stack-base",
             detail[-1] if detail else "check your network connection and try again",
         )
 

@@ -22,7 +22,6 @@ from __future__ import annotations
 import re
 import subprocess
 from collections import deque
-from pathlib import Path
 from typing import Callable
 
 from stackbase.errors import StackError
@@ -118,7 +117,13 @@ def _wait_running(ctx: Context, step: Step) -> str:
             f"virtual machine {vps_id} is running but has no IPv4 address",
             _HPANEL + " -- stack-base needs an IPv4 address to reach it",
         )
-    return f"node {node}: running at {node_state.ipv4}"
+
+    # Hostinger calls a VM "running" as soon as it has booted, which is a
+    # little before sshd is accepting connections. Every step after this one
+    # talks SSH, so wait for the port here rather than letting the next step
+    # fail on a box that was simply 20 seconds from ready.
+    ctx.ssh(node).wait_port(connector=ctx.connector)
+    return f"node {node}: running at {node_state.ipv4}, accepting SSH"
 
 
 def _ensure_keys(ctx: Context, _step: Step) -> str:
