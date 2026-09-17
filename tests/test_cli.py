@@ -282,9 +282,15 @@ class ConvergedStackTests(unittest.TestCase):
             self._script_converged(server, infra_dir)
             stdout = io.StringIO()
 
-            with _cli(server, identity) as (ssh_class, execute):
-                with contextlib.redirect_stdout(stdout):
-                    main(["--infra-dir", str(infra_dir), "up"])
+            # A missing cloudflare-ips.nix skips that check silently (Finding
+            # i) -- keeps this test's "nothing to do" output exact regardless
+            # of what the real snapshot file currently contains.
+            with mock.patch(
+                "stackbase.reconcile._cloudflare_ips_path", return_value=Path(tmp) / "no-such-file.nix"
+            ):
+                with _cli(server, identity) as (ssh_class, execute):
+                    with contextlib.redirect_stdout(stdout):
+                        main(["--infra-dir", str(infra_dir), "up"])
 
             self.assertEqual(stdout.getvalue().strip(), "nothing to do")
             execute.assert_not_called()
