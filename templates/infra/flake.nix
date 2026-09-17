@@ -9,6 +9,11 @@
 #   - ./nodes/<name>/extra.nix -- OPTIONAL. Create that file for anything
 #     specific to one server (a network quirk, an extra package) and it is
 #     picked up automatically.
+#
+# Only stack.toml is read here. stack.state.json records what stack-base has
+# observed and done (IP addresses, record ids, fingerprints), but none of that
+# is an input to a machine's configuration -- so the Nix side deliberately
+# does not read it.
 {
   description = "NixOS configuration for this project's servers";
 

@@ -207,7 +207,7 @@ config and used directly, so edits to stack-base take effect on the next run.
 | `keys/*.pub` | Everyone's SSH public key. Commit |
 | `age-recipients.txt` | Everyone's age public key — who can read the secrets. Commit |
 | `secrets.age` | The encrypted API tokens and TLS key. Commit (it's encrypted) |
-| `stack.state.json` | What stack-base has done so far. Written for you — commit, don't edit |
+| `stack.state.json` | What stack-base has done so far — addresses, record ids, fingerprints. Written for you: commit it, don't edit it. The servers' configuration is built from `stack.toml` alone, so nothing in here changes what gets installed |
 | `known_hosts` | The servers' SSH fingerprints. Commit |
 | `nodes/<name>/` | Each server's own disk and boot settings, copied off the machine. Commit |
 | `nodes/<name>/extra.nix` | Optional, yours: anything specific to one server |
