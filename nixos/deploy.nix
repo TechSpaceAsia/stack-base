@@ -36,9 +36,14 @@ let
   # systemctl calls (distinct from the Task 2 SSH forced-command surface,
   # which only ever proxies to this same binary). Every entry names one
   # concrete unit -- no globs -- so `deploy` can never touch a unit other
-  # than its own two app colors and its own two drain timers.
+  # than its own two app colors and its own two drain timers. start is
+  # granted alongside restart/stop on the app units to match the
+  # start|stop|restart surface Task 2's forced-command dispatcher exposes,
+  # even though stack-deploy itself only ever calls restart (idempotent
+  # whether the unit was already running or not).
   deploySudoCommands = lib.concatMap
     (color: [
+      { command = "${systemctlBin} start ${cfg.project}@${color}.service"; options = [ "NOPASSWD" ]; }
       { command = "${systemctlBin} restart ${cfg.project}@${color}.service"; options = [ "NOPASSWD" ]; }
       { command = "${systemctlBin} stop ${cfg.project}@${color}.service"; options = [ "NOPASSWD" ]; }
       { command = "${systemctlBin} restart stackbase-drain@${color}.timer"; options = [ "NOPASSWD" ]; }
@@ -102,10 +107,19 @@ in
   };
 
   config = {
+    # Two distinct trust boundaries, two distinct groups -- do not merge
+    # them. `<project>` is the app's own group; a later task drops
+    # /var/lib/stackbase/app.env as `root:<project> 0640` (the app's own
+    # secrets). `<project>-sock` exists purely so `deploy` and `nginx` can
+    # reach /run/<project> and the app.sock socket file without also
+    # getting read access to that secrets file -- `deploy` must never be
+    # a member of `<project>` itself.
     users.groups.${cfg.project} = { };
+    users.groups."${cfg.project}-sock" = { };
     users.users.${cfg.project} = {
       isSystemUser = true;
       group = cfg.project;
+      extraGroups = [ "${cfg.project}-sock" ];
       home = "/var/empty";
       createHome = false;
       description = "stackbase app runtime user for ${cfg.project}";
@@ -115,10 +129,12 @@ in
     users.users.deploy = {
       isSystemUser = true;
       group = "deploy";
-      # Needs to traverse /run/<project> (mode 2775, group <project>) to
-      # replace the app.sock symlink, and to create files under
-      # /opt/<project>/{releases,blue,green} (owned deploy:<project>).
-      extraGroups = [ cfg.project ];
+      # `<project>-sock`, not `<project>`: deploy only ever needs to
+      # replace the app.sock symlink inside /run/<project>, never to read
+      # the app's own secrets (app.env). Ownership of
+      # /opt/<project>/{releases,blue,green} is deploy:deploy directly
+      # (see C2 below), so no group membership is needed there either.
+      extraGroups = [ "${cfg.project}-sock" ];
       home = "/var/lib/stackbase";
       createHome = false;
       description = "stackbase release engine (blue/green deploys)";
@@ -129,18 +145,26 @@ in
 
     # nginx (app-host.nix) proxies to unix:/run/<project>/app.sock as the
     # `nginx` user. It never runs as <project>, so the only way it can
-    # connect() to the app's socket is group membership: put it in the
-    # project's group, and rely on the app process chmod'ing its socket
-    # file group-writable after bind (connect() on an AF_UNIX socket needs
-    # write permission on the socket special file, not just read). The
-    # fake app used by tests/vm-deploy.nix does this; a real app must too.
-    users.users.nginx.extraGroups = [ cfg.project ];
+    # connect() to the app's socket is group membership: put it in
+    # `<project>-sock` (not `<project>` -- see above), and rely on the app
+    # process chmod'ing its socket file group-writable after bind
+    # (connect() on an AF_UNIX socket needs write permission on the socket
+    # special file, not just read). The fake app used by
+    # tests/vm-deploy.nix does this; a real app must too.
+    users.users.nginx.extraGroups = [ "${cfg.project}-sock" ];
 
     systemd.tmpfiles.rules = [
       "d /opt/${cfg.project} 0755 root root -"
-      "d /opt/${cfg.project}/releases 2775 deploy ${cfg.project} -"
-      "d /opt/${cfg.project}/blue 0750 deploy ${cfg.project} -"
-      "d /opt/${cfg.project}/green 0750 deploy ${cfg.project} -"
+      # Not group-writable by anyone but deploy: the app user (and nginx,
+      # which shares its group for socket access) must never be able to
+      # replace a release out from under itself. Modes inside a release
+      # tree are normalised explicitly by stack-deploy on unpack (0755
+      # dirs, 0644 files, 0755 for the declared binary), so no group
+      # inheritance is needed here either -- world-readable bits already
+      # give <project> everything it needs to read and run its release.
+      "d /opt/${cfg.project}/releases 0755 deploy deploy -"
+      "d /opt/${cfg.project}/blue 0755 deploy deploy -"
+      "d /opt/${cfg.project}/green 0755 deploy deploy -"
       "d /var/lib/stackbase 0770 deploy deploy -"
       "d /var/lib/stackbase/incoming 0770 deploy deploy -"
       # /run is tmpfs, wiped every boot. Deliberately NOT RuntimeDirectory=
@@ -153,7 +177,12 @@ in
       # drain-stop. tmpfiles owns the directory unconditionally instead,
       # and stackbase-app-boot.service (below) recreates app.sock after
       # every boot since the symlink itself doesn't survive in tmpfs.
-      "d /run/${cfg.project} 2775 ${cfg.project} ${cfg.project} -"
+      # Owner <project>, group <project>-sock, setgid: a socket file the
+      # app creates here inherits the *directory's* group
+      # (<project>-sock) rather than the app's own primary group
+      # (<project>), which is what lets nginx (a <project>-sock member)
+      # reach it via the socket's own 0660/0666 mode.
+      "d /run/${cfg.project} 2770 ${cfg.project} ${cfg.project}-sock -"
     ];
 
     systemd.services."${cfg.project}@" = {

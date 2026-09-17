@@ -26,7 +26,6 @@ STACK_DEPLOY_HEALTH_TRIES="${STACK_DEPLOY_HEALTH_TRIES:-30}"
 STACK_DEPLOY_HEALTH_SLEEP="${STACK_DEPLOY_HEALTH_SLEEP:-2}"
 
 PROJECT="$STACK_PROJECT"
-GROUP="$STACK_PROJECT"
 RELEASES_DIR="/opt/$PROJECT/releases"
 BLUE_DIR="/opt/$PROJECT/blue"
 GREEN_DIR="/opt/$PROJECT/green"
@@ -92,10 +91,6 @@ linked_version() {
   fi
 }
 
-release_version_of() {
-  linked_version "$1"
-}
-
 current_version_or_dash() {
   local v
   v="$(linked_version "$1")"
@@ -140,6 +135,15 @@ acquire_lock() {
   fi
 }
 
+# A single global counter (not one per color): any deploy or rollback,
+# regardless of which color it touches, invalidates every older pending
+# drain-stop. That's intentionally coarser than it needs to be -- a
+# scheme scoped per-color could still be correct with more bookkeeping --
+# but the failure mode of "too coarse" is a color that stays running
+# longer than its drainSeconds (a stale drain-stop skips itself and never
+# retries), never a color getting killed that shouldn't be. Erring toward
+# "leave it running" over "maybe kill the wrong one" is the right trade
+# for a production traffic swap.
 next_generation() {
   local cur next
   if [ -f "$GENERATION_FILE" ]; then
@@ -177,10 +181,16 @@ wait_healthy() {
 # outgoing color's drain-stop. `prev_active` is the color that was active
 # before this call (or "none" on the very first deploy, when there is
 # nothing to drain).
+#
+# Returns non-zero on a failed health check instead of exiting directly,
+# so `cmd_deploy` can restore the idle color's `current` link to whatever
+# it pointed at before this attempt (see cmd_deploy) -- a bare `exit 1`
+# here would skip that restoration and leave a later `rollback` targeting
+# the broken candidate that just failed.
 activate_color() {
   local idle="$1" prev_active="$2" version
 
-  version=$(release_version_of "$idle")
+  version=$(linked_version "$idle")
 
   echo "→ starting $idle on $version"
   run_systemctl restart "${PROJECT}@${idle}.service"
@@ -188,9 +198,15 @@ activate_color() {
   if ! wait_healthy "$idle"; then
     echo "✗ $idle failed the health check ($STACK_HEALTH_PATH) after $STACK_DEPLOY_HEALTH_TRIES tries" >&2
     run_systemctl stop "${PROJECT}@${idle}.service" || true
-    exit 1
+    return 1
   fi
   echo "✓ $idle is healthy"
+
+  # Intent file: written just before the traffic flip, removed just after
+  # the state file is written. Closes the crash window between the two --
+  # see resolve_pending_color, called from cmd_boot and from the top of
+  # cmd_deploy/cmd_rollback (in case a previous run crashed mid-swap).
+  atomic_write "$STATE_DIR/pending-color" "$idle"
 
   atomic_symlink "app-${idle}.sock" "$SOCK_LINK"
   echo "✓ traffic switched to $idle"
@@ -198,6 +214,7 @@ activate_color() {
   # Constraint: the state file is written atomically AFTER the socket
   # symlink flip succeeds, never before.
   atomic_write "$ACTIVE_COLOR_FILE" "$idle"
+  rm -f "$STATE_DIR/pending-color"
 
   if [ "$prev_active" != none ] && [ "$prev_active" != "$idle" ]; then
     local gen
@@ -208,6 +225,37 @@ activate_color() {
   fi
 
   echo "i migrations run at app start: keep them additive (expand -> migrate -> contract in a later release)"
+  return 0
+}
+
+# Finishes or discards a swap interrupted between the app.sock flip and the
+# active-color write (see activate_color). Called at the top of
+# deploy/rollback/boot so a leftover intent from a crashed prior run is
+# always resolved before anything else touches state.
+resolve_pending_color() {
+  [ -f "$STATE_DIR/pending-color" ] || return 0
+
+  local pcolor link
+  pcolor=$(cat "$STATE_DIR/pending-color")
+  link="$(color_dir "$pcolor")/current"
+
+  if [ -e "$link" ]; then
+    echo "i resuming a swap to $pcolor that was interrupted before its state was persisted"
+    systemctl start "${PROJECT}@${pcolor}.service"
+    if wait_healthy "$pcolor"; then
+      atomic_symlink "app-${pcolor}.sock" "$SOCK_LINK"
+      atomic_write "$ACTIVE_COLOR_FILE" "$pcolor"
+      rm -f "$STATE_DIR/pending-color"
+      echo "✓ interrupted swap to $pcolor completed"
+      return 0
+    fi
+    echo "i $pcolor did not come up healthy while resuming the interrupted swap; falling back to active-color" >&2
+    systemctl stop "${PROJECT}@${pcolor}.service" || true
+  else
+    echo "i pending-color ($pcolor) has no linked release; discarding" >&2
+  fi
+
+  rm -f "$STATE_DIR/pending-color"
 }
 
 deploy_unpack_tarball() {
@@ -226,21 +274,55 @@ deploy_unpack_tarball() {
     die "sha256 mismatch for $tarball: expected $sha256, got $actual_sha"
   fi
 
-  local member
-  while IFS= read -r member; do
-    case "$member" in
-      /*) die "tarball contains an absolute path member: $member" ;;
+  # Verbose listing (not `-tzf`): the type character in column 1 is the
+  # only reliable way to reject symlinks and hardlinks, not just their
+  # names. A name-only check (`tar -tzf`) lets a symlink member such as
+  # `evil -> /etc` followed by `evil/passwd` sail through path validation
+  # and then get planted on disk as a real symlink outside the release
+  # tree the moment it's extracted.
+  local line type_char name
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    type_char="${line:0:1}"
+    case "$type_char" in
+      -|d) : ;;
+      *) die "tarball contains a member that is not a regular file or directory (type '$type_char'): $line" ;;
     esac
-    if printf '%s\n' "$member" | tr '/' '\n' | grep -qx '\.\.'; then
-      die "tarball contains a '..' path member: $member"
+
+    # Strip the fixed `perm owner/group size date time` prefix to recover
+    # the member's own path, which may itself contain spaces; re-splitting
+    # $1 after each sub() is what makes this robust to that.
+    name=$(printf '%s\n' "$line" | awk '{ for (i = 1; i <= 5; i++) sub($1 FS, ""); print }')
+
+    case "$name" in
+      /*) die "tarball contains an absolute path member: $name" ;;
+    esac
+    if printf '%s\n' "$name" | tr '/' '\n' | grep -qx '\.\.'; then
+      die "tarball contains a '..' path member: $name"
     fi
-  done < <(tar -tzf "$tarball")
+  done < <(tar -tvzf "$tarball")
 
   local tmp_dir
   tmp_dir=$(mktemp -d "$RELEASES_DIR/.tmp-${version}-XXXXXX")
-  tar -xzf "$tarball" -C "$tmp_dir"
-  chgrp -R "$GROUP" "$tmp_dir"
-  chmod -R g+rX "$tmp_dir"
+  # --no-same-owner/--no-same-permissions: don't trust the archive's
+  # recorded uid/gid or mode bits (a crafted tarball could ship a setuid
+  # root binary or a world-writable file) -- extract with the invoking
+  # user's ownership and umask-based permissions as a first line of
+  # defense. --no-overwrite-dir: never let extraction change the mode of
+  # a directory that already exists at the destination (moot here since
+  # tmp_dir is always fresh, but cheap insurance).
+  tar -xzf "$tarball" -C "$tmp_dir" --no-same-owner --no-same-permissions --no-overwrite-dir
+
+  # Second, unconditional line of defense: normalise every mode
+  # explicitly rather than trust the extraction flags above. A plain
+  # 3-digit octal chmod always clears setuid/setgid/sticky (they'd need a
+  # 4th digit), so this strips them regardless of what the archive or the
+  # extracting umask produced.
+  find "$tmp_dir" -type d -exec chmod 0755 {} +
+  find "$tmp_dir" -type f -exec chmod 0644 {} +
+  if [ -f "$tmp_dir/$STACK_BINARY" ]; then
+    chmod 0755 "$tmp_dir/$STACK_BINARY"
+  fi
 
   rm -rf "$release_dir"
   mv -T "$tmp_dir" "$release_dir"
@@ -288,6 +370,7 @@ cmd_deploy() {
   fi
 
   acquire_lock
+  resolve_pending_color
 
   local release_dir="$RELEASES_DIR/$version"
 
@@ -297,17 +380,36 @@ cmd_deploy() {
     [ -d "$release_dir" ] || die "release $version not found at $release_dir (unpack it first or pass --tarball)"
   fi
 
-  local active idle
+  local active idle idle_link prev_target
   active=$(read_active)
   idle=$(idle_for "$active")
+  idle_link="$(color_dir "$idle")/current"
 
-  atomic_symlink "../releases/$version" "$(color_dir "$idle")/current"
+  # Capture what the idle color's `current` pointed at before we repoint
+  # it, so a failed health check below can put it back rather than leave
+  # `rollback` targeting the broken candidate we're about to try.
+  prev_target=""
+  if [ -e "$idle_link" ]; then
+    prev_target=$(readlink "$idle_link")
+  fi
 
-  activate_color "$idle" "$active"
+  atomic_symlink "../releases/$version" "$idle_link"
+
+  if ! activate_color "$idle" "$active"; then
+    if [ -n "$prev_target" ]; then
+      atomic_symlink "$prev_target" "$idle_link"
+      echo "i $idle/current restored to its previous release" >&2
+    else
+      rm -f "$idle_link"
+      echo "i $idle/current removed (it had no previous release)" >&2
+    fi
+    exit 1
+  fi
 }
 
 cmd_rollback() {
   acquire_lock
+  resolve_pending_color
 
   local active idle link
   active=$(read_active)
@@ -316,7 +418,7 @@ cmd_rollback() {
   link="$(color_dir "$idle")/current"
   [ -e "$link" ] || die "idle color $idle has no linked release; nothing to roll back to"
 
-  activate_color "$idle" "$active"
+  activate_color "$idle" "$active" || exit 1
 }
 
 cmd_prune() {
@@ -397,14 +499,33 @@ cmd_status() {
 # Invoked only as root, as the ExecStart of stackbase-app-boot.service:
 # starts whichever color active-color names and recreates app.sock, since
 # /run is tmpfs and doesn't survive a reboot. Absent state file -> no-op.
+# Takes the deploy lock first (always uncontended at boot -- flock is an
+# in-kernel lock on an open fd, so it can never survive a reboot even if
+# something crashed mid-deploy) so it can't race a deploy triggered in
+# the same window, and so resolve_pending_color's own writes are safe.
 cmd_boot() {
+  acquire_lock
+  resolve_pending_color
+
   local active
   active=$(read_active)
   if [ "$active" = none ]; then
     echo "i no active-color set; nothing to start at boot"
     exit 0
   fi
+
+  local link
+  link="$(color_dir "$active")/current"
+  if [ ! -e "$link" ]; then
+    die "active color $active has no linked release at $link -- state file and release directory are out of sync; redeploy to recover"
+  fi
+
   systemctl start "${PROJECT}@${active}.service"
+  if ! wait_healthy "$active"; then
+    echo "✗ $active failed the health check ($STACK_HEALTH_PATH) at boot; leaving traffic unrouted" >&2
+    exit 1
+  fi
+
   atomic_symlink "app-${active}.sock" "$SOCK_LINK"
   echo "✓ $active started at boot; traffic restored"
 }
