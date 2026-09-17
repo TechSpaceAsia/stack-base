@@ -94,7 +94,7 @@ pkgs.testers.runNixOSTest {
           "${nodes.proxy.networking.primaryIPAddress}/32"
         ];
 
-        environment.systemPackages = [ pkgs.python3 pkgs.util-linux ];
+        environment.systemPackages = [ pkgs.python3 pkgs.util-linux pkgs.e2fsprogs ];
 
         environment.etc."stackbase-test/fake-app.py".text = fakeApp;
 
@@ -131,6 +131,11 @@ pkgs.testers.runNixOSTest {
               f"/etc/stackbase-test/fake-app.py > /tmp/{version}-bin && "
               f"install -D -m0755 /tmp/{version}-bin /opt/${project}/releases/{version}/${project}"
           )
+
+      def parse_colors(s):
+          "Parse 'active=X idle=Y' into (active, idle)."
+          parts = dict(kv.split("=", 1) for kv in s.strip().split())
+          return parts["active"], parts["idle"]
 
       def make_tarball(version, health_code=200, setuid_binary=False, extra_world_writable_file=None):
           "Build a flat tarball (binary at the archive root) for the --tarball deploy path; returns its sha256."
@@ -415,5 +420,141 @@ pkgs.testers.runNixOSTest {
           # explicitly here).
           node.succeed("cat /var/lib/stackbase/app.env")
           assert node.succeed("stack-deploy colors").strip().startswith("active=")
+
+      with subtest("a tarball with an absolute-path member is rejected, nothing left in releases/ (N1a)"):
+          # `tar -P` disables GNU tar's default leading-slash stripping,
+          # so the member is stored (and listed) with its leading '/'
+          # intact. Content is a few bytes -- small enough to trigger the
+          # verbose listing's right-justified size-column padding that
+          # broke the old name-recovery logic.
+          node.succeed(
+              "rm -rf /tmp/abspkg && mkdir -p /tmp/abspkg && "
+              "echo hi > /tmp/abspkg/evil.txt && "
+              "tar -P -czf /tmp/v1.20.0.tar.gz /tmp/abspkg/evil.txt"
+          )
+          sha = node.succeed("sha256sum /tmp/v1.20.0.tar.gz | cut -d' ' -f1").strip()
+          status, out = node.execute(
+              f"stack-deploy deploy v1.20.0 --tarball /tmp/v1.20.0.tar.gz --sha256 {sha} 2>&1"
+          )
+          assert status == 1, f"expected exit 1 for an absolute-path member, got status={status}, output={out!r}"
+          node.fail("test -e /opt/${project}/releases/v1.20.0")
+
+      with subtest("a tarball with a '..' path-component member is rejected, nothing left in releases/ (N1b)"):
+          # --transform renames the stored member to include a '..'
+          # component; GNU tar applies no safety check at creation time.
+          # Content is again a few bytes, for the same padding reason.
+          node.succeed(
+              "rm -rf /tmp/dotpkg && mkdir -p /tmp/dotpkg && "
+              "echo hi > /tmp/dotpkg/evil.txt && "
+              "tar -czf /tmp/v1.21.0.tar.gz --transform 's,^evil.txt,../evil.txt,' -C /tmp/dotpkg evil.txt"
+          )
+          sha = node.succeed("sha256sum /tmp/v1.21.0.tar.gz | cut -d' ' -f1").strip()
+          status, out = node.execute(
+              f"stack-deploy deploy v1.21.0 --tarball /tmp/v1.21.0.tar.gz --sha256 {sha} 2>&1"
+          )
+          assert status == 1, f"expected exit 1 for a '..' member, got status={status}, output={out!r}"
+          node.fail("test -e /opt/${project}/releases/v1.21.0")
+
+      with subtest("a release with tiny files and a spaced file name deploys fine (N1c)"):
+          # Regression guard for the fix itself: small files (well under
+          # the ~1000-byte padding threshold) and a name containing
+          # spaces must NOT be false-rejected by the new name recovery.
+          node.succeed(
+              "rm -rf /tmp/spacepkg && mkdir -p /tmp/spacepkg && "
+              "sed -e 's/__VERSION__/v1.22.0/' -e 's/__HEALTH_CODE__/200/' "
+              "/etc/stackbase-test/fake-app.py > '/tmp/spacepkg/${project}' && "
+              "chmod +x '/tmp/spacepkg/${project}' && "
+              "echo hi > '/tmp/spacepkg/read me.txt' && "
+              "tar -czf /tmp/v1.22.0.tar.gz -C /tmp/spacepkg '${project}' 'read me.txt'"
+          )
+          sha = node.succeed("sha256sum /tmp/v1.22.0.tar.gz | cut -d' ' -f1").strip()
+          node.succeed(f"${fastHealth} stack-deploy deploy v1.22.0 --tarball /tmp/v1.22.0.tar.gz --sha256 {sha}")
+          node.succeed("test -e '/opt/${project}/releases/v1.22.0/read me.txt'")
+
+      with subtest("pre-flip failure (idle unit cannot start, not the health check) leaves state untouched and restores the idle link (N2-A)"):
+          active_color, idle_color = parse_colors(node.succeed("stack-deploy colors").strip())
+          idle_link = "/opt/${project}/" + idle_color + "/current"
+          prev_target = node.succeed(f"readlink {idle_link}").strip()
+          active_before = node.succeed("cat /var/lib/stackbase/active-color").strip()
+          sock_before = node.succeed("readlink /run/${project}/app.sock").strip()
+
+          # Release dir exists, but its binary is present-yet-not-executable
+          # -- systemd's ExecStart fails outright (permission denied)
+          # before the health check is ever reached.
+          node.succeed(
+              "rm -rf /opt/${project}/releases/v1.30.0 && "
+              "install -D -m0644 /dev/null /opt/${project}/releases/v1.30.0/${project}"
+          )
+
+          status, out = node.execute("${brokenHealth} stack-deploy deploy v1.30.0 2>&1")
+          assert status == 1, f"expected exit 1, got status={status}, output={out!r}"
+          assert "bookkeeping is incomplete" not in out, (
+              f"a pre-flip failure must not print the post-flip loud message: {out!r}"
+          )
+
+          assert node.succeed(f"readlink {idle_link}").strip() == prev_target, (
+              "idle color's current link must be restored on a pre-flip failure"
+          )
+          active_color_after = node.succeed("cat /var/lib/stackbase/active-color").strip()
+          assert active_color_after == active_before, f"active-color must be untouched, expected {active_before!r} got {active_color_after!r}"
+          sock_after = node.succeed("readlink /run/${project}/app.sock").strip()
+          assert sock_after == sock_before, f"app.sock must be untouched, expected {sock_before!r} got {sock_after!r}"
+          node.succeed(f"systemctl is-active --quiet ${project}@{active_color}.service")
+
+      with subtest("post-flip failure (active-color unwritable) leaves traffic on the new color; a later boot converges (N2-B)"):
+          active_color, idle_color = parse_colors(node.succeed("stack-deploy colors").strip())
+
+          node.succeed("chattr +i /var/lib/stackbase/active-color")
+          try:
+              status, out = node.execute("${fastHealth} stack-deploy rollback 2>&1")
+              assert status == 1, f"expected exit 1, got status={status}, output={out!r}"
+              assert "bookkeeping is incomplete" in out, f"expected the loud post-flip message, got: {out!r}"
+
+              assert node.succeed("readlink /run/${project}/app.sock").strip() == f"app-{idle_color}.sock", (
+                  "traffic must already be on the new color despite the failed active-color write"
+              )
+              node.succeed(f"systemctl is-active --quiet ${project}@{idle_color}.service")
+              node.succeed("test -e /var/lib/stackbase/pending-color")
+              assert node.succeed("cat /var/lib/stackbase/active-color").strip() == active_color, (
+                  "active-color must still read the stale value -- the write never landed"
+              )
+          finally:
+              node.succeed("chattr -i /var/lib/stackbase/active-color")
+
+          node.succeed("stack-deploy boot")
+          active_color_converged = node.succeed("cat /var/lib/stackbase/active-color").strip()
+          assert active_color_converged == idle_color, f"expected active-color to converge to {idle_color!r}, got {active_color_converged!r}"
+          node.fail("test -e /var/lib/stackbase/pending-color")
+          colors_converged = node.succeed("stack-deploy colors").strip()
+          assert colors_converged == f"active={idle_color} idle={active_color}", (
+              f"expected active={idle_color} idle={active_color}, got {colors_converged!r}"
+          )
+
+      with subtest("boot: pending-color whose release binary is missing falls back to active-color, which still comes up (N3)"):
+          active_color, idle_color = parse_colors(node.succeed("stack-deploy colors").strip())
+          idle_target = node.succeed("readlink -f /opt/${project}/" + idle_color + "/current").strip()
+          # The idle color was left running by the previous (N2-B) subtest
+          # -- a post-flip failure deliberately skips drain-scheduling, so
+          # nothing ever stopped it. `systemctl start` on an
+          # already-active unit is a no-op that would silently pass this
+          # test for the wrong reason (the OLD process, still holding its
+          # unlinked binary open, would keep answering health checks even
+          # after we move the file). Stop it first so resolve_pending_color
+          # has to genuinely fork+exec the missing binary.
+          node.succeed(f"systemctl stop ${project}@{idle_color}.service")
+          node.succeed(f"mv {idle_target}/${project} /tmp/n3-binary-backup")
+          node.succeed(f"echo {idle_color} > /var/lib/stackbase/pending-color")
+
+          status, out = node.execute("${brokenHealth} stack-deploy boot 2>&1")
+          assert status == 0, f"expected boot to still bring the active color up, got status={status}, output={out!r}"
+
+          colors_after = node.succeed("stack-deploy colors").strip()
+          assert colors_after == f"active={active_color} idle={idle_color}", (
+              f"expected active={active_color} idle={idle_color}, got {colors_after!r}; boot output was {out!r}"
+          )
+          node.fail("test -e /var/lib/stackbase/pending-color")
+          node.succeed(f"systemctl is-active --quiet ${project}@{active_color}.service")
+
+          node.succeed(f"mv /tmp/n3-binary-backup {idle_target}/${project}")
     '';
 }

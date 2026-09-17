@@ -10,6 +10,15 @@
 #
 # Packaged via pkgs.writeShellApplication, which already prepends
 # `set -euo pipefail` and runs shellcheck at build time.
+#
+# errexit gotcha: bash disables `set -e` for the ENTIRE body of a shell
+# function for as long as that function call is itself the thing being
+# tested by `if`/`!`/`&&`/`||` (e.g. `if ! some_func; then` or
+# `some_func || exit 1`) -- not just for the top-level call, the whole
+# dynamic extent of everything that function goes on to run. Any function
+# invoked that way (activate_color is the main one) must explicitly check
+# every state-mutating step itself (`if ! cmd; then ...; fi`) rather than
+# relying on `set -e` to abort on failure, because it won't.
 
 # shellcheck source=/dev/null
 # (the real path only exists on a stackbase node; nothing to lint here)
@@ -147,12 +156,16 @@ acquire_lock() {
 next_generation() {
   local cur next
   if [ -f "$GENERATION_FILE" ]; then
-    cur=$(cat "$GENERATION_FILE")
+    cur=$(cat "$GENERATION_FILE") || cur=0
   else
     cur=0
   fi
   next=$((cur + 1))
-  atomic_write "$GENERATION_FILE" "$next"
+  # Explicit check, not just "last statement's status": without this, a
+  # failed atomic_write here would still let `echo "$next"` (always
+  # successful) be the function's last command, so `$(next_generation)`
+  # would report success even though the counter was never persisted.
+  atomic_write "$GENERATION_FILE" "$next" || return 1
   echo "$next"
 }
 
@@ -182,22 +195,41 @@ wait_healthy() {
 # before this call (or "none" on the very first deploy, when there is
 # nothing to drain).
 #
-# Returns non-zero on a failed health check instead of exiting directly,
-# so `cmd_deploy` can restore the idle color's `current` link to whatever
-# it pointed at before this attempt (see cmd_deploy) -- a bare `exit 1`
-# here would skip that restoration and leave a later `rollback` targeting
-# the broken candidate that just failed.
+# Called as `if ! activate_color ...; then` / `activate_color ... ||
+# exit 1` by both callers -- per the top-of-file errexit note, that means
+# `set -e` does NOT apply anywhere in this function's body. Every
+# state-mutating step below is therefore checked explicitly, and the
+# function distinguishes two very different failure classes via its
+# return code:
+#
+#   return 1 (pre-flip): failed before the app.sock flip (start, health
+#   check, or the pending-color intent write). Nothing user-visible has
+#   changed -- cmd_deploy restores the idle color's previous `current`
+#   link; cmd_rollback has nothing to restore either way.
+#
+#   return 2 (post-flip): failed at or after the app.sock flip. Traffic
+#   has ALREADY moved to $idle -- callers must NOT restore any link and
+#   must NOT stop $idle. pending-color is left in place so the next
+#   deploy/rollback/boot finishes the bookkeeping via
+#   resolve_pending_color.
+#
+# A failure only to SCHEDULE the drain-stop (the last block) is a
+# warning, not either failure class: the old color simply keeps running
+# until the next deploy stops it explicitly.
 activate_color() {
   local idle="$1" prev_active="$2" version
 
   version=$(linked_version "$idle")
 
   echo "→ starting $idle on $version"
-  run_systemctl restart "${PROJECT}@${idle}.service"
+  if ! run_systemctl restart "${PROJECT}@${idle}.service"; then
+    echo "✗ failed to start $idle (${PROJECT}@${idle}.service)" >&2
+    return 1
+  fi
 
   if ! wait_healthy "$idle"; then
     echo "✗ $idle failed the health check ($STACK_HEALTH_PATH) after $STACK_DEPLOY_HEALTH_TRIES tries" >&2
-    run_systemctl stop "${PROJECT}@${idle}.service" || true
+    run_systemctl stop "${PROJECT}@${idle}.service" || echo "i also failed to stop $idle after its failed health check; it may still be running" >&2
     return 1
   fi
   echo "✓ $idle is healthy"
@@ -206,22 +238,46 @@ activate_color() {
   # the state file is written. Closes the crash window between the two --
   # see resolve_pending_color, called from cmd_boot and from the top of
   # cmd_deploy/cmd_rollback (in case a previous run crashed mid-swap).
-  atomic_write "$STATE_DIR/pending-color" "$idle"
+  # Still pre-flip: nothing user-visible has changed yet.
+  if ! atomic_write "$STATE_DIR/pending-color" "$idle"; then
+    echo "✗ failed to record the pending-color intent; aborting before the traffic flip" >&2
+    run_systemctl stop "${PROJECT}@${idle}.service" || echo "i also failed to stop $idle while aborting" >&2
+    return 1
+  fi
 
-  atomic_symlink "app-${idle}.sock" "$SOCK_LINK"
+  # ---- Point of no return -------------------------------------------
+  # Everything from here on mutates live routing state or bookkeeping
+  # about it. A failure past this line means traffic may already be on
+  # $idle: never undo the flip, never stop $idle.
+  if ! atomic_symlink "app-${idle}.sock" "$SOCK_LINK"; then
+    echo "✗ FAILED to flip app.sock to $idle. $idle is healthy and running -- do NOT stop it. Traffic routing is now inconsistent with recorded state; re-run 'stack-deploy deploy'/'rollback', or reboot -- resolve_pending_color will finish the flip automatically." >&2
+    return 2
+  fi
   echo "✓ traffic switched to $idle"
 
   # Constraint: the state file is written atomically AFTER the socket
   # symlink flip succeeds, never before.
-  atomic_write "$ACTIVE_COLOR_FILE" "$idle"
-  rm -f "$STATE_DIR/pending-color"
+  if ! atomic_write "$ACTIVE_COLOR_FILE" "$idle"; then
+    echo "✗ traffic is on $idle now, but active-color could not be updated -- bookkeeping is incomplete. Nothing to do by hand: pending-color is still recorded, and the next 'stack-deploy deploy'/'rollback'/boot will finish this automatically via resolve_pending_color." >&2
+    return 2
+  fi
+
+  if ! rm -f "$STATE_DIR/pending-color"; then
+    echo "✗ traffic is on $idle and active-color is correct, but the pending-color intent file could not be removed -- bookkeeping is incomplete. The next 'stack-deploy deploy'/'rollback'/boot will finish this automatically via resolve_pending_color." >&2
+    return 2
+  fi
 
   if [ "$prev_active" != none ] && [ "$prev_active" != "$idle" ]; then
     local gen
-    gen=$(next_generation)
-    atomic_write "$STATE_DIR/drain-pending-${prev_active}" "$gen"
-    echo "→ $prev_active will stop in ${STACK_DRAIN_SECONDS}s"
-    run_systemctl restart "stackbase-drain@${prev_active}.timer"
+    if ! gen=$(next_generation); then
+      echo "i failed to schedule $prev_active's drain-stop (generation counter write failed); $prev_active will keep running until the next deploy stops it explicitly" >&2
+    elif ! atomic_write "$STATE_DIR/drain-pending-${prev_active}" "$gen"; then
+      echo "i failed to schedule $prev_active's drain-stop (pending marker write failed); $prev_active will keep running until the next deploy stops it explicitly" >&2
+    elif ! run_systemctl restart "stackbase-drain@${prev_active}.timer"; then
+      echo "i failed to schedule $prev_active's drain-stop (timer arm failed); $prev_active will keep running until the next deploy stops it explicitly" >&2
+    else
+      echo "→ $prev_active will stop in ${STACK_DRAIN_SECONDS}s"
+    fi
   fi
 
   echo "i migrations run at app start: keep them additive (expand -> migrate -> contract in a later release)"
@@ -241,8 +297,16 @@ resolve_pending_color() {
 
   if [ -e "$link" ]; then
     echo "i resuming a swap to $pcolor that was interrupted before its state was persisted"
-    systemctl start "${PROJECT}@${pcolor}.service"
-    if wait_healthy "$pcolor"; then
+    # `systemctl start` used to be a bare statement here: on failure (e.g.
+    # $pcolor's release binary is missing or not executable), it would
+    # abort the whole invocation via errexit -- resolve_pending_color is
+    # always called plainly (not in a condition context), so `set -e` is
+    # in effect for it -- leaving pending-color on disk and never even
+    # reaching the active-color fallback below. Folding it into the same
+    # condition as wait_healthy treats a failed start exactly like a
+    # failed health check: message, discard the intent, fall back to
+    # whatever active-color still says.
+    if systemctl start "${PROJECT}@${pcolor}.service" && wait_healthy "$pcolor"; then
       atomic_symlink "app-${pcolor}.sock" "$SOCK_LINK"
       atomic_write "$ACTIVE_COLOR_FILE" "$pcolor"
       rm -f "$STATE_DIR/pending-color"
@@ -268,19 +332,42 @@ deploy_unpack_tarball() {
     die "release $version already exists at $release_dir; pass --force to overwrite"
   fi
 
+  # Open the tarball exactly once, on a dedicated fd, and run every
+  # subsequent operation (hash, both listings, extraction) against
+  # /proc/self/fd/$fd rather than $tarball itself. Each open() of that
+  # magic symlink starts a fresh read at offset 0 of the SAME underlying
+  # inode, so "the archive we hashed and validated" and "the archive we
+  # extract" are provably identical even if something swapped the path
+  # under us between steps (TOCTOU). Closed explicitly once extraction is
+  # done; a die() anywhere below exits the whole process, which closes it
+  # too.
+  local fd
+  exec {fd}<"$tarball" || die "cannot open tarball: $tarball"
+
   local actual_sha
-  actual_sha=$(sha256sum "$tarball" | awk '{print $1}')
+  actual_sha=$(sha256sum "/proc/self/fd/$fd" | awk '{print $1}')
   if [ "$actual_sha" != "$sha256" ]; then
     die "sha256 mismatch for $tarball: expected $sha256, got $actual_sha"
   fi
 
-  # Verbose listing (not `-tzf`): the type character in column 1 is the
-  # only reliable way to reject symlinks and hardlinks, not just their
-  # names. A name-only check (`tar -tzf`) lets a symlink member such as
-  # `evil -> /etc` followed by `evil/passwd` sail through path validation
-  # and then get planted on disk as a real symlink outside the release
-  # tree the moment it's extracted.
-  local line type_char name
+  # Member NAMES come ONLY from the plain listing (`tar -tzf`), one per
+  # line, never parsed out of the verbose listing. Verbose columns are
+  # right-justified, so a small member's size field is padded with
+  # leading spaces that survive naive stripping and land in the recovered
+  # name (e.g. an absolute path arrives as "  /abs/path"), silently
+  # defeating the checks below for any member under ~1000 bytes -- this
+  # is exactly what let an absolute-path/`..` member slip past the old
+  # check. The verbose listing (`tar -tvzf`) is used ONLY for the
+  # member's type character in column 1, which doesn't suffer from that
+  # problem.
+  local names_count types_count
+  names_count=$(tar -tzf "/proc/self/fd/$fd" | wc -l)
+  types_count=$(tar -tvzf "/proc/self/fd/$fd" | wc -l)
+  if [ "$names_count" -ne "$types_count" ]; then
+    die "tarball's plain and verbose listings disagree on member count ($names_count vs $types_count); refusing"
+  fi
+
+  local line type_char
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     type_char="${line:0:1}"
@@ -288,19 +375,19 @@ deploy_unpack_tarball() {
       -|d) : ;;
       *) die "tarball contains a member that is not a regular file or directory (type '$type_char'): $line" ;;
     esac
+  done < <(tar -tvzf "/proc/self/fd/$fd")
 
-    # Strip the fixed `perm owner/group size date time` prefix to recover
-    # the member's own path, which may itself contain spaces; re-splitting
-    # $1 after each sub() is what makes this robust to that.
-    name=$(printf '%s\n' "$line" | awk '{ for (i = 1; i <= 5; i++) sub($1 FS, ""); print }')
-
+  local name
+  while IFS= read -r name; do
+    [ -n "$name" ] || die "tarball contains a member with an empty name"
     case "$name" in
       /*) die "tarball contains an absolute path member: $name" ;;
+      *\\*) die "tarball contains a member name with a backslash escape (likely an escaped control byte such as a newline): $name" ;;
     esac
     if printf '%s\n' "$name" | tr '/' '\n' | grep -qx '\.\.'; then
       die "tarball contains a '..' path member: $name"
     fi
-  done < <(tar -tvzf "$tarball")
+  done < <(tar -tzf "/proc/self/fd/$fd")
 
   local tmp_dir
   tmp_dir=$(mktemp -d "$RELEASES_DIR/.tmp-${version}-XXXXXX")
@@ -311,7 +398,9 @@ deploy_unpack_tarball() {
   # defense. --no-overwrite-dir: never let extraction change the mode of
   # a directory that already exists at the destination (moot here since
   # tmp_dir is always fresh, but cheap insurance).
-  tar -xzf "$tarball" -C "$tmp_dir" --no-same-owner --no-same-permissions --no-overwrite-dir
+  tar -xzf "/proc/self/fd/$fd" -C "$tmp_dir" --no-same-owner --no-same-permissions --no-overwrite-dir
+
+  exec {fd}<&-
 
   # Second, unconditional line of defense: normalise every mode
   # explicitly rather than trust the extraction flags above. A plain
@@ -395,7 +484,23 @@ cmd_deploy() {
 
   atomic_symlink "../releases/$version" "$idle_link"
 
-  if ! activate_color "$idle" "$active"; then
+  # activate_color returns 1 (pre-flip: nothing changed) or 2 (post-flip:
+  # traffic already moved) -- see its own comment. Capturing $? via `||`
+  # rather than `if ! activate_color; then` for the same reason: either
+  # form runs activate_color with errexit disabled, but its own internals
+  # are now self-guarded either way, so this is just about getting the
+  # exact return code out.
+  local rc=0
+  activate_color "$idle" "$active" || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    # Post-flip: activate_color already printed the loud diagnostic.
+    # Do NOT touch idle_link and do NOT stop $idle -- it's serving live
+    # traffic.
+    exit 1
+  elif [ "$rc" -ne 0 ]; then
+    # Pre-flip (rc == 1): nothing user-visible changed -- restore the
+    # idle color's previous `current` target so a later `rollback` can't
+    # target the broken candidate we just tried.
     if [ -n "$prev_target" ]; then
       atomic_symlink "$prev_target" "$idle_link"
       echo "i $idle/current restored to its previous release" >&2
@@ -418,6 +523,11 @@ cmd_rollback() {
   link="$(color_dir "$idle")/current"
   [ -e "$link" ] || die "idle color $idle has no linked release; nothing to roll back to"
 
+  # Unlike cmd_deploy, rollback never repoints $link -- it targets
+  # whatever the idle color's `current` already points at -- so there is
+  # nothing to restore on either activate_color failure class (pre- or
+  # post-flip); a bare exit 1 is correct for both. activate_color itself
+  # already printed the right diagnostic for whichever class occurred.
   activate_color "$idle" "$active" || exit 1
 }
 
