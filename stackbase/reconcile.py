@@ -91,6 +91,7 @@ class Action(Enum):
     ENSURE_ORIGIN_CERT = "ensure_origin_cert"
     PUSH_CONFIG = "push_config"
     REBUILD = "rebuild"
+    ENSURE_APP_ENV = "ensure_app_env"
     UPSERT_DNS = "upsert_dns"
 
 
@@ -108,6 +109,7 @@ _DOING: dict[Action, str] = {
     Action.ENSURE_ORIGIN_CERT: "creating the Cloudflare origin certificate",
     Action.PUSH_CONFIG: "uploading the configuration and the origin certificate",
     Action.REBUILD: "rebuilding NixOS (this can take a few minutes)",
+    Action.ENSURE_APP_ENV: "updating the application's environment file",
     Action.UPSERT_DNS: "pointing the domain at the server in Cloudflare",
 }
 
@@ -170,6 +172,14 @@ class Local:
     # `Local` without naming this field keeps today's (token-present)
     # behaviour byte-for-byte.
     has_cloudflare_token: bool = True
+    # sha256 of the validated, normalised "app_env" secret, or None when
+    # secrets.age has no "app_env" key at all. `plan()` compares this against
+    # each node's recorded `NodeState.app_env_sha` -- see `_needs_app_env`.
+    # Computed here (not inside `plan()`) so `plan()` stays pure and never
+    # reads `secrets` itself; validated here too, so a malformed app_env
+    # fails fast (one plain-English line, nothing echoed) on every `up`
+    # invocation, `--plan` included, rather than surfacing later at push time.
+    app_env_sha: str | None = None
 
 
 def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str | None = None) -> Local:
@@ -178,13 +188,91 @@ def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str 
     `desired_rev` is the fingerprint a node records once it has successfully
     rebuilt -- see `compute_rev`.
     """
+    app_env_raw = secrets.get("app_env")
     return Local(
         desired_rev=compute_rev(infra_dir, stackbase_src=stackbase_src),
         has_origin_cert=bool(secrets.get("origin_cert")) and bool(secrets.get("origin_key")),
         pinned_hosts=_pinned_hosts(infra_dir / "known_hosts"),
         captured_nodes=_captured_nodes(infra_dir / "nodes"),
         has_cloudflare_token=bool(secrets.get("cloudflare_token")),
+        app_env_sha=app_env_digest(validate_app_env(app_env_raw)) if app_env_raw else None,
     )
+
+
+_APP_ENV_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# Any individual app_env VALUE shorter than this is not masked from output --
+# short strings (a port number, "true", a single digit) are too likely to
+# appear incidentally in unrelated text, and masking them would make normal
+# output unreadable for no real protection.
+_APP_ENV_MIN_REDACT_LEN = 8
+
+
+def validate_app_env(raw: str) -> str:
+    """Validate the "app_env" secret and normalise it to one trailing newline.
+
+    Every non-blank, non-comment ("#") line must look like `NAME=value`
+    (`NAME` starting with a letter or underscore). Raises `StackError` on any
+    violation -- the message names the problem, never the offending line or
+    any part of its content, per the global "secrets are never echoed" rule.
+    """
+    if "\x00" in raw:
+        raise StackError(
+            "infra/secrets.age's 'app_env' contains a NUL byte",
+            "app_env must be plain KEY=value lines, one per line -- fix it and re-encrypt secrets.age",
+        )
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if not _APP_ENV_LINE_RE.match(stripped):
+            raise StackError(
+                "infra/secrets.age's 'app_env' has a line that is not KEY=value",
+                "every non-blank, non-comment line must look like NAME=value (NAME starting with "
+                "a letter or underscore) -- fix it and re-encrypt secrets.age",
+            )
+    return raw.rstrip("\n") + "\n"
+
+
+def app_env_digest(normalized_app_env: str) -> str:
+    """sha256 hex digest of an already-`validate_app_env`-normalised string."""
+    return hashlib.sha256(normalized_app_env.encode("utf-8")).hexdigest()
+
+
+def _app_env_secret_values(raw: str) -> list[str]:
+    """Every individual VALUE inside "app_env" worth masking from output.
+
+    Parsed leniently (never raises): this feeds `redact()`, not validation,
+    and a still-malformed app_env deserves whatever protection can be
+    salvaged from it, not an exception on top of the one `validate_app_env`
+    will already raise elsewhere.
+    """
+    values = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        value = stripped.split("=", 1)[1]
+        if len(value) >= _APP_ENV_MIN_REDACT_LEN:
+            values.append(value)
+    return values
+
+
+def redaction_values(secrets: dict[str, str]) -> list[str]:
+    """Every string that must never appear in printed output.
+
+    Every top-level secret value (Hostinger/Cloudflare tokens, the origin
+    certificate key, the whole "app_env" blob, ...) plus -- because app_env
+    is itself a bundle of KEY=value secrets -- each individual value inside
+    it (see `_app_env_secret_values`). `Context.secret_values` (used by
+    every `ctx.emit()` call during `apply()`) is built from this; the CLI's
+    own top-level error/traceback/--plan printing in `stackbase/__main__.py`
+    currently masks only via a plain `list(secrets.values())` and would need
+    to switch to this function to get the same per-value app_env coverage.
+    """
+    values = [value for value in secrets.values() if value]
+    values.extend(_app_env_secret_values(secrets.get("app_env") or ""))
+    return values
 
 
 def compute_rev(infra_dir: Path, *, stackbase_src: str | None = None) -> str:
@@ -676,6 +764,12 @@ def plan(cfg: StackConfig, state: StackState, observed: Observed) -> list[Step]:
         if _needs_deploy(state, observed, name, cert_pending):
             steps.append(Step(Action.PUSH_CONFIG, name))
             steps.append(Step(Action.REBUILD, name))
+        # After REBUILD for this node (when one was just planned): the
+        # <project> group and the app@<color> units only exist once the node
+        # has rebuilt at least once. Absent "app_env" secret (app_env_sha is
+        # None) plans nothing and removes nothing -- see `_needs_app_env`.
+        if _needs_app_env(state, observed, name):
+            steps.append(Step(Action.ENSURE_APP_ENV, name))
 
     if has_cloudflare and not _dns_converged(state, observed):
         steps.append(Step(Action.UPSERT_DNS, primary_node(cfg)))
@@ -766,6 +860,18 @@ def _needs_deploy(state: StackState, observed: Observed, name: str, cert_pending
     return cert_pending or node_state.applied_rev != observed.local.desired_rev
 
 
+def _needs_app_env(state: StackState, observed: Observed, name: str) -> bool:
+    """True when secrets.age has an "app_env" whose sha differs from what
+    this node last had pushed. `app_env_sha is None` means no "app_env" key
+    at all -- deliberately not a step, and deliberately not a removal (see
+    `Local.app_env_sha`'s docstring and the README's "app_env" section)."""
+    desired = observed.local.app_env_sha
+    if desired is None:
+        return False
+    node_state = state.nodes.get(name) or NodeState()
+    return node_state.app_env_sha != desired
+
+
 def _dns_converged(state: StackState, observed: Observed) -> bool:
     return bool(
         state.cloudflare.zone_id
@@ -812,7 +918,7 @@ class Context:
 
     @property
     def secret_values(self) -> list[str]:
-        return [value for value in self.secrets.values() if value]
+        return redaction_values(self.secrets)
 
     def emit(self, line: str) -> None:
         """Print one line, with every known secret masked out first."""

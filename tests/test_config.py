@@ -247,6 +247,7 @@ class StateRoundTripTests(unittest.TestCase):
                     host_key_pinned=True,
                     hardware_captured=True,
                     applied_rev="abc123",
+                    app_env_sha="deadbeef" * 8,
                 ),
             },
             cloudflare=CloudflareState(zone_id="zone-1", record_id="record-1"),
@@ -313,6 +314,20 @@ class StateRoundTripTests(unittest.TestCase):
 
             with self.assertRaises(StackError):
                 load_state(infra_dir)
+
+    def test_node_state_app_env_sha_defaults_to_none_for_older_state_files(self) -> None:
+        """A stack.state.json written before this field existed has no
+        'app_env_sha' key -- it must load as None, not error, and not be
+        confused with "converged" (plan()'s `_needs_app_env` treats None the
+        same as "never pushed")."""
+        with TempInfraDir() as infra_dir:
+            (infra_dir / "stack.state.json").write_text(
+                json.dumps({"version": 1, "nodes": {"a": {"vps_id": 1}}}), encoding="utf-8"
+            )
+
+            state = load_state(infra_dir)
+
+            self.assertIsNone(state.nodes["a"].app_env_sha)
 
     def test_load_state_rejects_unknown_node_key(self) -> None:
         with TempInfraDir() as infra_dir:

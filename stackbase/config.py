@@ -284,6 +284,9 @@ class NodeState:
     host_key_pinned: bool = False
     hardware_captured: bool = False
     applied_rev: str | None = None
+    # sha256 of the app_env content (from secrets.age) most recently pushed
+    # to this node's /var/lib/stackbase/app.env. None until the first push.
+    app_env_sha: str | None = None
 
 
 @dataclass

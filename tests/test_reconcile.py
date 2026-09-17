@@ -337,6 +337,73 @@ class RenderDescriptionTests(unittest.TestCase):
         self.assertEqual(render_description(step, has_cloudflare_token=False), step.description)
 
 
+class AppEnvPlanTests(unittest.TestCase):
+    """Task 5: ENSURE_APP_ENV is planned per node from `Local.app_env_sha`
+    alone -- `plan()` never reads `secrets` itself (see `local_facts`)."""
+
+    def test_absent_app_env_plans_no_step(self) -> None:
+        actions = [s.action for s in plan(_config(), _converged_state(), _converged_observed())]
+
+        self.assertNotIn(Action.ENSURE_APP_ENV, actions)
+
+    def test_unchanged_sha_plans_no_step(self) -> None:
+        state = _converged_state()
+        state.nodes["a"].app_env_sha = "samesha"
+        observed = replace(_converged_observed(), local=replace(_converged_observed().local, app_env_sha="samesha"))
+
+        actions = [s.action for s in plan(_config(), state, observed)]
+
+        self.assertNotIn(Action.ENSURE_APP_ENV, actions)
+
+    def test_changed_sha_with_nothing_else_to_do_plans_only_the_app_env_step(self) -> None:
+        observed = replace(_converged_observed(), local=replace(_converged_observed().local, app_env_sha="newsha"))
+
+        actions = [s.action for s in plan(_config(), _converged_state(), observed)]
+
+        self.assertEqual(actions, [Action.ENSURE_APP_ENV])
+
+    def test_new_node_with_no_app_env_secret_yet_plans_no_step_alongside_it(self) -> None:
+        state = _converged_state()
+        state.nodes["a"].app_env_sha = None
+
+        actions = [s.action for s in plan(_config(), state, _converged_observed())]
+
+        self.assertNotIn(Action.ENSURE_APP_ENV, actions)
+
+    def test_when_rebuild_is_also_needed_app_env_comes_after_it(self) -> None:
+        state = _converged_state(rev="old-rev")
+        local = replace(_converged_observed().local, app_env_sha="newsha")
+        observed = replace(_converged_observed(), local=local)
+
+        actions = [s.action for s in plan(_config(), state, observed)]
+
+        self.assertEqual(actions, [Action.PUSH_CONFIG, Action.REBUILD, Action.ENSURE_APP_ENV])
+
+    def test_app_env_comes_before_a_pending_dns_update(self) -> None:
+        observed = replace(
+            _converged_observed(),
+            record_matches=False,
+            local=replace(_converged_observed().local, app_env_sha="newsha"),
+        )
+
+        actions = [s.action for s in plan(_config(), _converged_state(), observed)]
+
+        self.assertEqual(actions, [Action.ENSURE_APP_ENV, Action.UPSERT_DNS])
+
+    def test_step_carries_no_content_so_plan_output_cannot_reveal_any(self) -> None:
+        """`--plan` must show the step without revealing anything about the
+        app_env content -- not even its length. `Step` structurally cannot
+        carry content (only `action`/`node`), so this is guaranteed, not just
+        conventional."""
+        from dataclasses import fields
+
+        self.assertEqual({f.name for f in fields(Step)}, {"action", "node"})
+
+        step = Step(Action.ENSURE_APP_ENV, "a")
+        self.assertEqual(step.description, "node a: updating the application's environment file")
+        self.assertEqual(render_description(step, has_cloudflare_token=True), step.description)
+
+
 class CloudflareOptionalPlanTests(unittest.TestCase):
     """Task 7b change 1: no Cloudflare token in secrets -> no cert, no DNS."""
 
@@ -1719,6 +1786,209 @@ class OriginCertOwnershipTests(unittest.TestCase):
                     self.assertNotIn("|| true", call["argv"][-1])
 
 
+class EnsureAppEnvTests(unittest.TestCase):
+    """Task 5: pushing infra/secrets.age's "app_env" to the node and
+    restarting the active color, over the ssh-stdin model `_push_origin_cert`
+    uses for the TLS key."""
+
+    _APP_ENV_RAW = "DATABASE_URL=postgres:///acme\nSESSION_SECRET=abcdefgh12345678\n"
+    _TMP_CMD = "set -eu; install -m 0640 -o root -g acme /dev/null /var/lib/stackbase/app.env.new"
+    _CAT_CMD = "set -eu; cat > /var/lib/stackbase/app.env.new"
+    _MV_CMD = "set -eu; mv -f /var/lib/stackbase/app.env.new /var/lib/stackbase/app.env"
+
+    def _ctx(
+        self,
+        infra_dir: Path,
+        *,
+        app_env: str | None = None,
+        runner: FakeRunner | None = None,
+        state: StackState | None = None,
+    ):
+        secrets = {"hostinger_token": "htok", "cloudflare_token": "ctok"}
+        if app_env is not None:
+            secrets["app_env"] = app_env
+        return _context(
+            infra_dir,
+            state=state
+            if state is not None
+            else StackState(nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)}),
+            secrets=secrets,
+            runner=runner or FakeRunner(),
+        )
+
+    def _success_runner(self, *, active_color: str | None = "blue") -> FakeRunner:
+        def handler(argv, kwargs):
+            if not argv or argv[0] != "ssh":
+                return None
+            cmd = argv[-1]
+            if cmd == "getent group acme":
+                return _cp(argv, returncode=0, stdout="acme:x:993:\n")
+            if cmd == self._TMP_CMD:
+                return _cp(argv, returncode=0)
+            if cmd == self._CAT_CMD:
+                return _cp(argv, returncode=0)
+            if cmd == self._MV_CMD:
+                return _cp(argv, returncode=0)
+            if cmd == "cat -- /var/lib/stackbase-deploy/active-color":
+                if active_color is None:
+                    return _cp(argv, returncode=1, stderr="No such file or directory\n")
+                return _cp(argv, returncode=0, stdout=f"{active_color}\n")
+            if cmd.startswith("systemctl try-restart"):
+                return _cp(argv, returncode=0)
+            return None
+
+        return FakeRunner(handler=handler)
+
+    def test_malformed_content_is_rejected_before_any_ssh_call_with_no_value_in_the_message(self) -> None:
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(infra_dir, app_env="totally not a key value line\n", runner=FakeRunner())
+
+            with self.assertRaises(StackError) as caught:
+                apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
+
+            self.assertEqual(ctx.runner.calls, [])
+            self.assertNotIn("totally not a key value line", str(caught.exception))
+
+    def test_a_nul_byte_is_rejected_before_any_ssh_call(self) -> None:
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(infra_dir, app_env="A=1\x00\n", runner=FakeRunner())
+
+            with self.assertRaises(StackError):
+                apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
+
+            self.assertEqual(ctx.runner.calls, [])
+
+    def test_missing_project_group_is_a_hard_failure_naming_the_rebuild_hint(self) -> None:
+        def handler(argv, kwargs):
+            if argv and argv[0] == "ssh" and argv[-1] == "getent group acme":
+                return _cp(argv, returncode=2, stderr="")
+            return None
+
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(infra_dir, app_env=self._APP_ENV_RAW, runner=FakeRunner(handler=handler))
+
+            with self.assertRaises(StackError) as caught:
+                apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
+
+            message = str(caught.exception)
+            self.assertIn("acme", message)
+            self.assertIn("REBUILD", message)
+            self.assertFalse(any(c["argv"][-1] == self._TMP_CMD for c in ctx.runner.calls))
+
+    def test_temp_file_gets_final_owner_and_mode_before_any_content_is_written(self) -> None:
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(infra_dir, app_env=self._APP_ENV_RAW, runner=self._success_runner())
+
+            apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
+
+            commands = [c["argv"][-1] for c in ctx.runner.calls if c["argv"][0] == "ssh"]
+            self.assertLess(commands.index(self._TMP_CMD), commands.index(self._CAT_CMD))
+            self.assertLess(commands.index(self._CAT_CMD), commands.index(self._MV_CMD))
+
+    def test_content_travels_only_via_stdin_never_argv_never_a_local_file(self) -> None:
+        with Infra() as infra_dir:
+            before = {p for p in infra_dir.rglob("*") if p.is_file()}
+            ctx, _ = self._ctx(infra_dir, app_env=self._APP_ENV_RAW, runner=self._success_runner())
+
+            apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
+
+            after = {p for p in infra_dir.rglob("*") if p.is_file()}
+            self.assertEqual({p.name for p in after - before}, {"stack.state.json"})
+            for path in after:
+                self.assertNotIn("SESSION_SECRET", path.read_text(encoding="utf-8", errors="replace"))
+
+            for call in ctx.runner.calls:
+                self.assertNotIn("abcdefgh12345678", " ".join(call["argv"]))
+
+            cat_call = next(c for c in ctx.runner.calls if c["argv"][-1] == self._CAT_CMD)
+            self.assertEqual(cat_call["kwargs"].get("input"), self._APP_ENV_RAW)
+
+    def test_successful_push_saves_the_content_digest(self) -> None:
+        with Infra() as infra_dir:
+            ctx, lines = self._ctx(infra_dir, app_env=self._APP_ENV_RAW, runner=self._success_runner())
+
+            apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
+
+            from stackbase.reconcile import app_env_digest, validate_app_env
+
+            expected = app_env_digest(validate_app_env(self._APP_ENV_RAW))
+            self.assertEqual(ctx.state.nodes["a"].app_env_sha, expected)
+            self.assertTrue(any("application environment updated" in line for line in lines))
+
+    def test_restarts_only_the_active_color(self) -> None:
+        with Infra() as infra_dir:
+            ctx, lines = self._ctx(
+                infra_dir, app_env=self._APP_ENV_RAW, runner=self._success_runner(active_color="green")
+            )
+
+            apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
+
+            restarts = [
+                c["argv"][-1]
+                for c in ctx.runner.calls
+                if c["argv"][0] == "ssh" and c["argv"][-1].startswith("systemctl")
+            ]
+            self.assertEqual(restarts, ["systemctl try-restart acme@green.service"])
+            self.assertTrue(any("green restarted" in line for line in lines))
+
+    def test_no_active_color_skips_the_restart_and_warns(self) -> None:
+        with Infra() as infra_dir:
+            ctx, lines = self._ctx(
+                infra_dir, app_env=self._APP_ENV_RAW, runner=self._success_runner(active_color=None)
+            )
+
+            apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
+
+            self.assertFalse(
+                any(c["argv"][-1].startswith("systemctl") for c in ctx.runner.calls if c["argv"][0] == "ssh")
+            )
+            self.assertIn(
+                "! no release deployed yet — the new environment applies from the first deploy", lines
+            )
+            self.assertTrue(any(line.endswith("application environment updated") for line in lines))
+
+    def test_a_garbage_active_color_value_is_rejected_and_never_reaches_a_command(self) -> None:
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(
+                infra_dir,
+                app_env=self._APP_ENV_RAW,
+                runner=self._success_runner(active_color="purple; rm -rf /"),
+            )
+
+            with self.assertRaises(StackError) as caught:
+                apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
+
+            message = str(caught.exception)
+            self.assertIn("blue", message)
+            self.assertIn("green", message)
+            self.assertFalse(
+                any(c["argv"][-1].startswith("systemctl") for c in ctx.runner.calls if c["argv"][0] == "ssh")
+            )
+
+    def test_sha_is_saved_only_after_success_so_a_failed_restart_retries_next_run(self) -> None:
+        with Infra() as infra_dir:
+            from stackbase.config import load_state, save_state
+
+            state = StackState(nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)})
+            save_state(infra_dir, state)  # seed the on-disk state a real run would already have
+            ctx, _ = self._ctx(
+                infra_dir,
+                app_env=self._APP_ENV_RAW,
+                runner=self._success_runner(active_color="garbage"),
+                state=state,
+            )
+
+            with self.assertRaises(StackError):
+                apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
+
+            # ctx.state was mutated in memory (the sha was set before the
+            # restart failed) -- but apply() never called save_state() for
+            # this step, so the on-disk copy must be untouched.
+            saved = load_state(infra_dir)
+            self.assertIsNone(saved.nodes["a"].app_env_sha)
+            self.assertIsNotNone(ctx.state.nodes["a"].app_env_sha)
+
+
 class SetupReinstallEndToEndTests(unittest.TestCase):
     """Task 7b change 2, end-to-end: a previously-pinned, previously-captured
     node whose VM is observed back in state 'initial' must re-pin and
@@ -1960,6 +2230,34 @@ class OutputTests(unittest.TestCase):
             "error: command failed: echo ***REDACTED*** — stderr said ***REDACTED***",
         )
 
+    def test_an_individual_app_env_value_is_redacted_alongside_the_whole_blob(self) -> None:
+        """Task 5: app_env is itself a bundle of KEY=value secrets, so each
+        individual value (>=8 chars) must be masked too -- not just the whole
+        blob (which `secrets.values()` already covered for free)."""
+        from stackbase.reconcile import redaction_values
+
+        secrets = {
+            "hostinger_token": "htok",
+            "app_env": "SESSION_SECRET=abcdefgh12345678\nSHORT=abc\n",
+        }
+
+        values = redaction_values(secrets)
+
+        self.assertIn("abcdefgh12345678", values)
+        self.assertNotIn("abc", values)  # too short (<8 chars) to redact on its own
+        self.assertIn(secrets["app_env"], values)  # the whole blob is still masked too
+
+    def test_ctx_emit_redacts_an_app_env_value(self) -> None:
+        with Infra() as infra_dir:
+            ctx, lines = _context(
+                infra_dir,
+                secrets={"hostinger_token": "htok", "app_env": "SESSION_SECRET=abcdefgh12345678\n"},
+            )
+
+            ctx.emit("leaked: abcdefgh12345678")
+
+            self.assertEqual(lines, ["leaked: ***REDACTED***"])
+
 
 class LocalFactsTests(unittest.TestCase):
     def test_has_cloudflare_token_true_only_for_a_non_empty_token(self) -> None:
@@ -2016,6 +2314,49 @@ class LocalFactsTests(unittest.TestCase):
             message = str(caught.exception)
             self.assertIn("flake.lock", message)
             self.assertIn("STACKBASE_SRC", message)
+
+    def test_app_env_sha_is_none_when_the_key_is_absent_or_empty(self) -> None:
+        with Infra() as infra_dir:
+            self.assertIsNone(local_facts(infra_dir, {}).app_env_sha)
+            self.assertIsNone(local_facts(infra_dir, {"app_env": ""}).app_env_sha)
+
+    def test_app_env_sha_is_stable_for_identical_content_and_changes_with_it(self) -> None:
+        with Infra() as infra_dir:
+            raw = "DATABASE_URL=postgres:///acme\nSESSION_SECRET=abcdefgh12345678\n"
+
+            first = local_facts(infra_dir, {"app_env": raw}).app_env_sha
+            second = local_facts(infra_dir, {"app_env": raw}).app_env_sha
+            changed = local_facts(infra_dir, {"app_env": raw + "EXTRA=1\n"}).app_env_sha
+
+            self.assertIsNotNone(first)
+            self.assertEqual(first, second)
+            self.assertNotEqual(first, changed)
+
+    def test_app_env_sha_ignores_trailing_newline_variations(self) -> None:
+        with Infra() as infra_dir:
+            no_newline = local_facts(infra_dir, {"app_env": "A=12345678"}).app_env_sha
+            one_newline = local_facts(infra_dir, {"app_env": "A=12345678\n"}).app_env_sha
+            many_newlines = local_facts(infra_dir, {"app_env": "A=12345678\n\n\n"}).app_env_sha
+
+            self.assertEqual({no_newline, one_newline, many_newlines}, {no_newline})
+
+    def test_app_env_allows_comments_and_blank_lines(self) -> None:
+        with Infra() as infra_dir:
+            sha = local_facts(infra_dir, {"app_env": "# a comment\n\nA=12345678\n"}).app_env_sha
+
+            self.assertIsNotNone(sha)
+
+    def test_malformed_app_env_is_rejected_without_echoing_any_value(self) -> None:
+        with Infra() as infra_dir:
+            with self.assertRaises(StackError) as caught:
+                local_facts(infra_dir, {"app_env": "not-a-key-value-line\n"})
+
+            self.assertNotIn("not-a-key-value-line", str(caught.exception))
+
+    def test_app_env_with_a_nul_byte_is_rejected(self) -> None:
+        with Infra() as infra_dir:
+            with self.assertRaises(StackError):
+                local_facts(infra_dir, {"app_env": "A=1\x00\n"})
 
 
 if __name__ == "__main__":

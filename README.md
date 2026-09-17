@@ -113,6 +113,7 @@ Then commit what it wrote back: `infra/stack.state.json`,
 | creating the origin certificate | Gets a TLS certificate from Cloudflare for your domain |
 | uploading | Copies `infra/` and the certificate onto the server |
 | rebuilding NixOS | Applies the configuration (this is the slow one — minutes) |
+| updating the application's environment file | Pushes `app_env` from `secrets.age` to the server and restarts the running release (see [The app's environment](#the-apps-environment-app_env) below) |
 | pointing the domain | Points your domain at the server in Cloudflare |
 
 ## Everyday things
@@ -158,6 +159,67 @@ and you typing the exact phrase it asks for:
 Anything else and nothing is bought. **stack-base can never cancel or delete
 a server** — it has no code that can. Cancel it yourself in hPanel.
 
+## The app's environment (`app_env`)
+
+The platform-base app reads its configuration — database URL, session
+secrets, OAuth credentials, anything else in `.env.example` — from a single
+`EnvironmentFile` systemd loads before the app starts, as root, before the
+process drops to its own unprivileged user. stack-base owns getting that file
+onto the server: it lives in `secrets.age` as one more key, `app_env`, and
+`./infra/up` pushes it to `/var/lib/stackbase/app.env` whenever its content
+changes.
+
+**Set it** with the same decrypt → edit → re-encrypt flow as any other change
+to `secrets.age`:
+
+```bash
+age -d -i ~/.age/key.txt infra/secrets.age > /tmp/secrets.json
+$EDITOR /tmp/secrets.json   # add or update the "app_env" key -- see below
+age -R infra/age-recipients.txt -o infra/secrets.age /tmp/secrets.json
+rm -f /tmp/secrets.json
+./infra/up
+```
+
+`app_env`'s value is one string of `KEY=value` lines, so in `secrets.json` it
+looks like (fill in your own values, one `\n`-joined line per variable):
+
+```json
+{
+  "hostinger_token": "...",
+  "cloudflare_token": "...",
+  "app_env": "DATABASE_URL=postgres:///acme\nSESSION_SECRET=...\nCSRF_SECRET=...\nOAUTH_CLIENT_ID=...\nOAUTH_CLIENT_SECRET=...\nOAUTH_REDIRECT_URL=https://acme.example.com/auth/callback\n"
+}
+```
+
+At minimum a platform-base app needs: `DATABASE_URL` (`postgres:///<project>`
+— peer auth over the Unix socket, no password), a session secret and a CSRF
+secret, and the OAuth client id/secret/redirect URL. Check the project's own
+`.env.example` for anything else it expects. Do **not** put `SOCKET_PATH` in
+`app_env` — the systemd unit sets that itself, per color.
+
+**What `./infra/up` does with it:** the whole value, and every individual
+`KEY=value` line inside it, are redacted from every line stack-base prints —
+same as every other secret. The file lands on the server as `root:<project>
+0640`, written to a temp name with that owner and mode already set, then
+moved into place — so it's never briefly world-readable or half-written.
+stack-base never writes it to a local file; it only ever exists in memory on
+your machine and in `secrets.age`.
+
+**Restart semantics.** Pushing a new `app_env` restarts whichever color is
+currently live (`systemctl try-restart <project>@blue` or `@green`) so the
+new values take effect — this is a brief blip, not a blue/green swap; env
+changes aren't part of the zero-downtime release mechanism. If you want to
+roll an env change out with zero downtime, push it with `./infra/up` and then
+`deploy` (or re-deploy) a release — the new release process picks up the new
+`app_env` when it starts, and the swap itself stays zero-downtime as usual.
+If no release has been deployed to a node yet, `./infra/up` pushes the file
+and skips the restart (there's nothing running to restart) — the new
+environment simply applies from the first deploy.
+
+Removing `app_env` from `secrets.age` does **not** delete the file already on
+the server — that's a deliberate manual act (`./infra/up ssh a -- rm
+/var/lib/stackbase/app.env`), not something a config diff should do for you.
+
 ## When it fails
 
 Every failure is one line: what went wrong, then what to check.
@@ -178,6 +240,8 @@ Every failure is one line: what went wrong, then what to check.
 | `node a stopped answering SSH…` | See below |
 | `the SSH host key … does not match` | Either the server was reinstalled (delete its line from `infra/known_hosts`) or something is wrong. If you didn't reinstall it, stop and investigate |
 | `infra/flake.lock is missing` | First run against an unpublished stack-base: set `STACKBASE_SRC` (below) |
+| `app_env has a line that is not KEY=value` | Fix the offending line in `app_env` and re-encrypt `secrets.age` — see [The app's environment](#the-apps-environment-app_env) |
+| `node a has no '<project>' group yet` | Run `./infra/up` again once REBUILD has completed for that node at least once — the group is created by the first rebuild |
 
 A failed run changes nothing further and can always simply be run again: it
 picks up exactly where it stopped.
@@ -292,7 +356,7 @@ config and used directly, so edits to stack-base take effect on the next run.
 | `stack.toml` | What you want. The only file you normally edit |
 | `keys/*.pub` | Everyone's SSH public key. Commit |
 | `age-recipients.txt` | Everyone's age public key — who can read the secrets. Commit |
-| `secrets.age` | The encrypted API tokens and TLS key. Commit (it's encrypted) |
+| `secrets.age` | The encrypted API tokens, TLS key and the app's own `app_env`. Commit (it's encrypted) |
 | `stack.state.json` | What stack-base has done so far — addresses, record ids, fingerprints. Written for you: commit it, don't edit it. The servers' configuration is built from `stack.toml` alone, so nothing in here changes what gets installed |
 | `known_hosts` | The servers' SSH fingerprints. Commit |
 | `nodes/<name>/` | Each server's own disk and boot settings, copied off the machine. Commit |

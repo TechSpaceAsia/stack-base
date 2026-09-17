@@ -35,12 +35,14 @@ from stackbase.reconcile import (
     Action,
     Context,
     Step,
+    app_env_digest,
     compute_rev,
     desired_firewall_rules,
     firewall_name,
     first_address,
     hostname_for,
     primary_node,
+    validate_app_env,
 )
 from stackbase.secrets import save_secrets
 from stackbase.ssh import HOST_KEY_CHANGED_MARKER, Ssh, host_key_mismatch_hint
@@ -652,6 +654,102 @@ def _fetch_lock_file(ctx: Context, ssh: Ssh) -> None:
     ctx.emit("✓ infra/flake.lock updated from the node -- commit it")
 
 
+# --------------------------------------------------------------------------
+# App environment: push app.env, restart the active color
+# --------------------------------------------------------------------------
+
+# Owned by the release engine (nixos/deploy.nix's `stateDir`,
+# nixos/deploy/stack-deploy.sh's `ACTIVE_COLOR_FILE`) -- not
+# `REMOTE_CERT_DIR`/`/var/lib/stackbase`, which is stack-base's own state.
+_DEPLOY_STATE_DIR = "/var/lib/stackbase-deploy"
+_ACTIVE_COLOR_FILE = f"{_DEPLOY_STATE_DIR}/active-color"
+_VALID_COLORS = frozenset({"blue", "green"})
+
+
+def _ensure_app_env(ctx: Context, step: Step) -> str:
+    """Push infra/secrets.age's "app_env" to /var/lib/stackbase/app.env, then
+    restart the node's currently-active color (if any release has been
+    deployed yet).
+
+    Same model as `_push_origin_cert`: the content travels over an ssh stdin
+    pipe only -- never a local file, never an argv -- into a temp name
+    created with its final owner/mode (`root:<project> 0640`) BEFORE any
+    content is written, then `mv -f`d into place.
+
+    Unlike `_chgrp`'s nginx-group case, a missing `<project>` group here is a
+    hard failure rather than a warn-and-continue: `plan()` only ever plans
+    this step after REBUILD for the node (see `reconcile.plan`), which is
+    what creates the group -- so a missing group this late means something
+    else has already gone wrong.
+    """
+    node = _node(step)
+    raw = ctx.secrets.get("app_env")
+    if not raw:
+        raise StackError(
+            "infra/secrets.age has no 'app_env' to push",
+            "this is a bug in stack-base -- please report it",
+        )
+    # Validated and normalised before any ssh call: a malformed app_env must
+    # never open a connection, let alone reach the node -- and the message
+    # never echoes any part of its content.
+    normalized = validate_app_env(raw)
+
+    project = ctx.cfg.project
+    ssh = ctx.ssh(node)
+
+    group = ssh.run(f"getent group {shlex.quote(project)}", check=False)
+    if group.returncode != 0:
+        raise StackError(
+            f"node {node} has no '{project}' group yet",
+            "this step is planned only after REBUILD for the node, which creates the group -- "
+            "run `up` again once that has completed",
+        )
+
+    tmp_path = _cert_path("app.env.new")
+    final_path = _cert_path("app.env")
+    ssh.run(f"set -eu; install -m 0640 -o root -g {shlex.quote(project)} /dev/null {tmp_path}")
+    ssh.run(f"set -eu; cat > {tmp_path}", input=normalized)
+    ssh.run(f"set -eu; mv -f {tmp_path} {final_path}")
+
+    # Saved only now that the file is actually in place -- a failure above
+    # leaves state unchanged, so the next run retries the whole push.
+    ctx.node_state(node).app_env_sha = app_env_digest(normalized)
+
+    color = _restart_active_color(ctx, ssh, node, project)
+    if color:
+        return f"node {node}: application environment updated, {color} restarted"
+    return f"node {node}: application environment updated"
+
+
+def _restart_active_color(ctx: Context, ssh: Ssh, node: str, project: str) -> str | None:
+    """Restart the node's active color, if a release has ever been deployed.
+
+    The blue/green swap belongs to a release deploy, not to an env-only
+    change -- restarting the active color directly here is a brief blip, on
+    purpose; a zero-downtime way to roll an env change out is to push it and
+    then `deploy` (or re-deploy) a release.
+    """
+    result = ssh.run(f"cat -- {shlex.quote(_ACTIVE_COLOR_FILE)}", check=False)
+    if result.returncode != 0:
+        ctx.emit("! no release deployed yet — the new environment applies from the first deploy")
+        return None
+
+    color = (result.stdout or "").strip()
+    if color not in _VALID_COLORS:
+        # Never interpolate an unvalidated remote string into a command --
+        # `systemctl try-restart <garbage>@<garbage>.service` is exactly the
+        # kind of thing this refuses to build.
+        raise StackError(
+            f"node {node}: {_ACTIVE_COLOR_FILE} does not contain 'blue' or 'green'",
+            "check the file on the node by hand -- stack-base refuses to restart a service name "
+            "it cannot validate",
+        )
+
+    unit = f"{project}@{color}.service"
+    ssh.run(f"systemctl try-restart {shlex.quote(unit)}")
+    return color
+
+
 def _tail_hint(tail: list[str], advice: str) -> str:
     text = "\n".join(tail).strip()
     return f"{text}\n{advice}" if text else advice
@@ -700,5 +798,6 @@ _EXECUTORS: dict[Action, Callable[[Context, Step], str]] = {
     Action.ENSURE_ORIGIN_CERT: _ensure_origin_cert,
     Action.PUSH_CONFIG: _push_config,
     Action.REBUILD: _rebuild,
+    Action.ENSURE_APP_ENV: _ensure_app_env,
     Action.UPSERT_DNS: _upsert_dns,
 }

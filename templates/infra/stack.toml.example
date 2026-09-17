@@ -52,3 +52,7 @@ role = "primary"
 #
 # [nodes.b]
 # role = "replica"
+
+# The app's own environment (DATABASE_URL, session/CSRF secrets, OAuth
+# credentials, ...) is NOT set here -- it lives in secrets.age as the
+# "app_env" key. See the README's "The app's environment (app_env)" section.
