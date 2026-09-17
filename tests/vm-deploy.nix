@@ -93,6 +93,85 @@ let
     httpd = UnixHTTPServer(SOCKET_PATH, Handler)
     httpd.serve_forever()
   '';
+
+  # C1: exits non-zero (systemd sees this as a failed start, triggering
+  # Restart=on-failure) until __MARKER__ exists -- simulates "the database
+  # isn't ready yet", the actual real-world trigger for the reboot-leaves-
+  # the-node-serving-502-forever bug this whole fix closes.
+  fakeAppGated = ''
+    #!/usr/bin/env python3
+    import http.server
+    import os
+    import socket
+    import sys
+
+    VERSION = "__VERSION__"
+    MARKER = "__MARKER__"
+    SOCKET_PATH = os.environ["SOCKET_PATH"]
+
+    if not os.path.exists(MARKER):
+        sys.exit(1)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+            elif self.path == "/version":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(VERSION.encode())
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, fmt, *args):
+            pass
+
+    class UnixHTTPServer(http.server.HTTPServer):
+        address_family = socket.AF_UNIX
+
+    try:
+        os.remove(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+
+    httpd = UnixHTTPServer(SOCKET_PATH, Handler)
+    httpd.serve_forever()
+  '';
+
+  # I3: accepts the connection and the request, then never answers --
+  # simulates an app that hangs rather than answering or refusing, so the
+  # health check's OWN per-try timeout (not the health-check loop's overall
+  # try count) is what has to save it.
+  fakeAppHanging = ''
+    #!/usr/bin/env python3
+    import http.server
+    import os
+    import socket
+    import time
+
+    SOCKET_PATH = os.environ["SOCKET_PATH"]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            time.sleep(9999)
+
+        def log_message(self, fmt, *args):
+            pass
+
+    class UnixHTTPServer(http.server.HTTPServer):
+        address_family = socket.AF_UNIX
+
+    try:
+        os.remove(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+
+    httpd = UnixHTTPServer(SOCKET_PATH, Handler)
+    httpd.serve_forever()
+  '';
 in
 pkgs.testers.runNixOSTest {
   name = "stackbase-vm-deploy";
@@ -110,6 +189,18 @@ pkgs.testers.runNixOSTest {
         stackbase.project = project;
         stackbase.domain = domain;
         stackbase.deploy.drainSeconds = 2;
+        # I3/I6: the module-level DEFAULT health-check budget (30 tries x
+        # 2s = up to 60s) is only ever exercised for real by `stack-deploy
+        # boot`, invoked directly by systemd with no way for a test to
+        # inject a per-call STACK_DEPLOY_HEALTH_TRIES/SLEEP override.
+        # Every OTHER health-checked call in this test explicitly overrides
+        # with fastHealth/brokenHealth, and every happy-path reboot subtest
+        # succeeds on the very first health-check try regardless of the
+        # max-tries budget -- so lowering the default here only speeds up
+        # the one subtest (C1) that deliberately keeps the app unhealthy
+        # across a reboot; it changes no other subtest's behaviour.
+        stackbase.app.healthTries = 10;
+        stackbase.app.healthSleep = 1;
         # Small enough to be reliably exceeded by a deliberately oversized
         # test upload, comfortably larger than every real test tarball
         # (a few KB at most) so none of the legitimate upload subtests
@@ -130,6 +221,8 @@ pkgs.testers.runNixOSTest {
         environment.systemPackages = [ pkgs.python3 pkgs.util-linux pkgs.e2fsprogs ];
 
         environment.etc."stackbase-test/fake-app.py".text = fakeApp;
+        environment.etc."stackbase-test/fake-app-gated.py".text = fakeAppGated;
+        environment.etc."stackbase-test/fake-app-hanging.py".text = fakeAppHanging;
 
         system.stateVersion = "26.05";
       };
@@ -196,6 +289,20 @@ pkgs.testers.runNixOSTest {
           "Parse 'active=X idle=Y' into (active, idle)."
           parts = dict(kv.split("=", 1) for kv in s.strip().split())
           return parts["active"], parts["idle"]
+
+      def make_gated_release(version, marker):
+          "Write the marker-gated fake app (C1) straight into releases/<version>/${project}."
+          node.succeed(
+              f"sed -e 's/__VERSION__/{version}/' -e 's#__MARKER__#{marker}#' "
+              f"/etc/stackbase-test/fake-app-gated.py > /tmp/{version}-gated-bin && "
+              f"install -D -m0755 /tmp/{version}-gated-bin /opt/${project}/releases/{version}/${project}"
+          )
+
+      def make_hanging_release(version):
+          "Write the hangs-forever fake app (I3) straight into releases/<version>/${project}."
+          node.succeed(
+              f"install -D -m0755 /etc/stackbase-test/fake-app-hanging.py /opt/${project}/releases/{version}/${project}"
+          )
 
       def make_tarball(version, health_code=200, setuid_binary=False, extra_world_writable_file=None):
           "Build a flat tarball (binary at the archive root) for the --tarball deploy path; returns its sha256."
@@ -481,6 +588,33 @@ pkgs.testers.runNixOSTest {
           node.succeed("cat /var/lib/stackbase/app.env")
           assert node.succeed("stack-deploy colors").strip().startswith("active=")
 
+      with subtest("I1: a SOCKET_PATH line in app.env cannot override the per-color socket (belt and braces)"):
+          active_color, _ = parse_colors(node.succeed("stack-deploy colors").strip())
+          unit = f"${project}@{active_color}.service"
+
+          node.succeed("install -D -m0640 -o root -g ${project} /dev/null /var/lib/stackbase/app.env")
+          node.succeed("printf 'SOCKET_PATH=/tmp/evil.sock\\n' > /var/lib/stackbase/app.env")
+          node.succeed(f"systemctl restart {unit}")
+          node.wait_until_succeeds(f"systemctl is-active --quiet {unit}", timeout=15)
+          # `systemctl is-active` (Type=simple) reports "active" as soon as
+          # the process forks -- not once it has actually finished binding
+          # its socket. Wait for the real, functional signal (a live HTTP
+          # response) rather than racing that.
+          node.wait_until_succeeds(f"curl -s --unix-socket /run/${project}/app-{active_color}.sock http://localhost/health", timeout=15)
+
+          # The app must still be bound to its OWN per-color socket, never
+          # the app.env-supplied path -- the unit's own `env SOCKET_PATH=...`
+          # in its ExecStart wins over EnvironmentFile regardless of order
+          # (nixos/deploy.nix). Proven both directly (the evil path was
+          # never created) and functionally (nginx, which only ever talks
+          # to the real per-color socket, still gets a live response).
+          node.succeed(f"test -S /run/${project}/app-{active_color}.sock")
+          node.fail("test -e /tmp/evil.sock")
+          code = proxy.succeed(curl_version).strip()
+          assert code == "200", f"expected the app to still answer over its real per-color socket, got {code}"
+
+          node.succeed("rm -f /var/lib/stackbase/app.env")
+
       with subtest("a tarball with an absolute-path member is rejected, nothing left in releases/ (N1a)"):
           # `tar -P` disables GNU tar's default leading-slash stripping,
           # so the member is stored (and listed) with its leading '/'
@@ -617,6 +751,209 @@ pkgs.testers.runNixOSTest {
 
           node.succeed(f"mv /tmp/n3-binary-backup {idle_target}/${project}")
 
+      with subtest(
+          "C1: a reboot with a not-yet-ready dependency never gives up -- app.sock already points at the "
+          "active color, the unit keeps retrying instead of hitting start-limit-hit, and it recovers with "
+          "no further action once the dependency is ready"
+      ):
+          # NOT /tmp: the app unit has PrivateTmp=true, so /tmp inside the
+          # sandboxed process is a private, empty tmpfs, invisible to a
+          # marker file created from outside it. /run is real and shared
+          # (only WRITES there are restricted by ProtectSystem=strict,
+          # outside the unit's own declared ReadWritePaths -- an
+          # os.path.exists() check is a read, which still works fine).
+          marker = "/run/c1-gate-marker"
+          node.succeed(f"touch {marker}")
+          make_gated_release("v9.0.0", marker)
+          node.succeed("${fastHealth} stack-deploy deploy v9.0.0")
+
+          code = proxy.succeed(curl_version).strip()
+          body = proxy.succeed("cat /tmp/vbody").strip()
+          assert code == "200" and body == "v9.0.0", f"expected v9.0.0 live before testing the reboot, got {code}/{body!r}"
+
+          active_color, _ = parse_colors(node.succeed("stack-deploy colors").strip())
+          unit = f"${project}@{active_color}.service"
+
+          start_limit = node.succeed(f"systemctl show {unit} -p StartLimitIntervalUSec --value").strip()
+          assert start_limit in ("0", "infinity"), (
+              f"expected StartLimitIntervalUSec to be 0/infinity (never give up), got {start_limit!r}"
+          )
+          after_line = node.succeed(f"systemctl show {unit} -p After --value").strip()
+          assert "postgresql.service" in after_line, f"expected After= to include postgresql.service, got {after_line!r}"
+
+          # Simulate "the database isn't ready yet" across the reboot --
+          # the actual real-world trigger for the bug this whole fix closes.
+          node.succeed(f"rm -f {marker}")
+          node.shutdown()
+          node.start()
+
+          node.wait_for_unit("multi-user.target")
+          node.wait_for_unit("nginx.service")
+          node.wait_for_unit("stackbase-app-boot.service")
+
+          # app.sock must already point at the active color -- even though
+          # the app behind it isn't up yet (C1: cmd_boot links BEFORE the
+          # health check, never gated on it, and never fails the boot unit
+          # over an unhealthy/not-yet-started app).
+          assert node.succeed("readlink /run/${project}/app.sock").strip() == f"app-{active_color}.sock"
+
+          # By now stackbase-app-boot.service has already run its own
+          # (module-default) health-check wait to completion -- the app
+          # unit has had that whole window to attempt restarts in the
+          # background. Prove it never gave up: Result must never become
+          # "start-limit-hit", and it must have attempted at least one
+          # restart.
+          result = node.succeed(f"systemctl show {unit} -p Result --value").strip()
+          assert result != "start-limit-hit", (
+              f"the unit gave up (start-limit-hit) instead of retrying forever, Result={result!r}"
+          )
+          nrestarts = int(node.succeed(f"systemctl show {unit} -p NRestarts --value").strip())
+          assert nrestarts > 0, "expected the unit to have attempted at least one restart while its dependency was unready"
+
+          # The dependency becomes ready -- recovery needs NO further
+          # action from an operator, a redeploy, or another reboot.
+          node.succeed(f"touch {marker}")
+          node.wait_until_succeeds(f"systemctl is-active --quiet {unit}", timeout=30)
+          proxy.wait_until_succeeds(f"{curl_version} | grep -q '^200'", timeout=30)
+          body_after = proxy.succeed("cat /tmp/vbody").strip()
+          assert body_after == "v9.0.0", f"expected v9.0.0 live again once the dependency was ready, got {body_after!r}"
+
+      with subtest("I3: an app that accepts but never answers fails the health check within a bounded time, active color untouched"):
+          active_before, idle_before = parse_colors(node.succeed("stack-deploy colors").strip())
+          make_hanging_release("v9.1.0")
+
+          import time as _time
+
+          start = _time.monotonic()
+          status, out = node.execute("${brokenHealth} stack-deploy deploy v9.1.0 2>&1")
+          elapsed = _time.monotonic() - start
+
+          assert status == 1, f"expected exit 1 for a health check that never answers, got status={status}, output={out!r}"
+          # brokenHealth is 3 tries x 1s sleep; each try is bounded by
+          # curl's own --max-time 5 (I3). A generous upper bound (well
+          # under the OLD ~300s-per-try x 30-tries failure mode this
+          # closes) still proves the timeout is actually being honoured.
+          assert elapsed < 60, f"health check against a hanging app took {elapsed:.1f}s -- curl's own timeout is not being honoured"
+          assert "migrations" in out.lower(), f"expected the health-check failure to mention migrations may already be applied, got: {out!r}"
+
+          active_after, idle_after = parse_colors(node.succeed("stack-deploy colors").strip())
+          assert (active_after, idle_after) == (active_before, idle_before), (
+              f"a failed deploy must not change which color is active/idle, got {(active_after, idle_after)}"
+          )
+
+      with subtest("I2: prune runs automatically at the end of a successful deploy, keeping only the newest 5 (+ linked)"):
+          # Round out to comfortably more than keep=5 with plain,
+          # already-linkable release directories (the exact content
+          # doesn't matter for prune's own counting logic -- proven with
+          # real binaries elsewhere in this file).
+          for v in ["v9.2.0", "v9.3.0", "v9.4.0", "v9.5.0", "v9.6.0", "v9.7.0"]:
+              make_release(v)
+
+          before = set(node.succeed("ls /opt/${project}/releases").split())
+          assert {"v9.2.0", "v9.3.0", "v9.4.0", "v9.5.0", "v9.6.0", "v9.7.0"} <= before
+
+          # A deploy of the newest one -- never an explicit `prune` call.
+          node.succeed("${fastHealth} stack-deploy deploy v9.7.0")
+
+          after = set(node.succeed("ls /opt/${project}/releases").split())
+          active_color, idle_color = parse_colors(node.succeed("stack-deploy colors").strip())
+          blue_ver = node.succeed("readlink -f /opt/${project}/blue/current").strip().rsplit("/", 1)[-1]
+          green_ver = node.succeed("readlink -f /opt/${project}/green/current").strip().rsplit("/", 1)[-1]
+          linked = {blue_ver, green_ver}
+          unprotected = after - linked
+          assert len(unprotected) <= 5, (
+              f"expected at most 5 unlinked releases to survive an automatic prune, got {len(unprotected)}: {unprotected}"
+          )
+          assert "v9.7.0" in after, "the just-deployed release must survive its own deploy's prune"
+
+      with subtest("I2: a prune failure (an undeletable release) is a warning, not a failed deploy"):
+          make_release("v9.8.0")
+          node.succeed("${fastHealth} stack-deploy deploy v9.8.0")
+
+          # An immutable file inside an UNLINKED release dir (v9.9.0, never
+          # deployed) makes `rm -rf` on that one directory fail -- prune
+          # must still attempt every other unprotected release, and the
+          # deploy that triggered this prune must still succeed.
+          for v in ["v9.9.0", "v9.10.0", "v9.11.0", "v9.12.0", "v9.13.0", "v9.14.0"]:
+              make_release(v)
+          node.succeed("chattr +i /opt/${project}/releases/v9.9.0/${project}")
+
+          try:
+              status, out = node.execute("${fastHealth} stack-deploy deploy v9.14.0 2>&1")
+              assert status == 0, f"a prune failure must not fail the deploy that triggered it, got status={status}, output={out!r}"
+              assert "pruning old releases failed" in out or "failed to prune" in out, (
+                  f"expected the prune failure to be reported as a warning, got: {out!r}"
+              )
+              node.succeed("test -d /opt/${project}/releases/v9.9.0")
+          finally:
+              node.succeed("chattr -i /opt/${project}/releases/v9.9.0/${project}")
+              node.succeed("rm -rf /opt/${project}/releases/v9.9.0")
+
+      with subtest("I7: a disk-full extraction leaves no .tmp-* directory behind"):
+          # A REAL "disk full during extraction" -- not a corrupt archive.
+          # GNU tar's LISTING (-tzf/-tvzf, what this engine's own
+          # validation uses) fails its own EOF/integrity check on a merely
+          # truncated or corrupted tarball just as loudly as extraction
+          # does (confirmed while writing this test), so that shape of
+          # failure never actually reaches deploy_unpack_tarball's
+          # post-tmp_dir-creation window at all -- there's nothing there to
+          # leak. A tmpfs mounted tiny, just for this subtest (unmounted
+          # immediately after, restoring every real release underneath
+          # unchanged) reproduces the actual failure window I7 protects
+          # against: `mktemp -d` (near-zero bytes) succeeds, but extracting
+          # real file content genuinely runs out of space partway through.
+          node.succeed("mount -t tmpfs -o size=64k tmpfs /opt/${project}/releases")
+          try:
+              node.succeed(
+                  "rm -rf /tmp/bigpkg && mkdir -p /tmp/bigpkg && "
+                  "dd if=/dev/zero of=/tmp/bigpkg/${project} bs=1024 count=512 status=none && "
+                  "chmod +x /tmp/bigpkg/${project} && "
+                  "tar -czf /tmp/v9.15.0.tar.gz -C /tmp/bigpkg ${project}"
+              )
+              sha = node.succeed("sha256sum /tmp/v9.15.0.tar.gz | cut -d' ' -f1").strip()
+
+              status, out = node.execute(
+                  "stack-deploy deploy v9.15.0 --tarball /tmp/v9.15.0.tar.gz --sha256 " + sha + " 2>&1"
+              )
+              # A failing `tar -xzf` is a PLAIN (non-conditional) statement
+              # in deploy_unpack_tarball, so under `set -e` its OWN exit
+              # code (tar's "2" for a fatal error, not this script's usual
+              # die()-normalised "1") is what actually reaches the caller --
+              # any nonzero is the real contract here, not a specific code.
+              assert status != 0, f"expected a nonzero exit for a disk-full extraction, got status={status}, output={out!r}"
+              node.fail("test -e /opt/${project}/releases/v9.15.0")
+
+              leftover = set(
+                  node.succeed("find /opt/${project}/releases -mindepth 1 -maxdepth 1 -name '.tmp-*' || true").split()
+              )
+              assert leftover == set(), f"a failed extraction must not leave a .tmp-* directory behind, got: {leftover}"
+          finally:
+              node.succeed("umount /opt/${project}/releases")
+
+      with subtest("M9: the app's StateDirectory (/var/lib/<project>) is writable by the app user and nowhere else under /var/lib"):
+          node.succeed("runuser -u ${project} -- test -d /var/lib/${project}")
+          mode_owner = node.succeed("stat -c '%a %U %G' /var/lib/${project}").strip()
+          assert mode_owner == "750 ${project} ${project}", f"expected /var/lib/${project} to be 0750 ${project}:${project}, got {mode_owner!r}"
+
+          node.succeed("runuser -u ${project} -- touch /var/lib/${project}/upload-test")
+          node.succeed("rm -f /var/lib/${project}/upload-test")
+
+          # Nowhere ELSE under /var/lib is writable by the app user --
+          # ProtectSystem=strict makes /var/lib read-only except for the
+          # explicitly declared StateDirectory/ReadWritePaths.
+          node.fail("runuser -u ${project} -- touch /var/lib/should-fail")
+          node.fail("runuser -u ${project} -- touch /var/lib/stackbase/should-fail")
+
+      # The last few subtests above deployed (swapped) more than once,
+      # each arming a drainSeconds-later drain-stop timer for whichever
+      # color it vacated. Left pending, one of those timers could fire
+      # concurrently with the very first ssh-driven `deploy` below and grab
+      # the engine lock first (a real, if narrow, race -- internal-drain-
+      # stop's own flock is non-blocking) -- let every pending drain
+      # actually finish before moving on, the same way earlier subtests in
+      # this file wait out a drain after their own swap.
+      node.succeed("sleep 3")
+
       # -----------------------------------------------------------------
       # Task 2: the restricted SSH door (deploy@node, forced command)
       # -----------------------------------------------------------------
@@ -710,8 +1047,12 @@ pkgs.testers.runNixOSTest {
           status, out = ssh_upload("v3.0.0", sha)
           assert status == 0, f"upload over ssh failed: status={status} output={out!r}"
           node.succeed("test -d /opt/${project}/releases/v3.0.0")
-          node.fail(f"test -e {STATE_DIR}/incoming/v3.0.0.tar.gz")
-          node.fail(f"test -e {STATE_DIR}/incoming/v3.0.0.tar.gz.partial")
+          # M10: incoming_files() == set() (not two hand-picked stale
+          # names) -- the mktemp'd per-connection filename (F2, Fix round
+          # 1) never looked like "v3.0.0.tar.gz"/"v3.0.0.tar.gz.partial" in
+          # the first place, so those two checks were never actually
+          # proving anything about THIS implementation's naming scheme.
+          assert incoming_files() == set(), f"incoming/ must be empty after a completed upload, got {incoming_files()}"
 
           status, out = ssh("deploy v3.0.0")
           assert status == 0, f"deploy over ssh failed: status={status} output={out!r}"
