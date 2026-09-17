@@ -207,6 +207,73 @@ class TemplateFlakeEvaluatesTests(unittest.TestCase):
 
 
 @unittest.skipIf(_NIX is None, "nix is not installed")
+class CiDeployKeyTests(unittest.TestCase):
+    """Task 4: an optional GitHub Actions deploy key, `ci-deploy`, layered
+    on top of every admin key. It must reach stackbase.deploy.keys (so it
+    can drive the SSH forced-command door) but never stackbase.admins
+    itself -- root's and every admin's own authorized_keys must never
+    contain it.
+    """
+
+    _CI_PUB = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAACIExampleCiDeployKey ci-deploy@acme\n"
+
+    def _eval(self, directory: Path) -> dict:
+        apply_fn = (
+            "node: {"
+            " deployKeys = node.config.stackbase.deploy.keys;"
+            " deployAuthorizedKeys = node.config.users.users.deploy.openssh.authorizedKeys.keys;"
+            " rootKeys = node.config.users.users.root.openssh.authorizedKeys.keys;"
+            " mattKeys = node.config.users.users.matt.openssh.authorizedKeys.keys;"
+            " }"
+        )
+        result = subprocess.run(
+            [
+                _NIX or "nix", "eval", "--json",
+                f"path:{directory}#nixosConfigurations.a",
+                "--apply", apply_fn,
+                "--override-input", "stack-base", f"path:{_REPO_ROOT}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise AssertionError(f"nix eval failed:\n{result.stderr}")
+        return json.loads(result.stdout)
+
+    def test_ci_deploy_key_reaches_deploy_keys_but_never_admin_or_root_keys(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+            (directory / "keys" / "ci-deploy.pub").write_text(self._CI_PUB, encoding="utf-8")
+
+            facts = self._eval(directory)
+
+            self.assertIn("ci-deploy", facts["deployKeys"])
+            self.assertNotIn("ExampleCiDeployKey", "".join(facts["rootKeys"]))
+            self.assertNotIn("ExampleCiDeployKey", "".join(facts["mattKeys"]))
+            self.assertTrue(facts["deployAuthorizedKeys"], "expected at least one deploy authorized_keys line")
+            self.assertTrue(
+                all(line.startswith("restrict,command=") for line in facts["deployAuthorizedKeys"]),
+                facts["deployAuthorizedKeys"],
+            )
+
+    def test_no_ci_deploy_pub_file_means_no_ci_deploy_key_and_evaluation_still_succeeds(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+
+            facts = self._eval(directory)
+
+            self.assertNotIn("ci-deploy", facts["deployKeys"])
+            self.assertTrue(facts["deployAuthorizedKeys"], "admin keys should still reach the deploy door")
+            self.assertTrue(
+                all(line.startswith("restrict,command=") for line in facts["deployAuthorizedKeys"]),
+                facts["deployAuthorizedKeys"],
+            )
+
+
+@unittest.skipIf(_NIX is None, "nix is not installed")
 class MkNodeProviderContractTests(unittest.TestCase):
     """`lib.mkNode`'s `provider` argument (review follow-up on task 8a):
     "hostinger" (the default) must include the Hostinger provider module,
@@ -397,6 +464,20 @@ class TemplateUpScriptTests(unittest.TestCase):
                     result = self._run_up(infra_dir, *args, env_extra={"STACKBASE_SRC": str(source)})
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout.strip(), f"--infra-dir {infra_dir} {expected_tail}")
+
+    def test_secrets_keys_reaches_the_subcommand_unchanged(self) -> None:
+        """`secrets` doesn't start with '-', so `_with_implicit_up` must
+        leave it alone -- `./infra/up secrets keys` must reach `secrets
+        keys`, never `up secrets keys` (Task 4, B1).
+        """
+        with TemporaryDirectory() as tmp:
+            infra_dir = self._infra_dir(tmp)
+            source = self._fake_echo_source(tmp)
+
+            result = self._run_up(infra_dir, "secrets", "keys", env_extra={"STACKBASE_SRC": str(source)})
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), f"--infra-dir {infra_dir} secrets keys")
 
     def test_help_is_passed_through_without_inserting_up(self) -> None:
         with TemporaryDirectory() as tmp:

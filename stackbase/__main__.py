@@ -22,6 +22,7 @@ import sys
 import traceback
 from pathlib import Path
 
+from stackbase.ci import ci_setup
 from stackbase.cloudflare import CloudflareClient
 from stackbase.config import load_config, load_state
 from stackbase.errors import StackError
@@ -39,6 +40,7 @@ from stackbase.reconcile import (
 )
 from stackbase.release import run_deploy, run_rollback, run_status
 from stackbase.secrets import load_secrets, redact
+from stackbase.secrets_cli import edit_key, list_key_names, set_key, unset_key
 from stackbase.ssh import Ssh
 
 _DEFAULT_INFRA_DIR = "./infra"
@@ -81,6 +83,34 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--node", help="restrict to one node")
     status.add_argument("--debug", action="store_true", help="print the full traceback on failure")
 
+    ci_setup_p = commands.add_parser(
+        "ci-setup", help="provision an optional GitHub Actions deploy key for this project"
+    )
+    ci_setup_p.add_argument("--rotate", action="store_true", help="replace an existing CI deploy key")
+    ci_setup_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
+
+    secrets_p = commands.add_parser(
+        "secrets", help="manage infra/secrets.age one key at a time -- never to disk unencrypted"
+    )
+    secrets_sub = secrets_p.add_subparsers(dest="secrets_command", required=True)
+
+    secrets_keys_p = secrets_sub.add_parser("keys", help="list secret key names (never values)")
+    secrets_keys_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
+
+    secrets_set_p = secrets_sub.add_parser("set", help="set one key's value, read from stdin")
+    secrets_set_p.add_argument("key", help="the secret's name (e.g. hostinger_token, app_env)")
+    secrets_set_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
+
+    secrets_unset_p = secrets_sub.add_parser("unset", help="remove one key")
+    secrets_unset_p.add_argument("key", help="the secret's name")
+    secrets_unset_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
+
+    secrets_edit_p = secrets_sub.add_parser(
+        "edit", help="edit one key's value in $VISUAL/$EDITOR/vi, via a RAM-only scratch file"
+    )
+    secrets_edit_p.add_argument("key", help="the secret's name")
+    secrets_edit_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
+
     return parser
 
 
@@ -104,6 +134,10 @@ def main(argv: list[str] | None = None) -> None:
             _rollback(args, infra_dir)
         elif args.command == "status":
             _status(args, infra_dir)
+        elif args.command == "ci-setup":
+            _ci_setup(args, infra_dir)
+        elif args.command == "secrets":
+            _secrets(args, infra_dir)
         else:
             # argparse's subparsers are `required=True`, so this is
             # unreachable in practice -- but an explicit branch that fails
@@ -288,6 +322,29 @@ def _rollback(args: argparse.Namespace, infra_dir: Path) -> None:
 
 def _status(args: argparse.Namespace, infra_dir: Path) -> None:
     run_status(infra_dir, node=args.node, emit=_emit_plain)
+
+
+def _ci_setup(args: argparse.Namespace, infra_dir: Path) -> None:
+    ci_setup(infra_dir, rotate=args.rotate, emit=_emit_plain)
+
+
+def _secrets(args: argparse.Namespace, infra_dir: Path) -> None:
+    if args.secrets_command == "keys":
+        for name in list_key_names(infra_dir):
+            _emit_plain(name)
+    elif args.secrets_command == "set":
+        set_key(infra_dir, args.key, emit=_emit_plain)
+    elif args.secrets_command == "unset":
+        unset_key(infra_dir, args.key, emit=_emit_plain)
+    elif args.secrets_command == "edit":
+        edit_key(infra_dir, args.key, emit=_emit_plain)
+    else:
+        # secrets_sub is required=True, so this is unreachable in practice --
+        # an explicit branch beats a bare `else` silently doing nothing.
+        raise StackError(
+            f"unknown secrets command '{args.secrets_command}'",
+            "this is a bug in stack-base -- please report it",
+        )
 
 
 def _token(secrets: dict[str, str], key: str, label: str) -> str:

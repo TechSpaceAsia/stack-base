@@ -65,18 +65,25 @@ age-keygen -y ~/.age/key.txt                      # prints your PUBLIC key
 
 Paste that public key into `infra/age-recipients.txt`, one per line.
 
-**4. Create the secrets file.** Set the two variables, then run the command
-as-is. `CLOUDFLARE_TOKEN` is optional — leave it empty (`CLOUDFLARE_TOKEN=`)
-to skip DNS and the TLS origin certificate for now; the server is still
-provisioned, just reachable by IP/SSH only until you add the token and run
-`./infra/up` again:
+**4. Create the secrets file, then set your tokens.** First bootstrap an
+empty, encrypted secrets file (a one-time pipe straight into `age` — nothing
+plaintext ever touches disk, even here):
+
+```bash
+printf '{}' | age -R infra/age-recipients.txt -o infra/secrets.age
+```
+
+Then set each token with `secrets set` — see [Managing secrets](#managing-secrets)
+below for the full command reference. `cloudflare_token` is optional — skip
+it for now to stand the server up reachable by IP/SSH only; add it later and
+run `./infra/up` again to fill in DNS and the TLS origin certificate:
 
 ```bash
 HOSTINGER_TOKEN=<paste here>
-CLOUDFLARE_TOKEN=<paste here, or leave empty>
-printf '{"hostinger_token": "%s", "cloudflare_token": "%s"}' \
-  "$HOSTINGER_TOKEN" "$CLOUDFLARE_TOKEN" \
-  | age -R infra/age-recipients.txt -o infra/secrets.age
+printf '%s' "$HOSTINGER_TOKEN" | ./infra/up secrets set hostinger_token
+
+CLOUDFLARE_TOKEN=<paste here, or skip this line entirely>
+printf '%s' "$CLOUDFLARE_TOKEN" | ./infra/up secrets set cloudflare_token
 ```
 
 `infra/secrets.age` is encrypted — commit it. The tokens themselves never
@@ -135,9 +142,10 @@ can already decrypt `secrets.age` re-encrypts it for the new list.
 
 **Remove a teammate.** Delete them from `admins` and delete their
 `keys/<name>.pub`, then run `./infra/up`. Their account and access disappear
-on the next rebuild. Remove their line from `age-recipients.txt` and
-re-encrypt `secrets.age` too — and rotate the tokens, since they have seen
-them.
+on the next rebuild. Remove their line from `age-recipients.txt`, then
+re-run any `./infra/up secrets set <key>` (or `secrets edit <key>`) for each
+token — that re-encrypts `secrets.age` against the new recipient list as a
+side effect of saving. Rotate the tokens too, since they have seen them.
 
 **Open a shell on a server.**
 
@@ -159,6 +167,113 @@ and you typing the exact phrase it asks for:
 Anything else and nothing is bought. **stack-base can never cancel or delete
 a server** — it has no code that can. Cancel it yourself in hPanel.
 
+## Managing secrets
+
+`infra/secrets.age` holds every token, key, and the app's own `app_env` as
+one flat, encrypted JSON object. The safe way to touch it is one key at a
+time, never the whole bundle — these four subcommands are built so the safe
+way is also the easy way; none of them ever writes more than one key's
+value to disk, and only ever to RAM (never a real disk, and wiped
+immediately after):
+
+| Command | What it does |
+|---|---|
+| `./infra/up secrets keys` | Lists every key's NAME, sorted — never a value |
+| `./infra/up secrets set <key>` | Sets `<key>`'s value, read whole from stdin |
+| `./infra/up secrets unset <key>` | Removes `<key>` (refuses `hostinger_token` — `up` can't run without it) |
+| `./infra/up secrets edit <key>` | Opens `<key>`'s value in `$VISUAL`/`$EDITOR`/`vi` |
+
+`secrets set` reads its value from stdin — pipe it in, or redirect it from a
+file; it refuses to prompt at an interactive terminal (typing a secret
+straight into a terminal is too easy to leave sitting in shell history):
+
+```bash
+HOSTINGER_TOKEN=<paste here>
+printf '%s' "$HOSTINGER_TOKEN" | ./infra/up secrets set hostinger_token
+# or, from a file:
+./infra/up secrets set hostinger_token < token.txt
+```
+
+`secrets edit <key>` writes ONLY that key's value to a private, RAM-backed
+scratch file (mode 0600), opens it in your editor, reads it back, and wipes
+the file the moment the editor exits — even if you never save. If the
+content comes back unchanged, nothing is re-encrypted. Your editor's own
+swap/backup files are its own business, not stack-base's — for vim,
+consider `:set noswapfile nobackup noundofile` if that matters to you.
+
+Both `set` and `edit` validate `app_env` (every non-blank, non-comment line
+must look like `NAME=value`) before saving it — the same check `up` itself
+performs, so a mistake is caught here, not on the next `up`.
+
+Key names must match `^[a-z][a-z0-9_]{0,40}$` — lowercase letters, digits,
+and underscores, starting with a letter.
+
+## Deploying from GitHub Actions (optional)
+
+Deploys (`./infra/up deploy vX.Y.Z`) normally run from a laptop, over the
+same restricted SSH door every `stackbase.deploy.keys` entry uses. That
+door can optionally also be driven by GitHub Actions on every tag push,
+so a release ships as soon as you `git push --tags`, with no laptop
+involved.
+
+**What `./infra/up ci-setup` does:** generates a fresh ed25519 key pair,
+held only in RAM on your machine (never written to your disk), and pushes
+the PRIVATE half straight into a **repository-level** GitHub Actions secret
+(`STACK_DEPLOY_KEY`) — repo-level, not organization-level, because this
+GitHub plan has no org-level secrets/variables to use instead. The PUBLIC
+half is written to `infra/keys/ci-deploy.pub`, which you commit like any
+other key. `ci-setup` needs the [`gh` CLI](https://cli.github.com),
+authenticated (`gh auth login`).
+
+**Turn it on** (three commands):
+
+```bash
+./infra/up ci-setup
+git add infra/keys/ci-deploy.pub && git commit -m "ci: add the CI deploy key"
+./infra/up                 # installs the key on every server
+```
+
+then copy the workflow itself into place. `ci-setup` prints the exact `cp`
+command for you (the source path depends on which stack-base revision your
+project is pinned to), in the shape of:
+
+```bash
+mkdir -p .github/workflows
+cp <stack-base checkout>/templates/github/deploy-stack.yml .github/workflows/deploy-stack.yml
+git add .github/workflows/deploy-stack.yml && git commit -m "ci: add the deploy workflow"
+```
+
+**Rotate it** with `./infra/up ci-setup --rotate`, then commit the new
+`infra/keys/ci-deploy.pub` and run `./infra/up` — the OLD key keeps working
+on every server until that `./infra/up` has actually completed (it's what
+removes the old key from `stackbase.deploy.keys`), so there's no window
+where deploys are broken mid-rotation.
+
+**Turn it off:**
+
+```bash
+rm infra/keys/ci-deploy.pub
+./infra/up                                        # removes the key from every server
+gh secret delete STACK_DEPLOY_KEY --repo <owner>/<repo>
+```
+
+**What a leaked CI key can and cannot do.** It's just another
+`stackbase.deploy.keys` entry, confined the same way every one of them is
+(`restrict,command=...`): it can only ever run the door's six words --
+`upload`, `deploy`, `rollback`, `status`, `colors`, `releases`. It **cannot**
+get an interactive shell, **cannot** read `infra/secrets.age` or anything
+else on the server, and **cannot** touch nginx or TLS. It **can** deploy any
+version it can upload, and roll back — so protect your `v*` tags (branch
+protection rules, required reviews on who can push a tag) the same way
+you'd protect a production deploy button.
+
+**Migrations must be additive.** The app runs its own migrations at
+startup, and a CI-triggered deploy has no manual "review before it touches
+the database" step — so every migration must be additive-only (expand,
+migrate the data, THEN contract in a later release). A migration that
+drops or renames a column a still-running old release depends on can break
+the currently-live color mid-swap.
+
 ## The app's environment (`app_env`)
 
 The platform-base app reads its configuration — database URL, session
@@ -169,27 +284,28 @@ onto the server: it lives in `secrets.age` as one more key, `app_env`, and
 `./infra/up` pushes it to `/var/lib/stackbase/app.env` whenever its content
 changes.
 
-**Set it** with the same decrypt → edit → re-encrypt flow as any other change
-to `secrets.age`:
+**Set it** with [`secrets edit`](#managing-secrets) — it's one string of
+`KEY=value` lines, so an editor is the natural way to write it:
 
 ```bash
-age -d -i ~/.age/key.txt infra/secrets.age > /tmp/secrets.json
-$EDITOR /tmp/secrets.json   # add or update the "app_env" key -- see below
-age -R infra/age-recipients.txt -o infra/secrets.age /tmp/secrets.json
-rm -f /tmp/secrets.json
-./infra/up
+./infra/up secrets edit app_env
 ```
 
-`app_env`'s value is one string of `KEY=value` lines, so in `secrets.json` it
-looks like (fill in your own values, one `\n`-joined line per variable):
+your editor opens with `app_env`'s current value (empty the first time);
+save something like this and exit:
 
-```json
-{
-  "hostinger_token": "...",
-  "cloudflare_token": "...",
-  "app_env": "DATABASE_URL=postgres:///acme\nSESSION_SECRET=...\nCSRF_SECRET=...\nOAUTH_CLIENT_ID=...\nOAUTH_CLIENT_SECRET=...\nOAUTH_REDIRECT_URL=https://acme.example.com/auth/callback\n"
-}
 ```
+DATABASE_URL=postgres:///acme
+SESSION_SECRET=...
+CSRF_SECRET=...
+OAUTH_CLIENT_ID=...
+OAUTH_CLIENT_SECRET=...
+OAUTH_REDIRECT_URL=https://acme.example.com/auth/callback
+```
+
+then run `./infra/up` to push it. (`secrets set app_env` works too, if you'd
+rather pipe the whole value in from a script or a file — see
+[Managing secrets](#managing-secrets).)
 
 At minimum a platform-base app needs: `DATABASE_URL` (`postgres:///<project>`
 — peer auth over the Unix socket, no password), a session secret and a CSRF
@@ -219,6 +335,12 @@ environment simply applies from the first deploy.
 Removing `app_env` from `secrets.age` does **not** delete the file already on
 the server — that's a deliberate manual act (`./infra/up ssh a -- rm
 /var/lib/stackbase/app.env`), not something a config diff should do for you.
+
+`stack.state.json` records a sha256 digest of `app_env` (so `up` can tell
+whether it needs to push again) — that digest is only as unguessable as the
+secrets inside `app_env` itself, so keep at least one long, random value in
+there (the session secret already is one) rather than only short,
+guessable values.
 
 ## When it fails
 

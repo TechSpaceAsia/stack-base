@@ -43,6 +43,26 @@
       admins = builtins.listToAttrs
         (map (admin: { name = admin; value = adminKey admin; }) stack.admins);
 
+      # The optional GitHub Actions deploy key (Task 4). Present only once
+      # an operator has run `ci-setup`, which writes this file's PUBLIC half
+      # -- the private half never leaves GitHub (see the README). Layered on
+      # TOP of the admin keys below, never merged into `admins` itself: every
+      # admin key also goes into stackbase.deploy.keys (so an admin can
+      # deploy from their own laptop with the same key they already log in
+      # with), but `ci-deploy` must never be able to reach root's or any
+      # admin's own authorized_keys -- only nixos/deploy.nix's forced-command
+      # door reads stackbase.deploy.keys.
+      ciDeployPubPath = ./keys/ci-deploy.pub;
+      ciDeployKeys =
+        if builtins.pathExists ciDeployPubPath
+        then {
+          ci-deploy = builtins.replaceStrings [ "\n" ] [ "" ]
+            (builtins.readFile ciDeployPubPath);
+        }
+        else { };
+
+      deployKeys = admins // ciDeployKeys;
+
       nodeConfig = name:
         let
           extra = ./nodes + "/${name}/extra.nix";
@@ -55,6 +75,7 @@
               stackbase.project = stack.project;
               stackbase.domain = stack.domain;
               stackbase.admins = admins;
+              stackbase.deploy.keys = deployKeys;
             }
           ] ++ (if builtins.pathExists extra then [ extra ] else [ ]);
         };

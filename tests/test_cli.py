@@ -682,5 +682,75 @@ class SshCommandTests(unittest.TestCase):
             self.assertIn("known nodes: a", stderr.getvalue())
 
 
+class CiSetupAndSecretsWiringTests(unittest.TestCase):
+    """`ci-setup` and `secrets ...` reach the right module function with the
+    right arguments -- the argument-parsing/dispatch wiring in __main__.py,
+    not the underlying logic (covered in test_ci.py/test_secrets_cli.py).
+    """
+
+    def test_ci_setup_dispatches_with_rotate(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+
+            with mock.patch("stackbase.__main__.ci_setup") as ci_setup_mock:
+                main(["--infra-dir", str(infra_dir), "ci-setup", "--rotate"])
+
+            self.assertEqual(ci_setup_mock.call_args.args, (infra_dir,))
+            self.assertEqual(ci_setup_mock.call_args.kwargs.get("rotate"), True)
+
+    def test_ci_setup_without_rotate_defaults_to_false(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+
+            with mock.patch("stackbase.__main__.ci_setup") as ci_setup_mock:
+                main(["--infra-dir", str(infra_dir), "ci-setup"])
+
+            self.assertEqual(ci_setup_mock.call_args.kwargs.get("rotate"), False)
+
+    def test_secrets_keys_prints_each_name_on_its_own_line(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            stdout = io.StringIO()
+
+            with mock.patch("stackbase.__main__.list_key_names", return_value=["a_key", "b_key"]):
+                with contextlib.redirect_stdout(stdout):
+                    main(["--infra-dir", str(infra_dir), "secrets", "keys"])
+
+            self.assertEqual(stdout.getvalue().splitlines(), ["a_key", "b_key"])
+
+    def test_secrets_set_dispatches_with_the_key_argument(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+
+            with mock.patch("stackbase.__main__.set_key") as set_key_mock:
+                main(["--infra-dir", str(infra_dir), "secrets", "set", "cloudflare_token"])
+
+            self.assertEqual(set_key_mock.call_args.args, (infra_dir, "cloudflare_token"))
+
+    def test_secrets_unset_dispatches_with_the_key_argument(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+
+            with mock.patch("stackbase.__main__.unset_key") as unset_key_mock:
+                main(["--infra-dir", str(infra_dir), "secrets", "unset", "cloudflare_token"])
+
+            self.assertEqual(unset_key_mock.call_args.args, (infra_dir, "cloudflare_token"))
+
+    def test_secrets_edit_dispatches_with_the_key_argument(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+
+            with mock.patch("stackbase.__main__.edit_key") as edit_key_mock:
+                main(["--infra-dir", str(infra_dir), "secrets", "edit", "app_env"])
+
+            self.assertEqual(edit_key_mock.call_args.args, (infra_dir, "app_env"))
+
+
 if __name__ == "__main__":
     unittest.main()
