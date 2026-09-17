@@ -43,7 +43,7 @@ from stackbase.reconcile import (
     primary_node,
 )
 from stackbase.secrets import save_secrets
-from stackbase.ssh import Ssh
+from stackbase.ssh import HOST_KEY_CHANGED_MARKER, Ssh, host_key_mismatch_hint
 
 _HPANEL = "check the virtual machine in hPanel (https://hpanel.hostinger.com/)"
 _STREAM_TAIL_LINES = 20
@@ -88,6 +88,30 @@ def _purchase(ctx: Context, step: Step) -> str:
     return f"node {node}: bought and installed virtual machine {vps_id}"
 
 
+def _adopt(ctx: Context, step: Step) -> str:
+    """Record a vps_id `observe()` already found under this node's hostname.
+
+    Non-destructive: this never talks to Hostinger. `observe()` (GET-only)
+    already did the lookup and put the vps_id on `ctx.observed.nodes[node]`
+    -- ADOPT's only job is to persist it to state instead of buying a second
+    server for the same node.
+    """
+    node = _node(step)
+    observed = ctx.observed.nodes.get(node)
+    vps_id = observed.vps_id if observed else None
+    if vps_id is None:
+        raise StackError(
+            f"node {node} has no adoptable virtual machine on record",
+            "this is a bug in stack-base -- please report it",
+        )
+    hostname = hostname_for(ctx.cfg, node)
+    ctx.emit(
+        f"! found an existing server {vps_id} named {hostname} -- adopting it instead of buying another"
+    )
+    ctx.node_state(node).vps_id = vps_id
+    return f"node {node}: adopted existing virtual machine {vps_id} ({hostname})"
+
+
 def _setup(ctx: Context, step: Step) -> str:
     node = _node(step)
     vps_id = _vps_id(ctx, node)
@@ -101,7 +125,17 @@ def _setup(ctx: Context, step: Step) -> str:
         public_key_ids=extra_ids,
     )
     _warn(ctx, warnings)
-    ctx.node_state(node).vps_id = vps_id
+    node_state = ctx.node_state(node)
+    node_state.vps_id = vps_id
+    if node_state.host_key_pinned:
+        # stack-base itself just reinstalled this machine, so its host key
+        # is about to change for a reason stack-base caused -- clear the
+        # stale pin here rather than forcing the reinstall-vs-interception
+        # decision onto the operator the next time something touches ssh
+        # (that decision only belongs to a change stack-base did NOT cause).
+        if node_state.ipv4:
+            ctx.ssh(node).unpin_host_key()
+        node_state.host_key_pinned = False
     return f"node {node}: NixOS installed on virtual machine {vps_id}"
 
 
@@ -235,7 +269,19 @@ def _ensure_origin_cert(ctx: Context, _step: Step) -> str:
     # every printed line and every error message masks the new key too.
     ctx.secrets["origin_cert"] = cert_pem
     ctx.secrets["origin_key"] = key_pem
-    save_secrets(ctx.infra_dir, ctx.secrets)
+    try:
+        save_secrets(ctx.infra_dir, ctx.secrets)
+    except StackError as exc:
+        # Cloudflare has already issued the certificate by this point -- a
+        # failure to save it locally does not un-issue it. Say so, so the
+        # operator doesn't go looking for a cert that silently vanished.
+        raise StackError(
+            exc.message,
+            f"{exc.hint} -- a Cloudflare origin certificate for {domain} was just issued and is "
+            "now orphaned (it was never saved to secrets.age); running `up` again will issue a "
+            "fresh one, and the orphaned certificate can be revoked in the Cloudflare dashboard -> "
+            "SSL/TLS -> Origin Server",
+        ) from exc
     return f"origin certificate for {domain} created and stored in infra/secrets.age"
 
 
@@ -320,8 +366,11 @@ def _push_origin_cert(ctx: Context, ssh: Ssh) -> None:
     whenever EITHER `origin.crt` or `origin.key` is missing, so the two files
     must never be observably out of step: they are written under `.new` names
     with their final owner and mode, and a single remote command moves the
-    key and then the certificate into place. A reboot at any instant during
-    this sees either both placeholders or both real files.
+    key and then the certificate into place. This is two `mv`s, not one --
+    a reboot in the narrow window between them would see the new key paired
+    with the old certificate (or, on the very first push, a missing
+    certificate), so "atomic" here means "as good as two sequential renames
+    get", not a guarantee against every possible timing.
     """
     cert = ctx.secrets.get("origin_cert")
     key = ctx.secrets.get("origin_key")
@@ -397,13 +446,21 @@ def _rebuild(ctx: Context, step: Step) -> str:
 
     returncode, tail = _stream(ctx, ssh, _rebuild_command(ctx, node, "test"))
     if returncode != 0:
+        if _tail_has_host_key_changed(tail):
+            raise _host_key_mismatch_error(ctx, node)
         raise StackError(
             f"node {node}: the new configuration failed to build or activate",
-            _tail_hint(tail, "fix the configuration in infra/ and run `up` again -- nothing was made permanent"),
+            _tail_hint(tail, _test_failure_advice(node, tail)),
         )
 
     probe = ctx.ssh(node).run("true", check=False)  # a NEW connection, on purpose
     if probe.returncode != 0:
+        if HOST_KEY_CHANGED_MARKER in (probe.stderr or ""):
+            # This is a change stack-base did NOT cause (an operator-side
+            # hPanel reinstall, say) -- the plain-English reinstall-vs-
+            # interception hint belongs here, not a raw ssh stderr dump that
+            # reads like the config itself locked the operator out.
+            raise _host_key_mismatch_error(ctx, node)
         raise StackError(
             f"node {node} stopped answering SSH after the new configuration was activated",
             "reboot the VPS from hPanel to return to the previous config, then fix the "
@@ -412,6 +469,8 @@ def _rebuild(ctx: Context, step: Step) -> str:
 
     returncode, tail = _stream(ctx, ssh, _rebuild_command(ctx, node, "switch"))
     if returncode != 0:
+        if _tail_has_host_key_changed(tail):
+            raise _host_key_mismatch_error(ctx, node)
         raise StackError(
             f"node {node}: making the new configuration permanent failed",
             _tail_hint(tail, "the node is still running the tested configuration -- fix infra/ and run `up` again"),
@@ -427,6 +486,56 @@ def _rebuild(ctx: Context, step: Step) -> str:
     if ctx.stackbase_src:
         _fetch_lock_file(ctx, ssh)
     return f"node {node}: NixOS rebuilt and switched"
+
+
+def _tail_has_host_key_changed(tail: list[str]) -> bool:
+    return any(HOST_KEY_CHANGED_MARKER in line for line in tail)
+
+
+def _host_key_mismatch_error(ctx: Context, node: str) -> StackError:
+    known_hosts = ctx.infra_dir / "known_hosts"
+    ip = ctx.node_state(node).ipv4 or node
+    return StackError(
+        f"the SSH host key for {ip} does not match the pinned entry in {known_hosts}",
+        host_key_mismatch_hint(known_hosts),
+    )
+
+
+_BOOT_GAP_MARKERS = ("boot.loader", "fileSystems")
+
+_REBOOT_ADVICE = (
+    "if the server is now unreachable, reboot it from hPanel -- the tested configuration is "
+    "discarded on reboot"
+)
+
+
+def _test_failure_advice(node: str, tail: list[str]) -> str:
+    """The advice half of the `nixos-rebuild test` failure hint.
+
+    `nixos-generate-config` puts a provider image's `boot.loader.*` (and
+    often static `networking.*`) into `configuration.nix`, which this
+    project's flake does not import -- only `hardware-configuration.nix`
+    does (see `_capture_hardware`). So the very first `test` on a fresh
+    provider image commonly fails eval with a `boot.loader`/`fileSystems`
+    assertion, before anything is activated. When the build output looks
+    like that, point the operator straight at the fix instead of the
+    generic "go fix infra/" advice.
+
+    Either way, the reboot instruction is appended unconditionally: a
+    config that drops networking kills the streaming ssh connection with
+    exit 255, landing on this exact path with the node now potentially
+    unreachable and running the broken (but not yet permanent) config.
+    """
+    combined = "\n".join(tail)
+    if any(marker in combined for marker in _BOOT_GAP_MARKERS):
+        specific = (
+            f"this looks like a first-run bootloader/network gap -- the provider's boot/network "
+            f"settings live in infra/nodes/{node}/configuration.nix; copy the boot.loader.* (and any "
+            f"static networking.*) lines into infra/nodes/{node}/extra.nix and run `up` again"
+        )
+    else:
+        specific = "fix the configuration in infra/ and run `up` again -- nothing was made permanent"
+    return f"{specific} -- {_REBOOT_ADVICE}"
 
 
 def _rebuild_command(ctx: Context, node: str, mode: str) -> str:
@@ -461,7 +570,15 @@ def _stream(ctx: Context, ssh: Ssh, command: str) -> tuple[int, list[str]]:
         # bursts, which for a ten-minute build means ten minutes of nothing
         # followed by a wall of text.
         process = ctx.popen(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            # A rebuild can take minutes; without this, any stray input typed
+            # at the terminal in the meantime would be swallowed by the
+            # streamed ssh process instead of reaching the shell afterwards.
+            stdin=subprocess.DEVNULL,
         )
     except FileNotFoundError as exc:
         raise StackError(
@@ -538,6 +655,7 @@ def _vps_id(ctx: Context, node: str) -> int:
 
 _EXECUTORS: dict[Action, Callable[[Context, Step], str]] = {
     Action.PURCHASE: _purchase,
+    Action.ADOPT: _adopt,
     Action.SETUP: _setup,
     Action.WAIT_RUNNING: _wait_running,
     Action.ENSURE_KEYS: _ensure_keys,

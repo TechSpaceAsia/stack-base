@@ -261,6 +261,23 @@ class PlanTests(unittest.TestCase):
 
         self.assertEqual(actions, [Action.ENSURE_FIREWALL])
 
+    def test_observed_ip_drift_replans_pin_host_key(self) -> None:
+        """Finding 6(a): an IP change (not caused by a run we did) must be re-pinned."""
+        observed = _converged_observed()
+        moved = {"a": replace(observed.nodes["a"], ipv4="9.9.9.9")}
+        observed = replace(observed, nodes=moved)
+
+        actions = [step.action for step in plan(_config(), _converged_state(), observed)]
+
+        self.assertIn(Action.PIN_HOST_KEY, actions)
+
+    def test_observed_ip_not_yet_in_known_hosts_replans_pin_host_key_even_when_unchanged(self) -> None:
+        observed = replace(_converged_observed(), local=_local(has_origin_cert=True, pinned=(), captured=("a",)))
+
+        actions = [step.action for step in plan(_config(), _converged_state(), observed)]
+
+        self.assertIn(Action.PIN_HOST_KEY, actions)
+
     def test_missing_hardware_file_replans_capture_even_when_state_says_captured(self) -> None:
         observed = replace(
             _converged_observed(),
@@ -377,6 +394,9 @@ class ObserveTests(unittest.TestCase):
     def test_observe_skips_the_vm_lookup_for_a_node_that_does_not_exist_yet(self) -> None:
         cfg = _config(nodes={"a": Node(name="a", role="primary", vps_id=None)})
         with FakeServer() as server:
+            # No hostname match on the account -- the adoption lookup finds
+            # nothing, and the node still needs a PURCHASE.
+            server.script("GET", "/api/vps/v1/virtual-machines", 200, [])
             server.script("GET", "/api/vps/v1/public-keys?page=1", 200, {"data": [], "meta": _meta(0)})
             server.script("GET", "/api/vps/v1/firewall?page=1", 200, {"data": [], "meta": _meta(0)})
             server.script("GET", f"/zones?name={_DOMAIN}&page=1", 200, _cf([{"id": "zone1", "name": _DOMAIN}], result_info=_page()))
@@ -387,10 +407,162 @@ class ObserveTests(unittest.TestCase):
             observed = observe(cfg, StackState(), hostinger, cloudflare, local=_local())
 
             self.assertIsNone(observed.nodes["a"].vps_id)
+            self.assertFalse(observed.nodes["a"].adopted)
             self.assertNotIn(
                 f"/api/vps/v1/virtual-machines/{_VPS_ID}",
                 [request["path"] for request in server.requests],
             )
+            self.assertIn(Action.PURCHASE, [s.action for s in plan(cfg, StackState(), observed)])
+
+
+class AdoptionTests(unittest.TestCase):
+    """Finding 4(b): a lost purchase response must not cause a double purchase."""
+
+    def _vm_for_adoption(self, *, hostname: str, vps_id: int = 9999) -> dict:
+        return {
+            "id": vps_id,
+            "hostname": hostname,
+            "state": "running",
+            "actions_lock": "unlocked",
+            "firewall_group_id": None,
+            "ipv4": [{"id": 1, "address": _IPV4}],
+            "ipv6": None,
+        }
+
+    def test_a_single_hostname_match_is_adopted_instead_of_purchased(self) -> None:
+        cfg = _config(nodes={"a": Node(name="a", role="primary", vps_id=None)})
+        hostname = hostname_for(cfg, "a")
+        with FakeServer() as server:
+            server.script("GET", "/api/vps/v1/virtual-machines", 200, [self._vm_for_adoption(hostname=hostname)])
+            server.script("GET", "/api/vps/v1/virtual-machines/9999", 200, self._vm_for_adoption(hostname=hostname))
+            server.script("GET", "/api/vps/v1/public-keys?page=1", 200, {"data": [], "meta": _meta(0)})
+            server.script("GET", "/api/vps/v1/firewall?page=1", 200, {"data": [], "meta": _meta(0)})
+            server.script("GET", f"/zones?name={_DOMAIN}&page=1", 200, _cf([{"id": "zone1", "name": _DOMAIN}], result_info=_page()))
+            server.script("GET", f"/zones/zone1/dns_records?type=A&name={_DOMAIN}&page=1", 200, _cf([], result_info=_page()))
+            hostinger = HostingerClient("htok", base_url=server.url)
+            cloudflare = CloudflareClient("ctok", base_url=server.url)
+
+            observed = observe(cfg, StackState(), hostinger, cloudflare, local=_local())
+
+            self.assertEqual(observed.nodes["a"].vps_id, 9999)
+            self.assertTrue(observed.nodes["a"].adopted)
+
+            actions = [step.action for step in plan(cfg, StackState(), observed)]
+            self.assertIn(Action.ADOPT, actions)
+            self.assertNotIn(Action.PURCHASE, actions)
+
+    def test_more_than_one_match_raises_telling_the_operator_to_set_vps_id(self) -> None:
+        cfg = _config(nodes={"a": Node(name="a", role="primary", vps_id=None)})
+        hostname = hostname_for(cfg, "a")
+        with FakeServer() as server:
+            server.script(
+                "GET",
+                "/api/vps/v1/virtual-machines",
+                200,
+                [self._vm_for_adoption(hostname=hostname, vps_id=1), self._vm_for_adoption(hostname=hostname, vps_id=2)],
+            )
+            hostinger = HostingerClient("htok", base_url=server.url)
+            cloudflare = CloudflareClient("ctok", base_url=server.url)
+
+            with self.assertRaises(StackError) as caught:
+                observe(cfg, StackState(), hostinger, cloudflare, local=_local())
+
+            self.assertIn("stack.toml", str(caught.exception))
+            self.assertIn(hostname, str(caught.exception))
+
+    def test_adopt_step_records_the_vps_id_and_prints_a_loud_line(self) -> None:
+        with Infra() as infra_dir:
+            hostname = hostname_for(_config(), "a")
+            observed = replace(
+                _observed_fresh(),
+                nodes={"a": ObservedNode(vps_id=4321, state="initial", actions_lock="unlocked", adopted=True)},
+            )
+            ctx, lines = _context(infra_dir, observed=observed)
+
+            apply([Step(Action.ADOPT, "a")], ctx, allow_purchase=False)
+
+            self.assertEqual(ctx.state.nodes["a"].vps_id, 4321)
+            self.assertTrue(any("adopting it instead of buying another" in line for line in lines))
+            self.assertTrue(any("4321" in line and hostname in line for line in lines))
+
+
+class CloudflareIpRangeWarningTests(unittest.TestCase):
+    """Minor i: warn (never error) on drift between live Cloudflare edge
+
+    ranges and the nixos/cloudflare-ips.nix snapshot.
+    """
+
+    def _snapshot(self, tmp: str, v4: list[str], v6: list[str] = ()) -> Path:
+        path = Path(tmp) / "cloudflare-ips.nix"
+        v4_lines = "\n".join(f'    "{ip}"' for ip in v4)
+        v6_lines = "\n".join(f'    "{ip}"' for ip in v6)
+        path.write_text(f"{{\n  v4 = [\n{v4_lines}\n  ];\n  v6 = [\n{v6_lines}\n  ];\n}}\n", encoding="utf-8")
+        return path
+
+    def _ips_body(self, v4: list[str], v6: list[str] = ()) -> dict:
+        return _cf({"ipv4_cidrs": v4, "ipv6_cidrs": v6})
+
+    def test_equal_ranges_produce_no_warning(self) -> None:
+        with TemporaryDirectory() as tmp:
+            snapshot = self._snapshot(tmp, ["1.2.3.0/24"], ["::/32"])
+            with FakeServer() as server:
+                _script_observe(server)
+                server.script("GET", "/ips", 200, self._ips_body(["1.2.3.0/24"], ["::/32"]))
+                hostinger = HostingerClient("htok", base_url=server.url)
+                cloudflare = CloudflareClient("ctok", base_url=server.url)
+
+                with mock.patch("stackbase.reconcile._cloudflare_ips_path", return_value=snapshot):
+                    observed = observe(_config(), StackState(), hostinger, cloudflare, local=_local())
+
+            self.assertEqual(observed.cloudflare_ip_warnings, [])
+
+    def test_differing_ranges_produce_exactly_one_warning_listing_added_and_removed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            snapshot = self._snapshot(tmp, ["1.2.3.0/24", "5.6.7.0/24"])
+            with FakeServer() as server:
+                _script_observe(server)
+                server.script("GET", "/ips", 200, self._ips_body(["1.2.3.0/24", "9.9.9.0/24"]))
+                hostinger = HostingerClient("htok", base_url=server.url)
+                cloudflare = CloudflareClient("ctok", base_url=server.url)
+
+                with mock.patch("stackbase.reconcile._cloudflare_ips_path", return_value=snapshot):
+                    observed = observe(_config(), StackState(), hostinger, cloudflare, local=_local())
+
+            self.assertEqual(len(observed.cloudflare_ip_warnings), 1)
+            warning = observed.cloudflare_ip_warnings[0]
+            self.assertIn("9.9.9.0/24", warning)
+            self.assertIn("5.6.7.0/24", warning)
+            self.assertIn("403", warning)
+
+    def test_a_fetch_failure_produces_a_warning_and_the_run_continues(self) -> None:
+        with TemporaryDirectory() as tmp:
+            snapshot = self._snapshot(tmp, ["1.2.3.0/24"])
+            with FakeServer() as server:
+                _script_observe(server)
+                server.script("GET", "/ips", 503, {"error": "unavailable"})
+                hostinger = HostingerClient("htok", base_url=server.url)
+                cloudflare = CloudflareClient("ctok", base_url=server.url)
+
+                with mock.patch("stackbase.reconcile._cloudflare_ips_path", return_value=snapshot):
+                    observed = observe(_config(), StackState(), hostinger, cloudflare, local=_local())
+
+            self.assertEqual(len(observed.cloudflare_ip_warnings), 1)
+            self.assertIn("could not fetch", observed.cloudflare_ip_warnings[0])
+
+    def test_a_missing_snapshot_file_is_skipped_silently(self) -> None:
+        with TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "does-not-exist.nix"
+            with FakeServer() as server:
+                _script_observe(server)
+                hostinger = HostingerClient("htok", base_url=server.url)
+                cloudflare = CloudflareClient("ctok", base_url=server.url)
+
+                with mock.patch("stackbase.reconcile._cloudflare_ips_path", return_value=missing):
+                    observed = observe(_config(), StackState(), hostinger, cloudflare, local=_local())
+
+            self.assertEqual(observed.cloudflare_ip_warnings, [])
+            # skipped silently means no /ips request was even made
+            self.assertNotIn("/ips", [r["path"] for r in server.requests])
 
 
 # --------------------------------------------------------------------------
@@ -613,6 +785,29 @@ class ApplyStepTests(unittest.TestCase):
             attach = next(r for r in server.requests if "attach" in r["path"])
             self.assertEqual(attach["body"], {"ids": [12]})
 
+    def test_setup_clears_a_previously_pinned_host_key_it_is_about_to_invalidate(self) -> None:
+        """Finding 6(b): a SETUP stack-base performs is a change it caused,
+
+        so the reinstall-vs-interception decision must not fall on the
+        operator afterwards -- clear the stale pin instead.
+        """
+        with Infra() as infra_dir, FakeServer() as server:
+            server.script("GET", "/api/vps/v1/templates", 200, [{"id": 1130, "name": "NixOS 26.05"}])
+            server.script("GET", "/api/vps/v1/data-centers", 200, [{"id": 21, "name": "kul"}])
+            server.script("POST", f"/api/vps/v1/virtual-machines/{_VPS_ID}/setup", 200, {})
+            server.script("POST", f"/api/vps/v1/public-keys/attach/{_VPS_ID}", 200, {})
+            (infra_dir / "known_hosts").write_text(f"{_IPV4} ssh-ed25519 AAAAoldkeybody\n", encoding="utf-8")
+            state = StackState(
+                nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)},
+                hostinger=HostingerState(ssh_key_ids={"matt": 11, "kim": 12}),
+            )
+            ctx, _ = _context(infra_dir, state=state, server=server)
+
+            apply([Step(Action.SETUP, "a")], ctx, allow_purchase=False)
+
+            self.assertFalse(ctx.state.nodes["a"].host_key_pinned)
+            self.assertNotIn(_IPV4, (infra_dir / "known_hosts").read_text())
+
     def test_wait_running_records_both_addresses_and_waits_for_sshd(self) -> None:
         with Infra() as infra_dir, FakeServer() as server:
             server.script("GET", f"/api/vps/v1/virtual-machines/{_VPS_ID}", 200, _vm_body())
@@ -716,6 +911,23 @@ class OriginCertTests(unittest.TestCase):
             for path in infra_dir.rglob("*"):
                 if path.is_file():
                     self.assertNotIn(_KEY_PEM.strip(), path.read_text(encoding="utf-8", errors="replace"))
+
+    def test_a_save_secrets_failure_after_issuance_says_the_cert_is_orphaned(self) -> None:
+        with Infra() as infra_dir, FakeServer() as server:
+            server.script("POST", "/certificates", 200, _cf({"certificate": _CERT_PEM}))
+            ctx, _ = _context(infra_dir, server=server, runner=self._runner())
+
+            def boom(_dir, _data):
+                raise StackError("failed to encrypt secrets to infra/secrets.age", "disk full")
+
+            with mock.patch("stackbase.steps.save_secrets", boom):
+                with self.assertRaises(StackError) as caught:
+                    apply([Step(Action.ENSURE_ORIGIN_CERT)], ctx, allow_purchase=False)
+
+            message = str(caught.exception).lower()
+            self.assertIn("orphaned", message)
+            self.assertIn("running `up` again", message)
+            self.assertIn("revoked", message)
 
     def test_the_csr_is_sent_to_cloudflare(self) -> None:
         with Infra() as infra_dir, FakeServer() as server:
@@ -833,6 +1045,18 @@ class RebuildTests(unittest.TestCase):
             self.assertEqual(ctx.state.nodes["a"].applied_rev, compute_rev(infra_dir))
             self.assertTrue(any("building..." in line for line in lines))
 
+    def test_streamed_rebuild_never_lets_the_child_read_our_stdin(self) -> None:
+        popen = FakePopen()
+        popen.script(0, "building...\n")
+        popen.script(0, "switching...\n")
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(infra_dir, popen)
+
+            apply([Step(Action.REBUILD, "a")], ctx, allow_purchase=False)
+
+            for call in popen.calls:
+                self.assertEqual(call["kwargs"].get("stdin"), subprocess.DEVNULL)
+
     def test_it_aborts_before_switch_when_the_post_test_probe_fails(self) -> None:
         popen = FakePopen()
         popen.script(0, "building...\n")
@@ -846,6 +1070,70 @@ class RebuildTests(unittest.TestCase):
             self.assertIn("reboot", str(caught.exception).lower())
             self.assertEqual(len(popen.calls), 1, "switch must never run after a failed probe")
             self.assertIsNone(ctx.state.nodes["a"].applied_rev)
+
+    def test_test_failure_always_mentions_rebooting_if_unreachable(self) -> None:
+        popen = FakePopen()
+        popen.script(1, "error: some generic problem\n")
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(infra_dir, popen)
+
+            with self.assertRaises(StackError) as caught:
+                apply([Step(Action.REBUILD, "a")], ctx, allow_purchase=False)
+
+            hint = str(caught.exception).lower()
+            self.assertIn("reboot", hint)
+            self.assertIn("hpanel", hint)
+
+    def test_a_bootloader_gap_gets_a_specific_hint_naming_extra_nix(self) -> None:
+        popen = FakePopen()
+        popen.script(
+            1,
+            "error: You must set the option `boot.loader.grub.devices' or "
+            "`boot.loader.grub.mirroredBoots' to make the system bootable.\n",
+        )
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(infra_dir, popen)
+
+            with self.assertRaises(StackError) as caught:
+                apply([Step(Action.REBUILD, "a")], ctx, allow_purchase=False)
+
+            hint = str(caught.exception)
+            self.assertIn("infra/nodes/a/configuration.nix", hint)
+            self.assertIn("infra/nodes/a/extra.nix", hint)
+            self.assertIn("reboot", hint.lower())
+
+    def test_a_missing_filesystems_assertion_also_gets_the_bootloader_gap_hint(self) -> None:
+        popen = FakePopen()
+        popen.script(1, "error: The fileSystems option does not specify your root file system.\n")
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(infra_dir, popen)
+
+            with self.assertRaises(StackError) as caught:
+                apply([Step(Action.REBUILD, "a")], ctx, allow_purchase=False)
+
+            hint = str(caught.exception)
+            self.assertIn("infra/nodes/a/extra.nix", hint)
+
+    def test_a_host_key_change_at_the_probe_gets_the_pin_hint_not_the_lockout_hint(self) -> None:
+        """Finding 6(b): an operator-side reinstall (same IP, new key, no
+
+        SETUP by us) must reach pin_host_key's plain-English hint rather
+        than the generic "reboot from hPanel, you're locked out" advice.
+        """
+        popen = FakePopen()
+        popen.script(0, "building...\n")
+        with Infra() as infra_dir:
+            banner = "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n"
+            runner = FakeRunner(default=_cp(["ssh"], returncode=255, stderr=banner))
+            ctx, _ = self._ctx(infra_dir, popen, runner=runner)
+
+            with self.assertRaises(StackError) as caught:
+                apply([Step(Action.REBUILD, "a")], ctx, allow_purchase=False)
+
+            hint = str(caught.exception).lower()
+            self.assertIn("intercept", hint)
+            self.assertIn("reinstall", hint.replace("re-install", "reinstall"))
+            self.assertNotIn("reboot the vps", hint)
 
     def test_it_does_not_record_the_rev_when_switch_fails(self) -> None:
         popen = FakePopen()

@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -38,6 +39,12 @@ from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
 from stackbase.secrets import redact
 from stackbase.ssh import Ssh
+
+# nixos/cloudflare-ips.nix, located relative to this package -- present in
+# stack-base's own checkout (whether run from $STACKBASE_SRC or the cached
+# pinned rev), never shipped into a consuming project's infra/.
+_CLOUDFLARE_IPS_NIX = Path(__file__).resolve().parent.parent / "nixos" / "cloudflare-ips.nix"
+_CIDR_RE = re.compile(r'"([0-9A-Fa-f:.]+/\d+)"')
 
 # The node is reached as root: the NixOS base module keeps key-only root
 # login and gives root every admin's key, because the very first rebuild
@@ -74,6 +81,7 @@ class Action(Enum):
     """
 
     PURCHASE = "purchase"
+    ADOPT = "adopt"
     SETUP = "setup"
     WAIT_RUNNING = "wait_running"
     ENSURE_KEYS = "ensure_keys"
@@ -90,6 +98,7 @@ class Action(Enum):
 # infrastructure for a living. These are printed verbatim by `--plan`.
 _DOING: dict[Action, str] = {
     Action.PURCHASE: "buying and setting up a new virtual machine",
+    Action.ADOPT: "adopting an existing virtual machine already found in Hostinger",
     Action.SETUP: "installing NixOS on the virtual machine",
     Action.WAIT_RUNNING: "waiting for the server to come up",
     Action.ENSURE_KEYS: "registering the team's SSH keys with Hostinger",
@@ -166,6 +175,13 @@ def compute_rev(infra_dir: Path, *, stackbase_src: str | None = None) -> str:
     It is recomputed when the rebuild records it, not reused from planning
     time: `CAPTURE_HARDWARE` writes into `infra/` mid-run, so the tree that
     actually gets pushed is not always the tree the run was planned against.
+
+    This hashes all of `infra/` as one tree, not per-node -- so capturing
+    node b's hardware (which writes into `infra/nodes/b/`) changes the rev
+    for every node, including node a. That triggers a harmless no-op rebuild
+    on node a the next time it runs (its own configuration hasn't actually
+    changed), which is the price of a single project-wide fingerprint rather
+    than per-node bookkeeping.
     """
     digest = hashlib.sha256()
     digest.update(_tree_digest(infra_dir, PUSH_EXCLUDES, skip=_REV_SKIP).encode("utf-8"))
@@ -279,6 +295,10 @@ class ObservedNode:
     ipv4: str | None = None
     ipv6: str | None = None
     firewall_group_id: int | None = None
+    # True when `vps_id` was not found in stack.toml/state.json but was
+    # discovered on Hostinger by hostname -- see `_find_adoptable_vms`. This
+    # is what tells `plan()` to emit ADOPT instead of PURCHASE.
+    adopted: bool = False
 
 
 @dataclass(frozen=True)
@@ -292,6 +312,10 @@ class Observed:
     zone_name: str | None = None
     record_id: str | None = None
     record_matches: bool = False
+    # GET-only, informational: differences between Cloudflare's live edge
+    # ranges and the snapshot in nixos/cloudflare-ips.nix. Never fatal --
+    # see `_cloudflare_ip_warnings`.
+    cloudflare_ip_warnings: list[str] = field(default_factory=list)
 
 
 def firewall_name(cfg: StackConfig) -> str:
@@ -336,6 +360,60 @@ def primary_node(cfg: StackConfig) -> str:
     )
 
 
+def _cloudflare_ips_path() -> Path:
+    """A seam for tests -- production always wants `_CLOUDFLARE_IPS_NIX`."""
+    return _CLOUDFLARE_IPS_NIX
+
+
+def _snapshot_cloudflare_ranges() -> frozenset[str] | None:
+    """The CIDRs currently baked into nixos/cloudflare-ips.nix, or `None` if missing."""
+    path = _cloudflare_ips_path()
+    if not path.exists():
+        return None
+    return frozenset(_CIDR_RE.findall(path.read_text(encoding="utf-8")))
+
+
+def _cloudflare_ip_warnings(cloudflare: CloudflareClient) -> list[str]:
+    """Compare Cloudflare's live edge ranges against nixos/cloudflare-ips.nix.
+
+    GET-only and never fatal: nginx's allow-list (app-host.nix) is built from
+    the static snapshot, so if Cloudflare has changed its published ranges
+    since the snapshot was last updated, visitors arriving via a brand new
+    range would get a 403 until stack-base is updated -- worth a loud
+    warning, never worth failing the run over. A missing snapshot file (e.g.
+    running against a stripped-down checkout) or a failed fetch both skip
+    silently/with-a-warning rather than raise.
+    """
+    snapshot = _snapshot_cloudflare_ranges()
+    if snapshot is None:
+        return []
+
+    try:
+        live_v4, live_v6 = cloudflare.ip_ranges()
+    except StackError as exc:
+        return [
+            f"could not fetch Cloudflare's current IP ranges to check against "
+            f"nixos/cloudflare-ips.nix ({exc}) -- skipping the check this run"
+        ]
+
+    live = frozenset(live_v4) | frozenset(live_v6)
+    if live == snapshot:
+        return []
+
+    added = sorted(live - snapshot)
+    removed = sorted(snapshot - live)
+    parts = []
+    if added:
+        parts.append(f"added: {', '.join(added)}")
+    if removed:
+        parts.append(f"removed: {', '.join(removed)}")
+    return [
+        "Cloudflare's published edge IP ranges have changed since nixos/cloudflare-ips.nix was "
+        f"last updated ({'; '.join(parts)}) -- visitors arriving via a new range will get 403 "
+        "until stack-base's nginx allow-list is updated"
+    ]
+
+
 def observe(
     cfg: StackConfig,
     state: StackState,
@@ -350,9 +428,16 @@ def observe(
     `local_facts`); it is passed in rather than gathered here so that
     `observe` stays purely the network-reading half.
     """
+    unresolved_nodes = [
+        name
+        for name, node in cfg.nodes.items()
+        if node.vps_id is None and (state.nodes.get(name) is None or state.nodes[name].vps_id is None)
+    ]
+    adoptable = _find_adoptable_vms(hostinger, cfg, unresolved_nodes) if unresolved_nodes else {}
+
     nodes: dict[str, ObservedNode] = {}
     for name, node in cfg.nodes.items():
-        nodes[name] = _observe_node(node, state.nodes.get(name), hostinger)
+        nodes[name] = _observe_node(node, state.nodes.get(name), hostinger, adopt_vps_id=adoptable.get(name))
 
     public_key_ids = _observe_public_keys(cfg, hostinger)
     firewall = _find_named(hostinger.list_firewalls(), firewall_name(cfg))
@@ -362,6 +447,8 @@ def observe(
     zone_id, zone_name = cloudflare.zone_for(cfg.domain)
     expected_ip = _expected_primary_ip(cfg, state, nodes)
     record_id, record_matches = _observe_record(cloudflare, zone_id, cfg.domain, expected_ip)
+
+    cloudflare_ip_warnings = _cloudflare_ip_warnings(cloudflare)
 
     return Observed(
         local=local,
@@ -373,13 +460,67 @@ def observe(
         zone_name=zone_name,
         record_id=record_id,
         record_matches=record_matches,
+        cloudflare_ip_warnings=cloudflare_ip_warnings,
     )
 
 
-def _observe_node(node: Node, node_state: NodeState | None, hostinger: HostingerClient) -> ObservedNode:
+def _find_adoptable_vms(
+    hostinger: HostingerClient, cfg: StackConfig, node_names: list[str]
+) -> dict[str, int]:
+    """For nodes with no `vps_id` anywhere, look for an already-existing
+    Hostinger VM whose hostname matches what stack-base would have named it
+    (`hostname_for`) -- most often the result of a PURCHASE whose response
+    was lost (network error, killed run, ...) after the charge already went
+    through. Exactly one match makes that node adoptable, so `plan()` can
+    emit ADOPT instead of PURCHASE. More than one match is ambiguous --
+    stack-base will not guess which one belongs to this project, and raises
+    (this is still a GET-only read, not a write).
+    """
+    wanted = {hostname_for(cfg, name): name for name in node_names}
+    if not wanted:
+        return {}
+
+    by_hostname: dict[str, list[int]] = {}
+    for vm in hostinger.list_vms():
+        hostname = vm.get("hostname")
+        vps_id = vm.get("id")
+        if isinstance(hostname, str) and isinstance(vps_id, int) and hostname in wanted:
+            by_hostname.setdefault(hostname, []).append(vps_id)
+
+    found: dict[str, int] = {}
+    for hostname, ids in by_hostname.items():
+        name = wanted[hostname]
+        if len(ids) > 1:
+            raise StackError(
+                f"found {len(ids)} existing virtual machines named '{hostname}' in Hostinger",
+                f"put the right one's id in stack.toml as vps_id for node '{name}' -- stack-base "
+                "will not guess which one to adopt",
+            )
+        found[name] = ids[0]
+    return found
+
+
+def _observe_node(
+    node: Node,
+    node_state: NodeState | None,
+    hostinger: HostingerClient,
+    *,
+    adopt_vps_id: int | None = None,
+) -> ObservedNode:
     vps_id = node.vps_id or (node_state.vps_id if node_state else None)
     if vps_id is None:
-        return ObservedNode()
+        if adopt_vps_id is None:
+            return ObservedNode()
+        vm = hostinger.get_vm(adopt_vps_id)
+        return ObservedNode(
+            vps_id=adopt_vps_id,
+            state=vm.get("state"),
+            actions_lock=vm.get("actions_lock"),
+            ipv4=first_address(vm.get("ipv4")),
+            ipv6=first_address(vm.get("ipv6")),
+            firewall_group_id=vm.get("firewall_group_id"),
+            adopted=True,
+        )
     vm = hostinger.get_vm(vps_id)
     return ObservedNode(
         vps_id=vps_id,
@@ -512,7 +653,13 @@ def _provisioning_steps(state: StackState, observed: Observed, name: str, node: 
 
     vps_id = node.vps_id or node_state.vps_id
     if vps_id is None:
-        steps.append(Step(Action.PURCHASE, name))
+        if seen.adopted and seen.vps_id is not None:
+            # A vps_id turned up under this node's expected hostname (most
+            # likely a PURCHASE whose response never made it back) -- record
+            # it rather than buying a second server.
+            steps.append(Step(Action.ADOPT, name))
+        else:
+            steps.append(Step(Action.PURCHASE, name))
     elif seen.state == "initial":
         steps.append(Step(Action.SETUP, name))
 
@@ -528,8 +675,16 @@ def _provisioning_steps(state: StackState, observed: Observed, name: str, node: 
     ):
         steps.append(Step(Action.ENSURE_FIREWALL, name))
 
-    if not node_state.host_key_pinned or (
-        node_state.ipv4 and node_state.ipv4 not in observed.local.pinned_hosts
+    # PIN_HOST_KEY is replanned when: it was never pinned; the recorded IP
+    # isn't in known_hosts; the OBSERVED IP differs from the recorded one
+    # (the server moved -- a new IP means a host key that was never pinned
+    # for that address); or the observed IP itself isn't in known_hosts yet.
+    ip_drifted = bool(seen.ipv4) and seen.ipv4 != node_state.ipv4
+    known_ips = {ip for ip in (node_state.ipv4, seen.ipv4) if ip}
+    if (
+        not node_state.host_key_pinned
+        or ip_drifted
+        or any(ip not in observed.local.pinned_hosts for ip in known_ips)
     ):
         steps.append(Step(Action.PIN_HOST_KEY, name))
 

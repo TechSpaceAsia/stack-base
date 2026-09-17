@@ -129,6 +129,8 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> N
     stackbase_src = os.environ.get("STACKBASE_SRC") or None
     local = local_facts(infra_dir, secrets, stackbase_src=stackbase_src)
     observed = observe(cfg, state, hostinger, cloudflare, local=local)
+    for warning in observed.cloudflare_ip_warnings:
+        print(redact(f"! {warning}", list(secrets.values())))
     steps = plan(cfg, state, observed)
 
     if args.plan:
