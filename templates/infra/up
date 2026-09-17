@@ -77,18 +77,91 @@ def locked_stack_base(lock_path: Path) -> tuple[str, str]:
     raise AssertionError("unreachable")  # pragma: no cover
 
 
+def cache_root() -> Path:
+    """The cache directory, created private and refused if it is not.
+
+    Whatever ends up in here gets executed, so a directory some other account
+    can write to is a way for them to run code as you.
+    """
+    CACHE_DIR.parent.mkdir(parents=True, exist_ok=True)
+    if not CACHE_DIR.exists():
+        CACHE_DIR.mkdir(mode=0o700)
+        os.chmod(CACHE_DIR, 0o700)  # mkdir's mode is filtered through the umask
+
+    info = CACHE_DIR.stat()
+    if info.st_uid != os.getuid():
+        fail(
+            f"{CACHE_DIR} belongs to another user",
+            "stack-base runs code from that directory, so it has to be yours -- move it aside",
+        )
+    if info.st_mode & 0o077:
+        fail(
+            f"{CACHE_DIR} can be read or written by other users",
+            f"stack-base runs code from that directory -- run: chmod 700 {CACHE_DIR}",
+        )
+    return CACHE_DIR
+
+
+def git_output(repo: Path, *args: str) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
+def is_pinned_checkout(checkout: Path, rev: str) -> bool:
+    """True only if `checkout` is exactly commit `rev`, with nothing altered."""
+    if not (checkout / ".git").is_dir():
+        return False
+    head = git_output(checkout, "rev-parse", "HEAD")
+    if head is None or head.strip() != rev:
+        return False
+    # --porcelain lists modified tracked files AND untracked ones while
+    # honouring .gitignore, so caches and build output do not count as
+    # tampering but an edited or planted file does.
+    dirty = git_output(checkout, "status", "--porcelain")
+    return dirty is not None and dirty.strip() == ""
+
+
 def fetch(url: str, rev: str) -> Path:
-    """Download exactly `rev` into the cache, once. Returns the checkout."""
-    checkout = CACHE_DIR / rev
-    if (checkout / "bin" / "up").exists():
+    """Return a checkout of exactly `rev`, downloading it if need be.
+
+    This check runs on every run, cache hit or miss: a directory sitting at
+    `<cache>/<rev>` with a `bin/up` in it is not evidence that it came from
+    the pinned repository -- anything able to write there could have put it
+    there. Only `git rev-parse HEAD` reporting `rev`, over a clean working
+    tree, is evidence. Anything else is discarded and fetched again once; if
+    the fresh copy still does not match, nothing is executed at all.
+    """
+    checkout = cache_root() / rev
+    if is_pinned_checkout(checkout, rev):
         return checkout
 
+    if checkout.exists():
+        print(
+            f"warning: the cached copy of stack-base at {checkout} is not commit {rev[:12]} "
+            "(or has been modified) -- discarding it and downloading it again",
+            file=sys.stderr,
+        )
+        shutil.rmtree(checkout, ignore_errors=True)
+
+    download(url, rev, checkout)
+
+    if not is_pinned_checkout(checkout, rev):
+        fail(
+            f"the downloaded copy of stack-base is not commit {rev[:12]}",
+            f"remove {checkout} and try again -- if it keeps happening, the pinned commit may no "
+            "longer exist in the repository infra/flake.lock points at",
+        )
+    return checkout
+
+
+def download(url: str, rev: str, checkout: Path) -> None:
     # A plain `git clone` cannot ask for one arbitrary commit, so: an empty
     # repository, one shallow fetch of that exact rev, one checkout. It lands
     # in a temporary directory and is renamed into place, so an interrupted
-    # download never leaves a half-empty cache entry that later runs trust.
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    staging = CACHE_DIR / f".{rev}.partial.{os.getpid()}"
+    # download never leaves a half-finished cache entry behind.
+    staging = checkout.parent / f".{rev}.partial.{os.getpid()}"
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True)
     try:
@@ -98,7 +171,6 @@ def fetch(url: str, rev: str) -> Path:
         os.replace(staging, checkout)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    return checkout
 
 
 def entry_point() -> Path:

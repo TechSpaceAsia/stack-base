@@ -197,6 +197,152 @@ class TemplateUpScriptTests(unittest.TestCase):
             self.assertIn("stack-base", result.stderr)
 
 
+class TemplateUpCacheTests(unittest.TestCase):
+    """The cache holds code that gets executed -- it must be proved, not assumed.
+
+    `~/.cache/stack-base/<rev>/bin/up` existing is not evidence that it came
+    from the pinned repository, so every run verifies the checkout really is
+    that commit and is unmodified. These tests fetch from a local git
+    repository over a file:// URL -- no network.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+        self.infra_dir = self.root / "infra"
+        self.infra_dir.mkdir()
+        shutil.copy(_TEMPLATE_DIR / "up", self.infra_dir / "up")
+
+        self.origin, self.rev = self._git_repo(self.root / "origin", "print('REAL')")
+        (self.infra_dir / "flake.lock").write_text(
+            json.dumps(
+                {
+                    "nodes": {
+                        "root": {"inputs": {"stack-base": "stack-base"}},
+                        "stack-base": {
+                            "locked": {"type": "git", "url": self.origin.as_uri(), "rev": self.rev}
+                        },
+                    },
+                    "root": "root",
+                    "version": 7,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.cache_home = self.root / "cache"
+
+    def _git(self, repo: Path, *args: str) -> str:
+        result = subprocess.run(
+            [
+                "git", "-C", str(repo),
+                "-c", "user.email=test@example.com",
+                "-c", "user.name=Test",
+                "-c", "commit.gpgsign=false",
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    def _git_repo(self, path: Path, body: str) -> tuple[Path, str]:
+        (path / "bin").mkdir(parents=True)
+        (path / "bin" / "up").write_text(f"{body}\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "init", "--quiet", "-b", "main", str(path)], capture_output=True, check=True
+        )
+        self._git(path, "add", "-A")
+        self._git(path, "commit", "--quiet", "-m", "initial")
+        return path, self._git(path, "rev-parse", "HEAD")
+
+    def _run_up(self):
+        env = {**os.environ, "XDG_CACHE_HOME": str(self.cache_home)}
+        env.pop("STACKBASE_SRC", None)
+        return subprocess.run(
+            ["python3", str(self.infra_dir / "up"), "up", "--plan"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+
+    @property
+    def _checkout(self) -> Path:
+        return self.cache_home / "stack-base" / self.rev
+
+    def test_a_first_run_fetches_the_pinned_commit_and_runs_it(self) -> None:
+        result = self._run_up()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("REAL", result.stdout)
+        self.assertTrue(self._checkout.exists())
+
+    def test_the_cache_root_is_created_private(self) -> None:
+        self._run_up()
+
+        mode = (self.cache_home / "stack-base").stat().st_mode & 0o777
+        self.assertEqual(mode, 0o700, f"cache root should be 0700, got {mode:o}")
+
+    def test_a_poisoned_cache_entry_is_discarded_and_refetched(self) -> None:
+        """A directory planted under the rev's name is not evidence of the rev."""
+        # The cache root itself is left correctly private, so this test is
+        # about the HEAD check and not about the permission check.
+        (self.cache_home / "stack-base").mkdir(parents=True)
+        (self.cache_home / "stack-base").chmod(0o700)
+        _planted, planted_rev = self._git_repo(self._checkout, "print('PWNED')")
+        self.assertNotEqual(planted_rev, self.rev)
+
+        result = self._run_up()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("PWNED", result.stdout)
+        self.assertIn("REAL", result.stdout)
+        self.assertEqual(self._git(self._checkout, "rev-parse", "HEAD"), self.rev)
+
+    def test_a_modified_cache_entry_is_discarded_and_refetched(self) -> None:
+        self.assertEqual(self._run_up().returncode, 0)
+        (self._checkout / "bin" / "up").write_text("print('TAMPERED')\n", encoding="utf-8")
+
+        result = self._run_up()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("TAMPERED", result.stdout)
+        self.assertIn("REAL", result.stdout)
+
+    def test_an_added_file_in_the_cache_entry_is_discarded_and_refetched(self) -> None:
+        self.assertEqual(self._run_up().returncode, 0)
+        (self._checkout / "bin" / "sneaky.py").write_text("print('SNEAKY')\n", encoding="utf-8")
+
+        result = self._run_up()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self._checkout / "bin" / "sneaky.py").exists())
+
+    def test_a_group_writable_cache_root_is_refused(self) -> None:
+        cache_root = self.cache_home / "stack-base"
+        cache_root.mkdir(parents=True)
+        cache_root.chmod(0o775)
+
+        result = self._run_up()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+        self.assertIn(str(cache_root), result.stderr)
+        self.assertIn("700", result.stderr)
+
+    def test_an_unfetchable_rev_fails_loudly_rather_than_running_anything(self) -> None:
+        shutil.rmtree(self.origin)
+
+        result = self._run_up()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("REAL", result.stdout)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+
+
 class TemplateFilesTests(unittest.TestCase):
     def test_the_up_script_is_executable(self) -> None:
         self.assertTrue(os.access(_TEMPLATE_DIR / "up", os.X_OK))
