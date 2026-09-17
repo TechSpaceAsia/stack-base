@@ -135,6 +135,29 @@ in
       '';
     };
 
+    app.healthTries = lib.mkOption {
+      type = lib.types.ints.between 1 300;
+      default = 30;
+      description = ''
+        Default number of health-check attempts stack-deploy makes before
+        giving up on a color, emitted into `/etc/stackbase/deploy.env` as
+        `STACK_HEALTH_TRIES`. An operator/test can still override this
+        per-invocation by exporting `STACK_DEPLOY_HEALTH_TRIES` in the
+        environment -- that always wins over this declarative default (I3).
+      '';
+    };
+
+    app.healthSleep = lib.mkOption {
+      type = lib.types.ints.between 1 60;
+      default = 2;
+      description = ''
+        Default seconds between health-check attempts, emitted into
+        `/etc/stackbase/deploy.env` as `STACK_HEALTH_SLEEP`. Same
+        env-var-wins-over-default relationship as `app.healthTries`, via
+        `STACK_DEPLOY_HEALTH_SLEEP`.
+      '';
+    };
+
     deploy.drainSeconds = lib.mkOption {
       type = lib.types.ints.positive;
       default = 60;
@@ -252,6 +275,19 @@ in
       # inheritance is needed here either -- world-readable bits already
       # give <project> everything it needs to read and run its release.
       "d /opt/${cfg.project}/releases 0755 deploy deploy -"
+      # I7 safety net: deploy_unpack_tarball (stack-deploy.sh) now removes
+      # its own ".tmp-<version>-XXXXXX" extraction directory on every
+      # failure path via an EXIT trap, but that trap can't fire across a
+      # SIGKILL (an operator's `kill -9`, an OOM kill mid-extraction) --
+      # exactly the "disk-full unpack is self-perpetuating" failure mode
+      # this line exists for. "e" with a glob only cleans a MATCHED
+      # directory's own CONTENTS by age, never the matched entry itself
+      # (see tmpfiles.d(5)) -- so this reclaims the disk space a stale,
+      # half-extracted release was holding (the actual risk), even though
+      # it can leave an empty ".tmp-*" directory shell behind; it can never
+      # touch a real, version-named release directory, since none of those
+      # match the ".tmp-*" glob.
+      "e /opt/${cfg.project}/releases/.tmp-* - - - 1d"
       "d /opt/${cfg.project}/blue 0755 deploy deploy -"
       "d /opt/${cfg.project}/green 0755 deploy deploy -"
       # The engine's own state directory (active-color, generation,
@@ -268,8 +304,17 @@ in
       # the "deploy" group, which today is nothing but root (which
       # bypasses DAC anyway).
       "d ${stateDir} 2750 deploy deploy -"
+      # M1: the state layout stack-deploy.sh understands, written once on
+      # first use (tmpfiles' "f" type never touches a file that already
+      # exists). stack-deploy.sh refuses to run against a RECORDED layout
+      # number higher than its own -- the failure mode this guards against
+      # is a node whose state was last touched by a newer stack-deploy
+      # (a future, incompatible layout) getting downgraded back to an older
+      # engine build, which would otherwise silently misinterpret state it
+      # doesn't understand.
+      "f ${stateDir}/layout-version 0644 deploy deploy - 1"
       "d ${stateDir}/incoming 0770 deploy deploy -"
-      # M1: a hard-killed upload session never runs its EXIT trap (see
+      # A hard-killed upload session never runs its EXIT trap (see
       # stack-deploy-ssh.sh's own comment on this), leaving an orphaned
       # per-connection temp file under incoming/ forever. Age-based
       # cleanup via a separate "e" line (adjusts/cleans an existing path,
@@ -304,16 +349,51 @@ in
 
     systemd.services."${cfg.project}@" = {
       description = "stackbase app instance (%i)";
-      after = [ "network.target" ];
+      # postgresql.service: a real app runs its migrations at start and
+      # exits fast when the DB socket isn't there yet -- ordering after it
+      # (and `wants`ing it, harmless when the unit doesn't exist on a node
+      # that never imports postgres.nix) means a reboot doesn't race a
+      # cold-starting Postgres against this unit's very first start attempt
+      # (C1). It is still only an ordering hint, not a hard dependency: if
+      # Postgres itself is slow or briefly unhealthy AFTER boot, this unit's
+      # own Restart=on-failure/StartLimitIntervalSec=0 below is what keeps
+      # it retrying forever rather than racing or giving up.
+      after = [ "network.target" "postgresql.service" ];
+      wants = [ "postgresql.service" ];
       # Deliberately NOT wantedBy multi-user.target: stackbase-app-boot.service
       # decides which color (if any) to start at boot, and stack-deploy
       # starts/stops instances directly during a deploy.
+      unitConfig = {
+        # C1: systemd's DEFAULT start limit (5 starts / 10s) would otherwise
+        # land this unit in a permanent "failed" state the first time its
+        # dependency (Postgres, a slow disk, ...) takes longer than a few
+        # restarts to become ready -- exactly the "reboot can leave the node
+        # serving 502 forever" failure this whole fix closes. The usual
+        # "failure" here is a slow-starting dependency, not a genuinely
+        # broken release, so this unit is allowed to keep retrying
+        # indefinitely; a release that is actually broken is instead caught
+        # by activate_color's own health check at DEPLOY time, before
+        # traffic ever moves to it.
+        StartLimitIntervalSec = 0;
+      };
       serviceConfig = {
         Type = "simple";
         User = cfg.project;
         Group = cfg.project;
         WorkingDirectory = "/opt/${cfg.project}/%i/current";
-        ExecStart = "/opt/${cfg.project}/%i/current/${cfg.app.binary}";
+        # `env SOCKET_PATH=... <binary>` rather than a plain ExecStart plus
+        # an `Environment=` line for this one variable (I1): EnvironmentFile
+        # below is applied by systemd AFTER Environment=, so a stray
+        # `SOCKET_PATH=...` line in the operator's own app_env (pushed via
+        # `secrets edit app_env`) would otherwise silently override the
+        # per-color socket path and collapse blue and green onto the same
+        # socket. Baking it into the ExecStart argv itself means nothing an
+        # EnvironmentFile can set is ever able to override it -- belt and
+        # braces alongside reconcile.validate_app_env's own reserved-key
+        # rejection (the primary guard, enforced before app_env is even
+        # pushed). `%i` expands the same way in ExecStart's argv as it does
+        # everywhere else in this unit (WorkingDirectory, above).
+        ExecStart = "${pkgs.coreutils}/bin/env SOCKET_PATH=/run/${cfg.project}/app-%i.sock /opt/${cfg.project}/%i/current/${cfg.app.binary}";
         EnvironmentFile = "-/var/lib/stackbase/app.env";
         # A real Rust release binary needs neither PATH nor a shebang
         # lookup, but a script-based release (e.g. the fake app used by
@@ -322,19 +402,43 @@ in
         # inherit the interactive shell's PATH, only the manager's own
         # DefaultEnvironment, which doesn't reach into the Nix profile.
         Environment = [
-          "SOCKET_PATH=/run/${cfg.project}/app-%i.sock"
           "PATH=/run/current-system/sw/bin:/usr/bin:/bin"
         ];
         Restart = "on-failure";
         RestartSec = 2;
+        # A small, bounded backoff rather than a flat 2s forever: each
+        # successive restart's delay grows over RestartSteps steps up to
+        # RestartMaxDelaySec, then holds there -- kinder to a dependency
+        # that is merely slow (e.g. Postgres still applying its own startup
+        # recovery) than hammering it every 2s indefinitely, while still
+        # recovering quickly for a merely-flaky single failure.
+        RestartSteps = 5;
+        RestartMaxDelaySec = 30;
+        # Gives an in-flight request (including a long-lived SSE stream)
+        # this long to finish once systemd asks the unit to stop -- the
+        # drain-stop timer (stackbase-drain@.timer) already waits
+        # `drainSeconds` before issuing that stop at all; this is the
+        # SECOND, independent grace period for the stop itself.
+        TimeoutStopSec = 30;
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;
         RestrictSUIDSGID = true;
+        # M9: a private, writable directory for the app's own runtime data
+        # (uploads, local files) -- /var/lib/<project>, created and owned
+        # by the app user, mode 0750 so nothing else on the box can read or
+        # write it. This is the ONE place, besides its own socket
+        # directory, that ProtectSystem=strict leaves writable to the app.
+        StateDirectory = cfg.project;
+        StateDirectoryMode = "0750";
         # The release tree under /opt is intentionally read-only to the
         # app (it only ever reads its own binary/static assets); the only
-        # writable path it needs is its own socket directory.
+        # writable paths it needs are its own socket directory and its
+        # StateDirectory above (which systemd already makes writable under
+        # ProtectSystem=strict on its own -- listed here again is
+        # unnecessary and would be redundant, so it is deliberately left
+        # off this list).
         ReadWritePaths = [ "/run/${cfg.project}" ];
         # Socket reachability is a unit-level concern, not an app-level
         # one: a bare `UnixListener::bind()` (what a real Rust release
@@ -357,7 +461,14 @@ in
 
     systemd.services.stackbase-app-boot = {
       description = "Start the active-color app instance at boot and restore app.sock (/run is volatile)";
-      after = [ "systemd-tmpfiles-setup.service" ];
+      # postgresql.service (C1): ordering, not a hard dependency -- `cmd_boot`
+      # itself never fails just because the app isn't healthy yet (see
+      # stack-deploy.sh), so there's no correctness reason this unit MUST
+      # wait for Postgres to be up. It's still worth ordering after it
+      # anyway: on a node that also runs postgres.nix, starting the app
+      # only after Postgres has at least been given the chance to start
+      # first cuts down on the app's very first restart cycle at boot.
+      after = [ "systemd-tmpfiles-setup.service" "postgresql.service" ];
       before = [ "nginx.service" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
@@ -410,6 +521,8 @@ in
       STACK_PROJECT=${cfg.project}
       STACK_BINARY=${cfg.app.binary}
       STACK_HEALTH_PATH=${cfg.app.healthPath}
+      STACK_HEALTH_TRIES=${toString cfg.app.healthTries}
+      STACK_HEALTH_SLEEP=${toString cfg.app.healthSleep}
       STACK_DRAIN_SECONDS=${toString cfg.deploy.drainSeconds}
       STACK_KEEP=${toString cfg.deploy.keep}
       STACK_MAX_UPLOAD_BYTES=${toString cfg.deploy.maxUploadBytes}

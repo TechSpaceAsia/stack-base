@@ -34,8 +34,14 @@ fi
 STACK_HEALTH_PATH="${STACK_HEALTH_PATH:-/health}"
 STACK_DRAIN_SECONDS="${STACK_DRAIN_SECONDS:-60}"
 STACK_KEEP="${STACK_KEEP:-5}"
-STACK_DEPLOY_HEALTH_TRIES="${STACK_DEPLOY_HEALTH_TRIES:-30}"
-STACK_DEPLOY_HEALTH_SLEEP="${STACK_DEPLOY_HEALTH_SLEEP:-2}"
+# I3: precedence is STACK_DEPLOY_HEALTH_TRIES/SLEEP (an explicit,
+# per-invocation env override -- tests rely on this) > STACK_HEALTH_TRIES/
+# SLEEP (nixos/deploy.nix's stackbase.app.healthTries/healthSleep, emitted
+# into /etc/stackbase/deploy.env) > the literal fallback, for a deploy.env
+# that predates these options or a bare dev invocation with no deploy.env
+# at all.
+STACK_DEPLOY_HEALTH_TRIES="${STACK_DEPLOY_HEALTH_TRIES:-${STACK_HEALTH_TRIES:-30}}"
+STACK_DEPLOY_HEALTH_SLEEP="${STACK_DEPLOY_HEALTH_SLEEP:-${STACK_HEALTH_SLEEP:-2}}"
 
 PROJECT="$STACK_PROJECT"
 RELEASES_DIR="/opt/$PROJECT/releases"
@@ -51,6 +57,15 @@ GENERATION_FILE="$STATE_DIR/generation"
 LOCK_FILE="$STATE_DIR/deploy.lock"
 RUN_DIR="/run/$PROJECT"
 SOCK_LINK="$RUN_DIR/app.sock"
+LAYOUT_VERSION_FILE="$STATE_DIR/layout-version"
+# The highest state-layout number THIS build of stack-deploy understands.
+# nixos/deploy.nix's tmpfiles rule writes "1" into $LAYOUT_VERSION_FILE the
+# first time the engine's state directory is created (M1). Guards against a
+# node whose state was last touched by a newer, layout-incompatible
+# stack-deploy getting downgraded back to an older engine build, which would
+# otherwise silently misinterpret state it doesn't understand -- refuse
+# loudly instead, before touching anything.
+STACK_DEPLOY_LAYOUT_VERSION=1
 
 # Anchored on both ends: vMAJOR.MINOR.PATCH exactly, no leading zeros, no
 # pre-release/build suffixes. Substituted by nixos/deploy.nix at build time
@@ -82,6 +97,16 @@ usage_die() {
 die_exists_diff() {
   echo "✗ $*" >&2
   exit 4
+}
+
+check_layout_version() {
+  [ -f "$LAYOUT_VERSION_FILE" ] || return 0
+  local recorded
+  recorded=$(cat "$LAYOUT_VERSION_FILE" 2>/dev/null) || return 0
+  [[ "$recorded" =~ ^[0-9]+$ ]] || return 0
+  if [ "$recorded" -gt "$STACK_DEPLOY_LAYOUT_VERSION" ]; then
+    die "this node's state layout is version $recorded, but this stack-deploy build only understands up to version $STACK_DEPLOY_LAYOUT_VERSION -- rebuild/redeploy this node with a newer stack-base before running stack-deploy again"
+  fi
 }
 
 color_dir() {
@@ -233,7 +258,12 @@ wait_healthy() {
   local color="$1"
   local sock="$RUN_DIR/app-$color.sock" i code
   for ((i = 1; i <= STACK_DEPLOY_HEALTH_TRIES; i++)); do
-    code=$(curl --unix-socket "$sock" -o /dev/null -s -w '%{http_code}' "http://localhost${STACK_HEALTH_PATH}" 2>/dev/null || echo 000)
+    # I3: --max-time/--connect-timeout bound EVERY single try -- without
+    # them, an app that accepts the connection and then hangs (rather than
+    # answering or refusing) blocks curl for its ~300s default, for as many
+    # as STACK_DEPLOY_HEALTH_TRIES tries, all while this process holds the
+    # deploy lock.
+    code=$(curl --unix-socket "$sock" --max-time 5 --connect-timeout 2 -o /dev/null -s -w '%{http_code}' "http://localhost${STACK_HEALTH_PATH}" 2>/dev/null || echo 000)
     case "$code" in
       2??) return 0 ;;
     esac
@@ -282,7 +312,7 @@ activate_color() {
   fi
 
   if ! wait_healthy "$idle"; then
-    echo "✗ $idle failed the health check ($STACK_HEALTH_PATH) after $STACK_DEPLOY_HEALTH_TRIES tries" >&2
+    echo "✗ $idle failed the health check ($STACK_HEALTH_PATH) after $STACK_DEPLOY_HEALTH_TRIES tries -- its migrations may have ALREADY been applied (they run before the app starts listening), even though this deploy is being reported as failed" >&2
     run_systemctl stop "${PROJECT}@${idle}.service" || echo "i also failed to stop $idle after its failed health check; it may still be running" >&2
     return 1
   fi
@@ -490,6 +520,31 @@ deploy_unpack_tarball() {
 
   local tmp_dir
   tmp_dir=$(mktemp -d "$RELEASES_DIR/.tmp-${version}-XXXXXX")
+
+  # I7: every failure path from here on (a truncated/corrupt archive
+  # failing extraction, an unexpected chmod/mv failure) must not leak this
+  # temp directory forever -- a disk-full unpack would otherwise be
+  # self-perpetuating, since a stray .tmp-* dir is invisible to both
+  # `releases` and `prune`. Both of this function's callers
+  # (cmd_unpack/cmd_deploy) invoke it PLAINLY, never as the subject of
+  # `if`/`||` (see the top-of-file errexit note), so a failing command from
+  # here on aborts the whole process immediately via ordinary `set -e` --
+  # which is exactly why cleanup is hooked on EXIT rather than sprinkled
+  # before each individual `die`: one trap covers every failure point
+  # uniformly, including any added here in the future, with nothing to
+  # clobber (this script sets no other EXIT trap anywhere).
+  #
+  # The trap deliberately reads a SCRIPT-GLOBAL ($UNPACK_TMP_DIR), not the
+  # local $tmp_dir: bash tears a function's local variables down before an
+  # errexit-triggered abort runs its EXIT trap, so under `set -u` (this
+  # script's own `-o nounset`) a trap referencing $tmp_dir directly would
+  # itself fail with "unbound variable" and never actually clean up --
+  # confirmed locally while writing this. Cleared (never left stale) once
+  # $tmp_dir has been renamed into its final place, immediately before the
+  # trap is disarmed below.
+  UNPACK_TMP_DIR="$tmp_dir"
+  trap 'rm -rf "${UNPACK_TMP_DIR:-}"' EXIT
+
   # --no-same-owner/--no-same-permissions: don't trust the archive's
   # recorded uid/gid or mode bits (a crafted tarball could ship a setuid
   # root binary or a world-writable file) -- extract with the invoking
@@ -526,6 +581,8 @@ deploy_unpack_tarball() {
 
   rm -rf "$release_dir"
   mv -T "$tmp_dir" "$release_dir"
+  UNPACK_TMP_DIR=""
+  trap - EXIT
   echo "✓ unpacked $version"
 }
 
@@ -663,6 +720,17 @@ cmd_deploy() {
     fi
     exit 1
   fi
+
+  # I2: prune old releases at the end of a SUCCESSFUL deploy only -- never
+  # on rollback, and never when the deploy above failed. The lock is
+  # already held (acquire_lock, near the top of this function), so
+  # prune_releases is called directly rather than through the standalone
+  # `prune` subcommand. A prune failure is a WARNING, never a failed
+  # deploy: the `||` here means the deploy that already succeeded is not
+  # retroactively turned into a failure just because disk cleanup hit a
+  # snag -- prune_releases itself already reported which release(s) it
+  # could not remove.
+  prune_releases "$STACK_KEEP" || echo "⚠ pruning old releases failed (not fatal) -- run 'stack-deploy prune' to retry" >&2
 }
 
 cmd_rollback() {
@@ -684,15 +752,21 @@ cmd_rollback() {
   activate_color "$idle" "$active" || exit 1
 }
 
-cmd_prune() {
-  local keep="${1:-$STACK_KEEP}"
-  [[ "$keep" =~ ^[1-9][0-9]*$ ]] || usage_die "keep count must be a positive integer, got: $keep"
-
-  acquire_lock
+# The actual retention logic, shared by the standalone `prune` subcommand
+# (I2) and a call from the END of a successful `cmd_deploy` -- see there for
+# why. Assumes the deploy lock is ALREADY held by the caller; never acquires
+# or releases it itself, so it can safely be called from inside a deploy
+# that is already holding it. Returns 1 if any individual release failed to
+# be removed (e.g. permission denied), after still attempting every other
+# one -- one bad release directory must never stop the rest from being
+# pruned, and the caller decides how loudly to treat that (fatal for the
+# standalone `prune` subcommand, a warning-only from `cmd_deploy`).
+prune_releases() {
+  local keep="$1"
 
   if [ ! -d "$RELEASES_DIR" ]; then
     echo "i no releases directory; nothing to prune"
-    exit 0
+    return 0
   fi
 
   local blue_ver green_ver
@@ -707,20 +781,34 @@ cmd_prune() {
   local total=${#all_versions[@]}
   if [ "$total" -le "$keep" ]; then
     echo "i nothing to prune ($total release(s), keep=$keep)"
-    exit 0
+    return 0
   fi
 
-  local to_drop=$((total - keep)) i v pruned=0
+  local to_drop=$((total - keep)) i v pruned=0 failed=0
   for ((i = 0; i < to_drop; i++)); do
     v="${all_versions[$i]}"
     if [ "$v" = "$blue_ver" ] || [ "$v" = "$green_ver" ]; then
       continue
     fi
-    rm -rf "${RELEASES_DIR:?}/$v"
-    echo "✓ pruned $v"
-    pruned=$((pruned + 1))
+    if rm -rf "${RELEASES_DIR:?}/$v"; then
+      echo "✓ pruned $v"
+      pruned=$((pruned + 1))
+    else
+      echo "⚠ failed to prune $v" >&2
+      failed=$((failed + 1))
+    fi
   done
   echo "i pruned $pruned release(s), kept $((total - pruned))"
+  [ "$failed" -eq 0 ] || return 1
+  return 0
+}
+
+cmd_prune() {
+  local keep="${1:-$STACK_KEEP}"
+  [[ "$keep" =~ ^[1-9][0-9]*$ ]] || usage_die "keep count must be a positive integer, got: $keep"
+
+  acquire_lock
+  prune_releases "$keep"
 }
 
 cmd_releases() {
@@ -783,6 +871,22 @@ cmd_boot() {
     die "active color $active has no linked release at $link -- state file and release directory are out of sync; redeploy to recover"
   fi
 
+  # C1: point app.sock at the active color BEFORE starting the unit or
+  # health-checking it, and never fail this boot over either of those two
+  # steps below. At boot, no OTHER color is already serving traffic, so a
+  # symlink pointing at a not-yet-healthy (or not-yet-started) color is
+  # strictly better than no symlink at all: nginx gets a 502 either way
+  # until the app is actually up, but the MOMENT it becomes healthy (e.g.
+  # once a slow-starting Postgres dependency is ready -- the app unit's own
+  # Restart=on-failure with StartLimitIntervalSec=0 keeps retrying
+  # indefinitely, see nixos/deploy.nix), traffic starts flowing with no
+  # further action from this unit, a redeploy, or an operator. Failing the
+  # boot unit here instead would leave nginx with NO socket at all even
+  # after the app recovers on its own.
+  if ! atomic_symlink "app-${active}.sock" "$SOCK_LINK"; then
+    die "failed to point $SOCK_LINK at $active at boot"
+  fi
+
   # run_systemctl (not a bare `systemctl start`): cmd_boot itself is only
   # ever invoked as root via stackbase-app-boot.service, but it shares
   # resolve_pending_color/activate_color's code paths with cmd_deploy and
@@ -792,14 +896,14 @@ cmd_boot() {
   # when running as root (run_systemctl's root branch is a bare systemctl
   # call).
   if ! run_systemctl start "${PROJECT}@${active}.service"; then
-    die "failed to start $active (${PROJECT}@${active}.service) at boot"
+    echo "⚠ failed to ask systemd to start $active (${PROJECT}@${active}.service) at boot -- app.sock already points at it, so it will start serving as soon as it comes up on its own (Restart=on-failure never gives up)" >&2
+    exit 0
   fi
   if ! wait_healthy "$active"; then
-    echo "✗ $active failed the health check ($STACK_HEALTH_PATH) at boot; leaving traffic unrouted" >&2
-    exit 1
+    echo "⚠ $active is not yet healthy ($STACK_HEALTH_PATH) at boot -- app.sock already points at it, so traffic will flow as soon as it becomes healthy (e.g. once a slow-starting dependency such as Postgres is ready); NOT failing this boot over it" >&2
+    exit 0
   fi
 
-  atomic_symlink "app-${active}.sock" "$SOCK_LINK"
   echo "✓ $active started at boot; traffic restored"
 }
 
@@ -851,6 +955,7 @@ cmd_internal_drain_stop() {
 
 main() {
   [ $# -ge 1 ] || usage_die "usage: stack-deploy <status|colors|deploy|rollback|prune|releases|unpack> [...]"
+  check_layout_version
   local cmd="$1"
   shift
   case "$cmd" in
