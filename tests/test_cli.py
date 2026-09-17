@@ -22,6 +22,7 @@ from unittest import mock
 
 from stackbase.__main__ import main
 from stackbase.cloudflare import CloudflareClient
+from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
 from tests.fakes import FakeServer
 
@@ -317,6 +318,119 @@ class FailureTests(unittest.TestCase):
             self.assertIn(" — ", line)
             self.assertNotIn(_HOSTINGER_TOKEN, line)
             self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_debug_prints_a_traceback_but_never_a_secret(self) -> None:
+        """--debug must not be a way to see the tokens in cleartext.
+
+        A StackError routinely carries text that came back from somewhere
+        else -- a remote command's stderr, an API error body -- and that text
+        can contain a token. A redacted one-line summary is no use if the raw
+        traceback printed just above it shows the same string unmasked.
+        """
+        with TemporaryDirectory() as tmp, FakeServer() as server:
+            infra_dir, identity = _project(Path(tmp))
+            leaky = StackError(
+                f"command failed on the node: echo {_HOSTINGER_TOKEN}",
+                f"stderr said: {_HOSTINGER_TOKEN}",
+            )
+            stdout, stderr = io.StringIO(), io.StringIO()
+
+            with _cli(server, identity):
+                with mock.patch("stackbase.__main__.observe", side_effect=leaky):
+                    with (
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                        self.assertRaises(SystemExit) as caught,
+                    ):
+                        main(["--infra-dir", str(infra_dir), "up", "--plan", "--debug"])
+
+            self.assertEqual(caught.exception.code, 1)
+            everything = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("Traceback (most recent call last)", everything)
+            self.assertNotIn(_HOSTINGER_TOKEN, everything)
+            self.assertIn("***REDACTED***", everything)
+
+    def test_debug_redacts_the_traceback_of_the_api_failure_fixture_too(self) -> None:
+        with TemporaryDirectory() as tmp, FakeServer() as server:
+            infra_dir, identity = _project(Path(tmp))
+            server.script(
+                "GET",
+                f"/api/vps/v1/virtual-machines/{_VPS_ID}",
+                500,
+                {"message": f"token {_HOSTINGER_TOKEN} is unhappy"},
+            )
+            stdout, stderr = io.StringIO(), io.StringIO()
+
+            with _cli(server, identity):
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                    self.assertRaises(SystemExit),
+                ):
+                    main(["--infra-dir", str(infra_dir), "up", "--plan", "--debug"])
+
+            everything = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("Traceback (most recent call last)", everything)
+            self.assertNotIn(_HOSTINGER_TOKEN, everything)
+
+    def test_an_unexpected_exception_is_one_redacted_line_without_debug(self) -> None:
+        with TemporaryDirectory() as tmp, FakeServer() as server:
+            infra_dir, identity = _project(Path(tmp))
+            boom = RuntimeError(f"internal wobble involving {_CLOUDFLARE_TOKEN}")
+            stdout, stderr = io.StringIO(), io.StringIO()
+
+            with _cli(server, identity):
+                with mock.patch("stackbase.__main__.observe", side_effect=boom):
+                    with (
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                        self.assertRaises(SystemExit) as caught,
+                    ):
+                        main(["--infra-dir", str(infra_dir), "up", "--plan"])
+
+            self.assertEqual(caught.exception.code, 1)
+            everything = stdout.getvalue() + stderr.getvalue()
+            self.assertNotIn(_CLOUDFLARE_TOKEN, everything)
+            self.assertNotIn("Traceback", everything)
+            line = stderr.getvalue().strip()
+            self.assertEqual(len(line.splitlines()), 1, f"expected one line, got: {line}")
+            self.assertIn("RuntimeError", line)
+            self.assertIn("--debug", line)
+
+    def test_an_unexpected_exception_with_debug_prints_a_redacted_traceback(self) -> None:
+        with TemporaryDirectory() as tmp, FakeServer() as server:
+            infra_dir, identity = _project(Path(tmp))
+            boom = RuntimeError(f"internal wobble involving {_CLOUDFLARE_TOKEN}")
+            stdout, stderr = io.StringIO(), io.StringIO()
+
+            with _cli(server, identity):
+                with mock.patch("stackbase.__main__.observe", side_effect=boom):
+                    with (
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                        self.assertRaises(SystemExit),
+                    ):
+                        main(["--infra-dir", str(infra_dir), "up", "--plan", "--debug"])
+
+            everything = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("Traceback (most recent call last)", everything)
+            self.assertIn("RuntimeError", everything)
+            self.assertNotIn(_CLOUDFLARE_TOKEN, everything)
+
+    def test_an_unexpected_failure_before_the_secrets_load_still_reports_cleanly(self) -> None:
+        """Nothing is known to redact yet -- that must not itself blow up."""
+        with TemporaryDirectory() as tmp, FakeServer() as server:
+            infra_dir, identity = _project(Path(tmp))
+            stderr = io.StringIO()
+
+            with _cli(server, identity):
+                with mock.patch("stackbase.__main__.load_config", side_effect=RuntimeError("early")):
+                    with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+                        main(["--infra-dir", str(infra_dir), "up", "--plan"])
+
+            self.assertEqual(caught.exception.code, 1)
+            self.assertIn("RuntimeError", stderr.getvalue())
+            self.assertEqual(len(stderr.getvalue().strip().splitlines()), 1)
 
     def test_a_missing_secrets_file_names_the_command_that_creates_it(self) -> None:
         with TemporaryDirectory() as tmp, FakeServer() as server:

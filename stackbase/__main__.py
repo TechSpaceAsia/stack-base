@@ -73,13 +73,44 @@ def main(argv: list[str] | None = None) -> None:
         else:
             _ssh(args, infra_dir)
     except StackError as error:
-        if debug:
-            traceback.print_exc()
+        _print_traceback(debug, secrets)
         print(error_line(error, list(secrets.values())), file=sys.stderr)
         raise SystemExit(1)
     except KeyboardInterrupt:
         print("error: interrupted — nothing further was changed", file=sys.stderr)
         raise SystemExit(1)
+    except Exception as error:  # noqa: BLE001 - deliberate last line of defence
+        # A bug in stack-base, not a user error. Python's own excepthook
+        # would print an unredacted traceback, so it must never be what
+        # handles this.
+        _print_traceback(debug, secrets)
+        print(
+            redact(
+                f"error: unexpected failure ({type(error).__name__}) — this is a bug in "
+                "stack-base; re-run with --debug and report it",
+                list(secrets.values()),
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+def _print_traceback(debug: bool, secrets: dict[str, str]) -> None:
+    """With `--debug`, print the traceback -- masked.
+
+    `traceback.print_exc()` writes straight to stderr, which would put the
+    exception's own text there unmasked: a StackError routinely carries a
+    remote command's stderr or an API error body, and either can contain a
+    token. `--debug` is for diagnosing stack-base, not for reading the
+    account's secrets in cleartext, and formatting the traceback to a string
+    first is the only way to get `redact()` in between.
+
+    `secrets` is read at call time on purpose: whatever has been decrypted by
+    the moment of the failure is masked, and a failure before that point
+    (nothing known to mask yet) still prints normally.
+    """
+    if debug:
+        print(redact(traceback.format_exc(), list(secrets.values())), file=sys.stderr, end="")
 
 
 def error_line(error: StackError, secret_values: list[str]) -> str:
