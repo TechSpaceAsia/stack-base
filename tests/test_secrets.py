@@ -36,6 +36,20 @@ class RedactTests(unittest.TestCase):
 
         self.assertNotIn("tok", result)
 
+    def test_masks_the_longest_value_first_so_overlapping_secrets_stay_hidden(self) -> None:
+        # "abc" occurs inside the longer secret. Masking the short one first
+        # would cut the long one into pieces that no longer match, leaving
+        # most of the real secret on screen.
+        result = redact("leaked: xxabcyy", ["abc", "xxabcyy"])
+
+        self.assertEqual(result, "leaked: ***REDACTED***")
+
+    def test_masking_does_not_depend_on_the_order_values_are_given(self) -> None:
+        self.assertEqual(
+            redact("leaked: xxabcyy", ["xxabcyy", "abc"]),
+            redact("leaked: xxabcyy", ["abc", "xxabcyy"]),
+        )
+
 
 class TempInfraDir:
     """Context manager for a scratch infra/ directory."""

@@ -1,4 +1,4 @@
-"""Test fake: a minimal local HTTP server for exercising stackbase.http.
+"""Test fakes shared by the suite: a local HTTP server, and subprocess doubles.
 
 `FakeServer` starts `http.server` on `127.0.0.1:0` (an OS-assigned free port)
 in a background thread. Queue a response with `.script(method, path, status,
@@ -7,11 +7,18 @@ per (method, path) pair, consumed first-in-first-out, so a retry scenario is
 scripted as multiple `.script()` calls for the same endpoint. Every request
 received is recorded in `.requests` as `{"method", "path", "body"}` (`body`
 is the JSON-decoded request body, or `None` if the request had no body).
+
+`FakeRunner` stands in for `subprocess.run` (ssh, rsync, ssh-keyscan,
+openssl) and `FakePopen` for `subprocess.Popen` (the streamed
+`nixos-rebuild`). Both record every argv they are handed, so a test can
+assert on the exact command line without shelling out or touching a network.
 """
 
 from __future__ import annotations
 
+import io
 import json
+import subprocess
 import threading
 from collections import deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -104,6 +111,81 @@ class FakeServer:
         handler.end_headers()
         if payload:
             handler.wfile.write(payload)
+
+
+class FakeRunner:
+    """Records every argv/kwargs it's called with and returns scripted results in order.
+
+    Three ways to supply a result, tried in order: a `handler(argv, kwargs)`
+    callable (return `None` to fall through), the FIFO queue filled by
+    `.script()`, and finally `default`. With none of them supplying a result
+    the call is an error -- a silent "success" for a command the test never
+    thought about would make the assertion that follows meaningless.
+    """
+
+    def __init__(self, *, handler: Any = None, default: subprocess.CompletedProcess | None = None) -> None:
+        self.calls: list[dict] = []
+        self._results: list[subprocess.CompletedProcess] = []
+        self._handler = handler
+        self._default = default
+
+    def script(self, result: subprocess.CompletedProcess) -> None:
+        self._results.append(result)
+
+    def __call__(self, argv, **kwargs) -> subprocess.CompletedProcess:
+        self.calls.append({"argv": list(argv), "kwargs": kwargs})
+        if self._handler is not None:
+            result = self._handler(list(argv), kwargs)
+            if result is not None:
+                return result
+        if self._results:
+            return self._results.pop(0)
+        if self._default is not None:
+            return self._default
+        raise AssertionError(f"FakeRunner: no result scripted for {argv}")
+
+    def argv_strings(self) -> list[str]:
+        """Every recorded call flattened to one string per call, for substring assertions."""
+        return [" ".join(call["argv"]) for call in self.calls]
+
+
+class FakeProcess:
+    """A `subprocess.Popen` stand-in whose stdout replays a canned transcript."""
+
+    def __init__(self, argv: list[str], returncode: int, output: str) -> None:
+        self.args = argv
+        self.returncode = returncode
+        self.stdout = io.StringIO(output)
+
+    def __enter__(self) -> "FakeProcess":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.stdout.close()
+
+    def wait(self) -> int:
+        return self.returncode
+
+
+class FakePopen:
+    """Records every argv and returns scripted (returncode, output) transcripts in order."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self._results: list[tuple[int, str]] = []
+
+    def script(self, returncode: int = 0, output: str = "") -> None:
+        self._results.append((returncode, output))
+
+    def __call__(self, argv, **kwargs) -> FakeProcess:
+        self.calls.append({"argv": list(argv), "kwargs": kwargs})
+        if not self._results:
+            raise AssertionError(f"FakePopen: no result scripted for {argv}")
+        returncode, output = self._results.pop(0)
+        return FakeProcess(list(argv), returncode, output)
+
+    def argv_strings(self) -> list[str]:
+        return [" ".join(call["argv"]) for call in self.calls]
 
 
 def _encode_body(body: Any) -> bytes:

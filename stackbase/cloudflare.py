@@ -130,7 +130,7 @@ class CloudflareClient:
         `name` is ambiguous -- this raises rather than guessing which one to
         keep or update; stack-base never deletes a record it didn't create.
         """
-        records = self._find_a_records(zone_id, name)
+        records = self.find_a_records(zone_id, name)
         if len(records) > 1:
             raise StackError(
                 f"multiple A records found for '{name}' in Cloudflare zone {zone_id}",
@@ -155,7 +155,8 @@ class CloudflareClient:
         )
         return parsed["result"]["id"]
 
-    def _find_a_records(self, zone_id: str, name: str) -> list[dict[str, Any]]:
+    def find_a_records(self, zone_id: str, name: str) -> list[dict[str, Any]]:
+        """Every A record for `name` in `zone_id` (read-only; walks all pages)."""
         records: list[dict[str, Any]] = []
         page = 1
         while True:

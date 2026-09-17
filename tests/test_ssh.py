@@ -10,26 +10,10 @@ from tempfile import TemporaryDirectory
 
 from stackbase.errors import StackError
 from stackbase.ssh import Ssh
+from tests.fakes import FakeRunner
 
 _HOST = "1.2.3.4"
 _KEYSCAN_LINE = f"{_HOST} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAImatchbody\n"
-
-
-class FakeRunner:
-    """Records every argv/kwargs it's called with and returns scripted results in order."""
-
-    def __init__(self) -> None:
-        self.calls: list[dict] = []
-        self._results: list[subprocess.CompletedProcess] = []
-
-    def script(self, result: subprocess.CompletedProcess) -> None:
-        self._results.append(result)
-
-    def __call__(self, argv, **kwargs) -> subprocess.CompletedProcess:
-        self.calls.append({"argv": list(argv), "kwargs": kwargs})
-        if not self._results:
-            raise AssertionError(f"FakeRunner: no result scripted for {argv}")
-        return self._results.pop(0)
 
 
 def _cp_text(argv, *, returncode=0, stdout="", stderr="") -> subprocess.CompletedProcess:

@@ -12,6 +12,13 @@ def main() -> None:
     try:
         from stackbase.__main__ import main as stackbase_main
     except ImportError as e:
+        # Only "this checkout has no stackbase.__main__" is handled here. An
+        # ImportError raised from *inside* stackbase (a typo, a missing
+        # sibling module) carries that module's name instead, and must
+        # surface as the real error with its traceback -- swallowing it would
+        # report a broken install for what is actually a one-line bug.
+        if e.name not in ("stackbase", "stackbase.__main__"):
+            raise
         print(f"stack-base is not fully installed yet: {e}", file=sys.stderr)
         sys.exit(1)
 

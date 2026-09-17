@@ -146,10 +146,14 @@ class HostingerClient:
 
     # -- Public keys -------------------------------------------------------
 
+    def list_public_keys(self) -> list[dict[str, Any]]:
+        """Every SSH public key registered on the account (read-only)."""
+        return self._list_paginated("/api/vps/v1/public-keys")
+
     def ensure_public_key(self, name: str, key: str) -> int:
         """Return the id of a public key matching `key`'s body, creating it if absent."""
         key_body = key.strip()
-        for existing in self._list_paginated("/api/vps/v1/public-keys"):
+        for existing in self.list_public_keys():
             if isinstance(existing.get("key"), str) and existing["key"].strip() == key_body:
                 return existing["id"]
         created = self._call("POST", "/api/vps/v1/public-keys", json_body={"name": name, "key": key})
@@ -333,8 +337,12 @@ class HostingerClient:
         """Activate `firewall_id` on `vps_id` (only one firewall may be active per VM)."""
         self._call("POST", f"/api/vps/v1/firewall/{firewall_id}/activate/{vps_id}")
 
+    def list_firewalls(self) -> list[dict[str, Any]]:
+        """Every firewall on the account, each with its rules (read-only)."""
+        return self._list_paginated("/api/vps/v1/firewall")
+
     def _find_firewall(self, name: str) -> dict[str, Any] | None:
-        for firewall in self._list_paginated("/api/vps/v1/firewall"):
+        for firewall in self.list_firewalls():
             if firewall.get("name") == name:
                 return firewall
         return None
