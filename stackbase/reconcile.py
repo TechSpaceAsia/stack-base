@@ -21,6 +21,7 @@ the decision logic, that one is the doing.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -60,7 +61,15 @@ REMOTE_CERT_DIR = "/var/lib/stackbase"
 # node's flake reads them to build its admin accounts. `known_hosts` is the
 # operator's own trust store, not node configuration (pushing it would also
 # make every newly pinned node look like a config change to every other one).
-PUSH_EXCLUDES = ("secrets.age", ".git", "__pycache__", "known_hosts", "result")
+#
+# "secrets.age*" (M6, a glob, not just the exact name): secrets.py's own
+# save_secrets() writes through a same-directory temp file
+# "secrets.age.<pid>.tmp" before the atomic rename -- a crash mid-save could
+# leave one of those behind, and it must never reach the node or feed the
+# tree digest either. `tree_files`/`_tree_digest` below match every entry
+# here with `fnmatch`, not exact string equality, so a glob pattern excludes
+# what it looks like it excludes.
+PUSH_EXCLUDES = ("secrets.age*", ".git", "__pycache__", "known_hosts", "result")
 
 # In dev mode the local stack-base checkout is pushed too, minus its own
 # working clutter.
@@ -199,7 +208,21 @@ def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str 
     )
 
 
-_APP_ENV_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_APP_ENV_LINE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
+
+# I1: keys the systemd unit template (nixos/deploy.nix) sets itself, per
+# color, and that an app_env line must never be allowed to override.
+# SOCKET_PATH is the one that actually matters today (the whole blue/green
+# split depends on each color listening on its own socket -- a stray
+# `SOCKET_PATH=...` line would otherwise silently collapse both colors onto
+# one path); this stays a set, not a single constant, so a future reserved
+# key can be added here without touching the check itself. Enforced here so
+# every caller (secrets set/edit, and the push-time check in
+# reconcile.local_facts) rejects it before it ever reaches a node -- the
+# unit's own `env SOCKET_PATH=...` in its ExecStart is the belt-and-braces
+# second layer (nixos/deploy.nix), for the case a value already on a node
+# predates this check.
+_APP_ENV_RESERVED_KEYS = frozenset({"SOCKET_PATH"})
 
 # Any individual app_env VALUE shorter than this is not masked from output --
 # short strings (a port number, "true", a single digit) are too likely to
@@ -225,13 +248,23 @@ def validate_app_env(raw: str) -> str:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if not _APP_ENV_LINE_RE.match(stripped):
+        match = _APP_ENV_LINE_RE.match(stripped)
+        if not match:
             # The line NUMBER is safe to name -- the content never is (per
             # the global "secrets are never echoed" rule).
             raise StackError(
                 f"infra/secrets.age's 'app_env' has a line that is not KEY=value (line {line_number})",
                 "every non-blank, non-comment line must look like NAME=value (NAME starting with "
                 "a letter or underscore) -- fix it and re-encrypt secrets.age",
+            )
+        key = match.group(1)
+        if key in _APP_ENV_RESERVED_KEYS:
+            # Name the KEY (never the value -- per the global "secrets are
+            # never echoed" rule, and the key name itself isn't secret).
+            raise StackError(
+                f"infra/secrets.age's 'app_env' sets '{key}' (line {line_number}), which is reserved",
+                f"'{key}' is set by the systemd unit itself, per color -- remove this line from "
+                "app_env and re-encrypt secrets.age",
             )
     return raw.rstrip("\n") + "\n"
 
@@ -347,15 +380,27 @@ def _locked_rev_from(lock: dict[str, Any]) -> str | None:
 
 
 def tree_files(root: Path, excludes: Iterable[str]) -> list[Path]:
-    """Every file under `root` that is not inside (or named) an excluded entry."""
-    banned = set(excludes)
+    """Every file under `root` that is not inside (or named) an excluded entry.
+
+    Each `excludes` entry is matched with `fnmatch` (M6), not exact string
+    equality -- every entry today is a plain literal name (no glob
+    metacharacters), for which `fnmatch` behaves identically to exact
+    equality, except for `PUSH_EXCLUDES`' "secrets.age*", which is
+    deliberately a glob so it also catches `secrets.py`'s own
+    "secrets.age.<pid>.tmp" write-ahead temp file.
+    """
+    patterns = list(excludes)
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(name for name in dirnames if name not in banned)
+        dirnames[:] = sorted(name for name in dirnames if not _matches_any_exclude(name, patterns))
         for name in sorted(filenames):
-            if name not in banned:
+            if not _matches_any_exclude(name, patterns):
                 found.append(Path(dirpath) / name)
     return found
+
+
+def _matches_any_exclude(name: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
 
 
 def _tree_digest(root: Path, excludes: Iterable[str], *, skip: Iterable[str] = ()) -> str:

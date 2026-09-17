@@ -7,6 +7,7 @@ import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from stackbase.errors import StackError
 from stackbase.ssh import HOST_KEY_CHANGED_MARKER, Ssh
@@ -71,6 +72,57 @@ class ArgvTests(unittest.TestCase):
             self.assertIn(f"UserKnownHostsFile={infra_dir / 'known_hosts'}", argv)
             self.assertIn("StrictHostKeyChecking=yes", argv)
             self.assertEqual(argv[-1], f"root@{_HOST}")
+
+    def test_no_identity_env_leaves_argv_unchanged(self) -> None:
+        with TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("STACKBASE_SSH_IDENTITY", None)
+            ssh = Ssh(Path(tmp), _HOST)
+
+            argv = ssh.argv()
+
+            self.assertNotIn("-i", argv)
+            self.assertNotIn("IdentitiesOnly=yes", argv)
+
+    def test_identity_env_adds_dash_i_and_identities_only(self) -> None:
+        with TemporaryDirectory() as tmp:
+            key_path = Path(tmp) / "id_ed25519"
+            key_path.write_text("fake key material", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"STACKBASE_SSH_IDENTITY": str(key_path)}):
+                ssh = Ssh(Path(tmp), _HOST)
+
+                argv = ssh.argv()
+
+                self.assertIn("-i", argv)
+                self.assertEqual(argv[argv.index("-i") + 1], str(key_path))
+                self.assertIn("IdentitiesOnly=yes", argv)
+
+    def test_identity_env_expands_tilde(self) -> None:
+        with TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "home"
+            (fake_home / ".ssh").mkdir(parents=True)
+            key_path = fake_home / ".ssh" / "id_ed25519"
+            key_path.write_text("fake key material", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"STACKBASE_SSH_IDENTITY": "~/.ssh/id_ed25519", "HOME": str(fake_home)}):
+                ssh = Ssh(Path(tmp), _HOST)
+
+                argv = ssh.argv()
+
+                self.assertEqual(argv[argv.index("-i") + 1], str(key_path))
+
+    def test_identity_env_relative_path_raises(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"STACKBASE_SSH_IDENTITY": "relative/key"}):
+                with self.assertRaises(StackError) as ctx:
+                    Ssh(Path(tmp), _HOST).argv()
+                self.assertIn("STACKBASE_SSH_IDENTITY", str(ctx.exception))
+
+    def test_identity_env_missing_file_raises(self) -> None:
+        with TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "does-not-exist"
+            with mock.patch.dict(os.environ, {"STACKBASE_SSH_IDENTITY": str(missing)}):
+                with self.assertRaises(StackError) as ctx:
+                    Ssh(Path(tmp), _HOST).argv()
+                self.assertIn(str(missing), str(ctx.exception))
 
     def test_custom_user_is_used(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -320,6 +372,24 @@ class RsyncToTests(unittest.TestCase):
             self.assertIn("BatchMode=yes", ssh_cmd)
             self.assertIn("ConnectTimeout=10", ssh_cmd)
             self.assertIn("StrictHostKeyChecking=yes", ssh_cmd)
+
+    def test_identity_env_reaches_the_dash_e_ssh_command_too(self) -> None:
+        """I4: STACKBASE_SSH_IDENTITY must restrict rsync's OWN ssh transport, not just plain ssh calls."""
+        with TemporaryDirectory() as tmp:
+            key_path = Path(tmp) / "id_ed25519"
+            key_path.write_text("fake key material", encoding="utf-8")
+            runner = FakeRunner()
+            runner.script(_cp_text(["rsync"], returncode=0))
+            with mock.patch.dict(os.environ, {"STACKBASE_SSH_IDENTITY": str(key_path)}):
+                ssh = Ssh(Path(tmp), _HOST, runner=runner)
+
+                ssh.rsync_to("/local/infra", "/etc/nixos/stack")
+
+            argv = runner.calls[0]["argv"]
+            e_index = argv.index("-e")
+            ssh_cmd = argv[e_index + 1]
+            self.assertIn(f"-i {key_path}", ssh_cmd)
+            self.assertIn("IdentitiesOnly=yes", ssh_cmd)
 
     def test_delete_false_omits_the_flag(self) -> None:
         with TemporaryDirectory() as tmp:

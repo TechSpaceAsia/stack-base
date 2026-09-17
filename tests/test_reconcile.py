@@ -26,6 +26,7 @@ from stackbase.config import CloudflareState, HostingerState, Node, NodeState, S
 from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
 from stackbase.reconcile import (
+    PUSH_EXCLUDES,
     Action,
     Context,
     Local,
@@ -40,6 +41,7 @@ from stackbase.reconcile import (
     observe,
     plan,
     render_description,
+    tree_files,
 )
 from tests.fakes import FakePopen, FakeRunner, FakeServer
 
@@ -1417,7 +1419,7 @@ class PushConfigTests(unittest.TestCase):
             apply([Step(Action.PUSH_CONFIG, "a")], ctx, allow_purchase=False)
 
             rsync = next(call for call in ctx.runner.calls if call["argv"][0] == "rsync")
-            self.assertIn("--exclude=secrets.age", rsync["argv"])
+            self.assertIn("--exclude=secrets.age*", rsync["argv"])
             self.assertNotIn("--exclude=keys", rsync["argv"])
             self.assertNotIn("--exclude=keys/", rsync["argv"])
             self.assertTrue(rsync["argv"][-1].endswith(":/etc/nixos/stack"))
@@ -1840,7 +1842,7 @@ class EnsureAppEnvTests(unittest.TestCase):
                 if active_color is None:
                     return _cp(argv, returncode=0, stdout="__STACKBASE_NONE__\n")
                 return _cp(argv, returncode=0, stdout=f"{active_color}\n")
-            if cmd.startswith("systemctl try-restart"):
+            if cmd.startswith("flock -w 300 /var/lib/stackbase-deploy/deploy.lock systemctl try-restart"):
                 return _cp(argv, returncode=0)
             return None
 
@@ -1933,10 +1935,32 @@ class EnsureAppEnvTests(unittest.TestCase):
             restarts = [
                 c["argv"][-1]
                 for c in ctx.runner.calls
-                if c["argv"][0] == "ssh" and c["argv"][-1].startswith("systemctl")
+                if c["argv"][0] == "ssh" and c["argv"][-1].startswith("flock")
             ]
-            self.assertEqual(restarts, ["systemctl try-restart acme@green.service"])
+            self.assertEqual(
+                restarts,
+                ["flock -w 300 /var/lib/stackbase-deploy/deploy.lock systemctl try-restart acme@green.service"],
+            )
             self.assertTrue(any("green restarted" in line for line in lines))
+
+    def test_restart_is_wrapped_in_the_same_flock_stack_deploy_itself_uses(self) -> None:
+        """M4: the env-only restart must not race an in-progress blue/green
+        swap that is mid-restart of this very unit -- run it under the SAME
+        deploy.lock stack-deploy.sh's own acquire_lock takes."""
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(infra_dir, app_env=self._APP_ENV_RAW, runner=self._success_runner())
+
+            apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
+
+            restart_call = next(
+                c["argv"][-1]
+                for c in ctx.runner.calls
+                if c["argv"][0] == "ssh" and c["argv"][-1].startswith("flock")
+            )
+            self.assertEqual(
+                restart_call,
+                "flock -w 300 /var/lib/stackbase-deploy/deploy.lock systemctl try-restart acme@blue.service",
+            )
 
     def test_no_active_color_skips_the_restart_and_warns(self) -> None:
         with Infra() as infra_dir:
@@ -2438,6 +2462,65 @@ class LocalFactsTests(unittest.TestCase):
         with Infra() as infra_dir:
             with self.assertRaises(StackError):
                 local_facts(infra_dir, {"app_env": "A=1\x00\n"})
+
+    def test_app_env_rejects_socket_path_naming_the_key_and_line_never_the_value(self) -> None:
+        """I1: SOCKET_PATH is set by the systemd unit itself, per color -- a
+        line in app_env overriding it would collapse blue and green onto one
+        socket. The error names the KEY and the LINE number, never the
+        value (per the global "secrets are never echoed" rule)."""
+        with Infra() as infra_dir:
+            with self.assertRaises(StackError) as caught:
+                local_facts(infra_dir, {"app_env": "A=1\nSOCKET_PATH=/tmp/evil.sock\n"})
+
+            message = str(caught.exception)
+            self.assertIn("SOCKET_PATH", message)
+            self.assertIn("line 2", message)
+            self.assertNotIn("/tmp/evil.sock", message)
+
+    def test_app_env_reserved_key_check_runs_before_any_ssh_call(self) -> None:
+        with Infra() as infra_dir:
+            ctx, _ = _context(
+                infra_dir,
+                state=StackState(nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)}),
+                secrets={"hostinger_token": "htok", "app_env": "SOCKET_PATH=/tmp/evil.sock\n"},
+                runner=FakeRunner(),
+            )
+
+            with self.assertRaises(StackError):
+                apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
+
+            self.assertEqual(ctx.runner.calls, [])
+
+
+class PushExcludesGlobTests(unittest.TestCase):
+    """M6: PUSH_EXCLUDES' "secrets.age*" must exclude secrets.age ITSELF
+    (an exact name, still matched by the glob) as well as secrets.py's own
+    "secrets.age.<pid>.tmp" write-ahead temp file -- from both the rsync
+    push (Ssh.rsync_to's --exclude, proven under PushConfigTests above) and
+    the tree digest that feeds compute_rev, checked here directly against
+    tree_files()."""
+
+    def test_tree_files_excludes_the_exact_name_and_the_glob_variant(self) -> None:
+        with Infra() as infra_dir:
+            (infra_dir / "secrets.age").write_text("ciphertext", encoding="utf-8")
+            (infra_dir / "secrets.age.12345.tmp").write_text("stale", encoding="utf-8")
+            (infra_dir / "stack.toml").write_text("kept", encoding="utf-8")
+
+            names = {p.name for p in tree_files(infra_dir, PUSH_EXCLUDES)}
+
+            self.assertNotIn("secrets.age", names)
+            self.assertNotIn("secrets.age.12345.tmp", names)
+            self.assertIn("stack.toml", names)
+
+    def test_compute_rev_is_unaffected_by_a_stale_secrets_age_tmp_file(self) -> None:
+        with Infra() as infra_dir:
+            (infra_dir / "flake.lock").write_text('{"nodes": {}}', encoding="utf-8")
+            before = compute_rev(infra_dir, stackbase_src="/fake/src")
+
+            (infra_dir / "secrets.age.99999.tmp").write_text("stale", encoding="utf-8")
+            after = compute_rev(infra_dir, stackbase_src="/fake/src")
+
+            self.assertEqual(before, after)
 
 
 if __name__ == "__main__":

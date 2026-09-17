@@ -62,6 +62,17 @@ def host_key_mismatch_hint(known_hosts: Path) -> str:
 _HOST_RE = re.compile(r"^(?!-)[A-Za-z0-9.:-]+$")
 _USER_RE = re.compile(r"^[a-z_][a-z0-9_-]*$")
 
+# I4: ssh offers every identity already loaded in the operator's own
+# ssh-agent by default. Combined with a hardened node's `MaxAuthTries 3`
+# (base.nix) and fail2ban (`maxretry 3`, a 10-minute ban), an operator whose
+# right key merely happens to be the 4th one their agent offers gets banned
+# by a SINGLE `deploy`/`rollback`/`status` invocation -- and a real `deploy`
+# now opens several connections per node in a row (upload, then deploy),
+# making it worse. Setting this env var to a specific private key file makes
+# ssh (and rsync's `-e` string) offer ONLY that key (`-o IdentitiesOnly=yes`)
+# -- unset, behaviour is exactly what it was before this existed.
+_IDENTITY_ENV = "STACKBASE_SSH_IDENTITY"
+
 _MISSING_BINARY_HINTS: dict[str, str] = {
     "ssh": "install openssh-client (e.g. `apt install openssh-client`, `brew install openssh`)",
     "ssh-keyscan": "install openssh-client (e.g. `apt install openssh-client`) -- ssh-keyscan ships with it",
@@ -412,7 +423,32 @@ class Ssh:
             "-o", "ConnectTimeout=10",
             "-o", f"UserKnownHostsFile={self._known_hosts}",
             "-o", "StrictHostKeyChecking=yes",
+            *self._identity_options(),
         ]
+
+    def _identity_options(self) -> list[str]:
+        """`-i <path> -o IdentitiesOnly=yes`, from `$STACKBASE_SSH_IDENTITY`, or `[]`.
+
+        Shared by every caller of `_ssh_options()` -- ordinary ssh commands
+        via `_ssh_argv`, and rsync's `-e` string via `rsync_to` -- so setting
+        the env var once restricts every connection this process makes, not
+        just some of them (I4).
+        """
+        raw = os.environ.get(_IDENTITY_ENV)
+        if not raw:
+            return []
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            raise StackError(
+                f"${_IDENTITY_ENV} must be an absolute path (or start with ~), got '{raw}'",
+                f"set {_IDENTITY_ENV} to your private key's path, e.g. ~/.ssh/id_ed25519_deploy",
+            )
+        if not path.is_file():
+            raise StackError(
+                f"${_IDENTITY_ENV} does not point at an existing file: {path}",
+                f"check the path -- {_IDENTITY_ENV} must name your SSH private key file",
+            )
+        return ["-i", str(path), "-o", "IdentitiesOnly=yes"]
 
     def _ssh_argv(self, *extra: str) -> list[str]:
         return ["ssh", *self._ssh_options(), f"{self.user}@{self.host}", *extra]

@@ -663,6 +663,10 @@ def _fetch_lock_file(ctx: Context, ssh: Ssh) -> None:
 # `REMOTE_CERT_DIR`/`/var/lib/stackbase`, which is stack-base's own state.
 _DEPLOY_STATE_DIR = "/var/lib/stackbase-deploy"
 _ACTIVE_COLOR_FILE = f"{_DEPLOY_STATE_DIR}/active-color"
+# Same lock stack-deploy.sh's own acquire_lock takes (nixos/deploy/
+# stack-deploy.sh) -- M4: the env-only restart below must not race an
+# in-progress blue/green swap that is mid-restart of this very unit.
+_DEPLOY_LOCK_FILE = f"{_DEPLOY_STATE_DIR}/deploy.lock"
 _VALID_COLORS = frozenset({"blue", "green"})
 
 # Printed by the remote check command itself when active-color genuinely
@@ -781,7 +785,22 @@ def _restart_active_color(ctx: Context, ssh: Ssh, node: str, project: str) -> st
         )
 
     unit = f"{project}@{color}.service"
-    ssh.run(f"systemctl try-restart {shlex.quote(unit)}")
+    # M4: run the restart under the SAME deploy.lock stack-deploy.sh itself
+    # takes, so this env-only restart can never race a blue/green swap
+    # that's mid-restart of this very unit. `flock -w 300` (not `-n`): a
+    # deploy in progress is expected to finish in well under 5 minutes, so
+    # waiting is the right behaviour here -- unlike stack-deploy.sh's own
+    # acquire_lock, which refuses immediately (exit 3) because a second
+    # concurrent DEPLOY is a caller mistake, not something to queue behind.
+    # `flock` creates the lock file if it doesn't exist yet (running as
+    # root here, same as every other steps.py ssh call -- see SSH_USER in
+    # reconcile.py); if it truly doesn't exist, no release has ever been
+    # deployed, and `_restart_active_color`'s caller already returned
+    # before reaching here in that case (see the _NO_ACTIVE_COLOR_MARKER
+    # branch above) -- so a missing lock file is never actually reached by
+    # this line in practice.
+    lock_cmd = f"flock -w 300 {shlex.quote(_DEPLOY_LOCK_FILE)} systemctl try-restart {shlex.quote(unit)}"
+    ssh.run(lock_cmd)
     return color
 
 
