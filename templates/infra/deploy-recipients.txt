@@ -1,0 +1,28 @@
+# Who can decrypt infra/deploy.age -- the project's SSH deploy key.
+#
+# One age public key per line. Lines starting with # are ignored. Commit
+# this file: public keys are not secret.
+#
+# This list MUST be a superset of infra/age-recipients.txt: everyone who
+# can read the project's secrets must also be able to deploy. `./infra/up`
+# refuses to run if a recipient is listed there but not here.
+#
+# It exists so the reverse is possible: a machine that only ships releases
+# (a NixOS build host, for example) gets an age identity listed HERE ONLY.
+# Compromising it yields "can push a release through the restricted door"
+# and nothing else -- no API tokens, no TLS key, no app_env.
+#
+# To add a build host:
+#
+#   1. On the build host, once:
+#
+#        mkdir -p ~/.age && age-keygen -o ~/.age/key.txt && chmod 600 ~/.age/key.txt
+#
+#   2. Print its PUBLIC key and paste it below as a new line:
+#
+#        age-keygen -y ~/.age/key.txt
+#
+#   3. Re-encrypt deploy.age for the new list. That replaces the key, so
+#      finish the sequence the command prints:
+#
+#        ./infra/up deploy-key init --rotate

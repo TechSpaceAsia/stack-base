@@ -27,6 +27,7 @@ from typing import Any, Callable
 from stackbase.config import load_config
 from stackbase.errors import StackError
 from stackbase.ramdir import private_ram_dir
+from stackbase.secrets import register_private_key, write_public_key
 
 SECRET_NAME = "STACK_DEPLOY_KEY"
 PUB_KEY_FILENAME = "ci-deploy.pub"
@@ -89,34 +90,6 @@ def _require_gh(*, runner: Any) -> None:
         raise StackError("the 'gh' command was not found", _MISSING_GH_HINT) from exc
     if result.returncode != 0:
         raise StackError("gh is not authenticated", "run `gh auth login`, then re-run ci-setup")
-
-
-def _register_private_key(private_key_text: str, register_secret: Callable[[str], None]) -> None:
-    """Feed the private key's whole text, plus each base64 body line, into
-    `register_secret` (F2, Fix round 1) -- before it is ever handed to `gh`.
-
-    A PEM/OpenSSH private key is `-----BEGIN ...-----` / body lines /
-    `-----END ...-----`; only the header/footer lines are non-secret. Each
-    body line is registered individually (not just the joined whole) so that
-    a partial echo of the key (e.g. one line of a remote command's stderr)
-    is still masked, the same reasoning `reconcile.redaction_values` applies
-    to `app_env`.
-    """
-    register_secret(private_key_text)
-    for line in private_key_text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("-----"):
-            continue
-        if len(stripped) >= 8:
-            register_secret(stripped)
-
-
-def _write_pub_key_atomically(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.parent / f".{path.name}.tmp"
-    tmp.write_text(content, encoding="utf-8")
-    tmp.chmod(0o644)
-    tmp.replace(path)
 
 
 def ci_setup(
@@ -191,7 +164,7 @@ def ci_setup(
 
         public_key = pub_key_path.read_text(encoding="utf-8").strip() + "\n"
         private_key_bytes = key_path.read_bytes()
-        _register_private_key(private_key_bytes.decode("utf-8", errors="replace"), register_secret)
+        register_private_key(private_key_bytes.decode("utf-8", errors="replace"), register_secret)
 
         # The private key travels ONLY as this subprocess call's stdin
         # (`input=`) -- never as an argv element, never as an environment
@@ -228,7 +201,7 @@ def ci_setup(
             f"run `gh secret list --repo {repo_slug}` yourself to check",
         )
 
-    _write_pub_key_atomically(pub_path, public_key)
+    write_public_key(pub_path, public_key)
 
     action = "rotated" if rotate else "created"
     emit(f"CI deploy key {action} for {repo_slug}.")

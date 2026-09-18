@@ -9,7 +9,18 @@ from pathlib import Path
 from unittest import mock
 
 from stackbase.errors import StackError
-from stackbase.secrets import load_secrets, redact, save_secrets
+from stackbase.secrets import (
+    DEPLOY_FILE,
+    DEPLOY_KEY_NAME,
+    SECRETS_FILE,
+    check_recipients_superset,
+    load_secrets,
+    read_recipients,
+    redact,
+    register_private_key,
+    save_secrets,
+    write_public_key,
+)
 
 _AGE_AVAILABLE = shutil.which("age") is not None and shutil.which("age-keygen") is not None
 
@@ -243,6 +254,126 @@ class SecretsRoundTripTests(unittest.TestCase):
                 os.umask(old_umask)
 
             self.assertEqual(seen_modes, [0o600])
+
+
+class ReadRecipientsTests(unittest.TestCase):
+    def test_skips_comments_and_blank_lines(self) -> None:
+        with TempInfraDir() as infra_dir:
+            path = infra_dir / "age-recipients.txt"
+            path.write_text("# who\n\nage1aaa\n  age1bbb  \n", encoding="utf-8")
+
+            self.assertEqual(read_recipients(path), ["age1aaa", "age1bbb"])
+
+    def test_a_missing_file_is_a_stack_error(self) -> None:
+        with TempInfraDir() as infra_dir:
+            with self.assertRaises(StackError) as ctx:
+                read_recipients(infra_dir / "age-recipients.txt")
+
+            self.assertIn("age-recipients.txt", str(ctx.exception))
+
+
+class RecipientsSupersetTests(unittest.TestCase):
+    def test_no_deploy_recipients_file_means_nothing_to_check(self) -> None:
+        with TempInfraDir() as infra_dir:
+            (infra_dir / "age-recipients.txt").write_text("age1aaa\n", encoding="utf-8")
+
+            check_recipients_superset(infra_dir)  # must not raise
+
+    def test_a_superset_passes(self) -> None:
+        with TempInfraDir() as infra_dir:
+            (infra_dir / "age-recipients.txt").write_text("age1aaa\nage1bbb\n", encoding="utf-8")
+            (infra_dir / "deploy-recipients.txt").write_text(
+                "age1aaa\nage1bbb\nage1buildhost\n", encoding="utf-8"
+            )
+
+            check_recipients_superset(infra_dir)  # must not raise
+
+    def test_a_missing_recipient_is_refused_and_named(self) -> None:
+        with TempInfraDir() as infra_dir:
+            (infra_dir / "age-recipients.txt").write_text("age1aaa\nage1bbb\n", encoding="utf-8")
+            (infra_dir / "deploy-recipients.txt").write_text("age1aaa\n", encoding="utf-8")
+
+            with self.assertRaises(StackError) as ctx:
+                check_recipients_superset(infra_dir)
+
+            message = str(ctx.exception)
+            self.assertIn("deploy-recipients.txt", message)
+            self.assertIn("age1bbb", message)
+            self.assertIn("deploy-key init --rotate", message)
+
+
+class PublicKeyWriteTests(unittest.TestCase):
+    def test_write_public_key_creates_the_parent_and_a_0644_file(self) -> None:
+        with TempInfraDir() as infra_dir:
+            path = infra_dir / "keys" / "deploy.pub"
+
+            write_public_key(path, "ssh-ed25519 AAAA deploy@acme\n")
+
+            self.assertEqual(path.read_text(encoding="utf-8"), "ssh-ed25519 AAAA deploy@acme\n")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+
+
+class RegisterPrivateKeyTests(unittest.TestCase):
+    def test_the_whole_key_and_every_body_line_are_registered(self) -> None:
+        key = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+        registered: list[str] = []
+
+        register_private_key(key, registered.append)
+
+        self.assertIn(key, registered)
+        self.assertIn("b3BlbnNzaC1rZXktdjEAAAAA", registered)
+        self.assertFalse(any(value.startswith("-----") for value in registered if value != key))
+
+
+@unittest.skipUnless(_AGE_AVAILABLE, "age / age-keygen not installed -- skipping secrets round-trip tests")
+class DeployFileRoundTripTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._identity_tmp = tempfile.TemporaryDirectory()
+        self.identity_path, self.public_key = _generate_age_identity(Path(self._identity_tmp.name))
+
+    def tearDown(self) -> None:
+        self._identity_tmp.cleanup()
+
+    def test_deploy_age_round_trips_against_its_own_recipients_file(self) -> None:
+        with TempInfraDir() as infra_dir:
+            (infra_dir / "deploy-recipients.txt").write_text(self.public_key + "\n", encoding="utf-8")
+            payload = {DEPLOY_KEY_NAME: "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n"}
+
+            with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(self.identity_path)}):
+                save_secrets(infra_dir, payload, file=DEPLOY_FILE)
+
+                self.assertTrue((infra_dir / "deploy.age").exists())
+                self.assertFalse((infra_dir / "secrets.age").exists())
+
+                self.assertEqual(load_secrets(infra_dir, file=DEPLOY_FILE), payload)
+
+    def test_a_missing_deploy_age_names_the_init_command(self) -> None:
+        with TempInfraDir() as infra_dir:
+            with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(self.identity_path)}):
+                with self.assertRaises(StackError) as ctx:
+                    load_secrets(infra_dir, file=DEPLOY_FILE)
+
+            self.assertIn("deploy.age", str(ctx.exception))
+            self.assertIn("./infra/up deploy-key init", str(ctx.exception))
+
+    def test_saving_deploy_age_without_its_recipients_file_is_refused(self) -> None:
+        with TempInfraDir() as infra_dir:
+            with self.assertRaises(StackError) as ctx:
+                save_secrets(infra_dir, {DEPLOY_KEY_NAME: "x"}, file=DEPLOY_FILE)
+
+            self.assertIn("deploy-recipients.txt", str(ctx.exception))
+
+    def test_the_two_files_stay_independent(self) -> None:
+        with TempInfraDir() as infra_dir:
+            (infra_dir / "age-recipients.txt").write_text(self.public_key + "\n", encoding="utf-8")
+            (infra_dir / "deploy-recipients.txt").write_text(self.public_key + "\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(self.identity_path)}):
+                save_secrets(infra_dir, {"hostinger_token": "tok"}, file=SECRETS_FILE)
+                save_secrets(infra_dir, {DEPLOY_KEY_NAME: "key"}, file=DEPLOY_FILE)
+
+                self.assertEqual(load_secrets(infra_dir), {"hostinger_token": "tok"})
+                self.assertEqual(load_secrets(infra_dir, file=DEPLOY_FILE), {DEPLOY_KEY_NAME: "key"})
 
 
 if __name__ == "__main__":

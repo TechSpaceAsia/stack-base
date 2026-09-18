@@ -40,7 +40,7 @@ from stackbase.reconcile import (
     render_description,
 )
 from stackbase.release import run_deploy, run_rollback, run_status
-from stackbase.secrets import load_secrets, redact
+from stackbase.secrets import check_recipients_superset, load_secrets, redact
 from stackbase.secrets_cli import edit_key, list_key_names, set_key, unset_key
 from stackbase.ssh import Ssh
 
@@ -211,6 +211,11 @@ _NO_CLOUDFLARE_WARNING = (
 def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
     cfg = load_config(infra_dir)
     state = load_state(infra_dir)
+    # Before anything reaches the network: a deploy-recipients.txt that has
+    # drifted behind age-recipients.txt means an admin who can read every
+    # project secret can no longer decrypt the deploy key -- caught here,
+    # once, rather than at their next failed deploy.
+    check_recipients_superset(infra_dir)
     secrets.update(load_secrets(infra_dir))
 
     hostinger = HostingerClient(_token(secrets, "hostinger_token", "Hostinger"))

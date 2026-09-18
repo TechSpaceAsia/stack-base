@@ -720,6 +720,16 @@ class TemplateFilesTests(unittest.TestCase):
         ]
         self.assertEqual(real_keys, [], "the template must not ship a real recipient key")
 
+    def test_the_deploy_recipients_file_carries_instructions_and_no_real_keys(self) -> None:
+        text = (_TEMPLATE_DIR / "deploy-recipients.txt").read_text(encoding="utf-8")
+
+        self.assertIn("superset", text)
+        self.assertIn("age-recipients.txt", text)
+        real_keys = [
+            line for line in text.splitlines() if line.strip().startswith("age1") and not line.startswith("#")
+        ]
+        self.assertEqual(real_keys, [], "the template must not ship a real recipient key")
+
     def test_the_gitignore_only_hides_build_output(self) -> None:
         entries = [
             line.strip()
