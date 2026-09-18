@@ -24,10 +24,12 @@ Four stages:
 - `ship` / `rollback_nodes` / `status_nodes` -- drive the SSH door, one node
   at a time, in the right order.
 
-These commands need no secrets: no age decryption, no API token. They only
-need `stack.toml`, `stack.state.json` (for each node's IP) and
-`infra/known_hosts` -- a teammate whose only credential is an SSH key listed
-in `stackbase.deploy.keys` can run all three.
+These commands need no API token and never decrypt `secrets.age`. They read
+`stack.toml`, `stack.state.json` and `infra/known_hosts` -- plus, when the
+project has one, `infra/deploy.age`, which needs the age identity. A
+teammate whose only credential is an SSH key listed in
+`stackbase.deploy.keys` still runs all three: they set
+`$STACKBASE_SSH_IDENTITY`, or let their ssh-agent answer.
 """
 
 from __future__ import annotations
@@ -50,6 +52,8 @@ from typing import Any, Callable, Iterator
 
 from stackbase.config import StackConfig, StackState, load_config, load_state
 from stackbase.errors import StackError
+from stackbase.ramdir import private_ram_dir
+from stackbase.secrets import DEPLOY_FILE, DEPLOY_KEY_NAME, load_secrets, register_private_key
 from stackbase.ssh import Ssh
 
 # vMAJOR.MINOR.PATCH exactly -- no leading zeros, no pre-release/build
@@ -589,6 +593,88 @@ def _sha256_file(path: Path) -> str:
 
 
 # --------------------------------------------------------------------------
+# The SSH identity a deploy uses
+# --------------------------------------------------------------------------
+
+# Read by stackbase/ssh.py's own `_identity_options` -- setting it here
+# makes every Ssh() built inside the `with` block offer exactly one key
+# (`-i <path> -o IdentitiesOnly=yes`), which is also what keeps a
+# multi-key ssh-agent from burning through the node's MaxAuthTries (I4).
+_SSH_IDENTITY_ENV = "STACKBASE_SSH_IDENTITY"
+
+_NO_PROJECT_KEY_WARNING = (
+    "! no project deploy key found (infra/deploy.age) -- using whatever your ssh-agent offers; "
+    "run `./infra/up deploy-key init` to create one"
+)
+
+
+@contextlib.contextmanager
+def deploy_identity(
+    infra_dir: Path,
+    *,
+    emit: Callable[[str], None] = print,
+    register_secret: Callable[[str], None] = lambda _value: None,
+) -> Iterator[None]:
+    """Resolve which SSH key this deploy offers, in a fixed order.
+
+    1. `$STACKBASE_SSH_IDENTITY` -- an explicit operator choice always wins,
+       and nothing is decrypted.
+    2. `infra/deploy.age` -- decrypted with the age identity
+       (`$STACKBASE_AGE_IDENTITY`; on a build host a file identity, on a
+       laptop usually a YubiKey) into a RAM-backed scratch file for the
+       duration of this block, and pointed at by `$STACKBASE_SSH_IDENTITY`.
+       The plaintext key NEVER exists outside `private_ram_dir()`, which is
+       zeroed and removed on the way out -- success, failure or Ctrl-C.
+    3. Neither -- fall through to whatever the operator's ssh-agent offers,
+       with one warning line so a silent "Permission denied" later is not a
+       mystery.
+
+    Unlike everything else in this module, path 2 needs an age identity.
+    That is deliberate (it is what lets a build host deploy with a key that
+    unlocks nothing else); a teammate who only holds an SSH key still
+    deploys via path 1 or 3.
+    """
+    if os.environ.get(_SSH_IDENTITY_ENV):
+        yield
+        return
+
+    deploy_path = infra_dir / DEPLOY_FILE.name
+    if not deploy_path.exists():
+        emit(_NO_PROJECT_KEY_WARNING)
+        yield
+        return
+
+    private_key = load_secrets(infra_dir, file=DEPLOY_FILE).get(DEPLOY_KEY_NAME)
+    if not private_key:
+        raise StackError(
+            f"{deploy_path} has no '{DEPLOY_KEY_NAME}'",
+            "re-create it with `./infra/up deploy-key init --rotate`",
+        )
+    register_private_key(private_key, register_secret)
+
+    with private_ram_dir() as ramdir:
+        key_path = ramdir / "deploy_key"
+        # Created at 0600 atomically (O_CREAT|O_EXCL), never chmod'ed
+        # afterwards: ssh refuses a group/world-readable private key, and a
+        # window at a laxer mode is exactly what this avoids.
+        fd = os.open(str(key_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            # ssh requires the trailing newline; ssh-keygen always writes
+            # one, but a hand-edited deploy.age might not have it.
+            handle.write(private_key if private_key.endswith("\n") else private_key + "\n")
+
+        previous = os.environ.get(_SSH_IDENTITY_ENV)
+        os.environ[_SSH_IDENTITY_ENV] = str(key_path)
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop(_SSH_IDENTITY_ENV, None)
+            else:
+                os.environ[_SSH_IDENTITY_ENV] = previous
+
+
+# --------------------------------------------------------------------------
 # Ship / rollback / status: drive the SSH door, node by node
 # --------------------------------------------------------------------------
 
@@ -828,11 +914,13 @@ def run_deploy(
     runner: Any = subprocess.run,
     popen: Any = subprocess.Popen,
     emit: Callable[[str], None] = print,
+    register_secret: Callable[[str], None] = lambda _value: None,
 ) -> None:
     """`deploy <version>`: build (or reuse a prebuilt tarball), package, ship.
 
-    Needs no secrets -- only `stack.toml`, `stack.state.json` and
-    `infra/known_hosts`; `load_secrets` is never called.
+    Reads no API token and never decrypts `secrets.age`. The one secret this
+    path can hold is the project's own SSH deploy key, resolved by
+    `deploy_identity` around the ship phase only -- see its docstring.
     """
     if skip_build and not tarball_path:
         raise StackError("--skip-build requires --tarball PATH", "pass --tarball with the pre-built release archive")
@@ -856,7 +944,8 @@ def run_deploy(
         if not tarball.is_file():
             raise StackError(f"tarball not found: {tarball}", "check the --tarball path")
         sha256 = _sha256_file(tarball)
-        ship(infra_dir, cfg, state, version, tarball, sha256, node=node, runner=runner, popen=popen, emit=emit)
+        with deploy_identity(infra_dir, emit=emit, register_secret=register_secret):
+            ship(infra_dir, cfg, state, version, tarball, sha256, node=node, runner=runner, popen=popen, emit=emit)
         return
 
     # A private, per-run work dir (`tempfile.mkdtemp`'s own default mode,
@@ -875,7 +964,11 @@ def run_deploy(
             project = read_project(worktree, cfg)
             bundle_dir = build(worktree, project, work_dir=work_dir, runner=runner, popen=popen, emit=emit)
             tarball, sha256 = package(bundle_dir, version, mtime, binary_name=project.binary)
-        ship(infra_dir, cfg, state, version, tarball, sha256, node=node, runner=runner, popen=popen, emit=emit)
+        # Opened only now, not around the build: a cargo build can take many
+        # minutes, and the decrypted key only needs to exist for the
+        # upload/switch phase.
+        with deploy_identity(infra_dir, emit=emit, register_secret=register_secret):
+            ship(infra_dir, cfg, state, version, tarball, sha256, node=node, runner=runner, popen=popen, emit=emit)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -887,10 +980,12 @@ def run_rollback(
     runner: Any = subprocess.run,
     popen: Any = subprocess.Popen,
     emit: Callable[[str], None] = print,
+    register_secret: Callable[[str], None] = lambda _value: None,
 ) -> None:
     cfg = load_config(infra_dir)
     state = load_state(infra_dir)
-    rollback_nodes(infra_dir, cfg, state, node=node, runner=runner, popen=popen, emit=emit)
+    with deploy_identity(infra_dir, emit=emit, register_secret=register_secret):
+        rollback_nodes(infra_dir, cfg, state, node=node, runner=runner, popen=popen, emit=emit)
 
 
 def run_status(
@@ -900,7 +995,9 @@ def run_status(
     runner: Any = subprocess.run,
     popen: Any = subprocess.Popen,
     emit: Callable[[str], None] = print,
+    register_secret: Callable[[str], None] = lambda _value: None,
 ) -> None:
     cfg = load_config(infra_dir)
     state = load_state(infra_dir)
-    status_nodes(infra_dir, cfg, state, node=node, runner=runner, popen=popen, emit=emit)
+    with deploy_identity(infra_dir, emit=emit, register_secret=register_secret):
+        status_nodes(infra_dir, cfg, state, node=node, runner=runner, popen=popen, emit=emit)

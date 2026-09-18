@@ -236,6 +236,16 @@ git push origin v1.2.3
 ./infra/up deploy v1.2.3
 ```
 
+**Which key a deploy offers**, in order:
+
+1. `$STACKBASE_SSH_IDENTITY`, if you set it — an explicit choice always wins.
+2. `infra/deploy.age`, decrypted to a RAM-only file for the duration of the
+   command. This is the normal path, and the one a build host uses.
+3. Your `ssh-agent`, with a warning that no project key was found.
+
+The decrypted key never touches a real disk, and `./infra/up deploy` deletes
+it the moment the command ends (including on Ctrl-C).
+
 `deploy` builds a clean, deterministic release from that tag (a fresh `git
 worktree`, never your working tree — the same build a GitHub Actions
 deploy runs, see [below](#deploying-from-github-actions-optional)), uploads

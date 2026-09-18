@@ -144,11 +144,11 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "ssh":
             _ssh(args, infra_dir)
         elif args.command == "deploy":
-            _deploy(args, infra_dir)
+            _deploy(args, infra_dir, secrets)
         elif args.command == "rollback":
-            _rollback(args, infra_dir)
+            _rollback(args, infra_dir, secrets)
         elif args.command == "status":
-            _status(args, infra_dir)
+            _status(args, infra_dir, secrets)
         elif args.command == "ci-setup":
             _ci_setup(args, infra_dir, secrets)
         elif args.command == "deploy-key":
@@ -315,35 +315,61 @@ def _ssh(args: argparse.Namespace, infra_dir: Path) -> None:
 
 
 def _emit_plain(line: str) -> None:
-    """The print path `deploy`/`rollback`/`status` share.
+    """The print path for output that is emitted BEFORE anything is decrypted.
 
-    These commands never load a secret (no `load_secrets` call anywhere in
-    their path -- see the global constraint that a teammate with only an SSH
-    key listed in `stackbase.deploy.keys` can run them), so there is nothing
-    to mask today. Still routed through `redact()` with an empty value list
-    -- a no-op -- so every printed line goes through the same masking path
-    as the rest of the CLI, in case that ever changes.
+    `ci-setup`, `deploy-key` and `secrets` hand their own
+    `register_secret` to the functions that hold a value, and print their
+    own already-safe lines through here. Still routed through `redact()`
+    with an empty value list -- a no-op -- so every printed line goes
+    through the same masking path as the rest of the CLI. Anything that can
+    hold a secret for the duration of a command uses `_emit_masked` instead.
     """
     print(redact(line, []))
 
 
-def _deploy(args: argparse.Namespace, infra_dir: Path) -> None:
+def _emit_masked(secrets: dict[str, str]) -> Callable[[str], None]:
+    """A print that masks every value registered so far.
+
+    `deploy`/`rollback`/`status` can now hold one secret -- the project's
+    SSH deploy key, decrypted into RAM by `release.deploy_identity` -- so
+    their output goes through the same masking path as the rest of the CLI
+    rather than `_emit_plain`'s empty value list.
+    """
+
+    def emit(line: str) -> None:
+        print(redact(line, redaction_values(secrets)))
+
+    return emit
+
+
+def _deploy(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
     run_deploy(
         infra_dir,
         args.version,
         node=args.node,
         skip_build=args.skip_build,
         tarball_path=args.tarball,
-        emit=_emit_plain,
+        emit=_emit_masked(secrets),
+        register_secret=_secret_register_counter(secrets),
     )
 
 
-def _rollback(args: argparse.Namespace, infra_dir: Path) -> None:
-    run_rollback(infra_dir, node=args.node, emit=_emit_plain)
+def _rollback(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+    run_rollback(
+        infra_dir,
+        node=args.node,
+        emit=_emit_masked(secrets),
+        register_secret=_secret_register_counter(secrets),
+    )
 
 
-def _status(args: argparse.Namespace, infra_dir: Path) -> None:
-    run_status(infra_dir, node=args.node, emit=_emit_plain)
+def _status(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+    run_status(
+        infra_dir,
+        node=args.node,
+        emit=_emit_masked(secrets),
+        register_secret=_secret_register_counter(secrets),
+    )
 
 
 def _secret_register_counter(secrets: dict[str, str]) -> Callable[[str], None]:

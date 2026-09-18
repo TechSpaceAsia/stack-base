@@ -11,9 +11,11 @@ no real server, ever.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -27,21 +29,29 @@ from stackbase.errors import StackError
 from stackbase.release import (
     Project,
     build,
+    deploy_identity,
     package,
     project_from_cargo_toml,
     release_worktree,
     rollback_nodes,
     run_deploy,
+    run_status,
     ship,
     status_nodes,
     tag_commit_timestamp,
     validate_version_format,
     verify_version,
 )
+from stackbase.secrets import DEPLOY_FILE, DEPLOY_KEY_NAME, save_secrets
 from stackbase.__main__ import main
 from tests.fakes import FakePopen, FakeRunner
+from tests.test_secrets import _generate_age_identity
 
 _SHA = "a" * 64
+# The deploy-key tests round-trip through real `age`/`age-keygen` (the same
+# philosophy as tests/test_secrets.py: faking the crypto would test nothing);
+# they are skipped rather than failed where those binaries are absent.
+_AGE_AVAILABLE = shutil.which("age") is not None and shutil.which("age-keygen") is not None
 _GIT_ENV = {
     **os.environ,
     "GIT_AUTHOR_NAME": "Test",
@@ -1379,6 +1389,113 @@ class CLIWiringTests(unittest.TestCase):
             line = stderr.getvalue().strip()
             self.assertEqual(len(line.splitlines()), 1)
             self.assertTrue(line.startswith("error: boom"))
+
+
+# --------------------------------------------------------------------------
+# deploy_identity(): which SSH key a deploy offers, and where the plaintext lives
+# --------------------------------------------------------------------------
+
+
+_TEST_PRIVATE_KEY = (
+    "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n"
+    "-----END OPENSSH PRIVATE KEY-----\n"
+)
+
+
+class DeployIdentityTests(unittest.TestCase):
+    def test_an_explicit_env_identity_wins_and_nothing_is_decrypted(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp)
+            (infra_dir / "deploy.age").write_bytes(b"would-not-decrypt")
+            emitted: list[str] = []
+
+            with mock.patch.dict(os.environ, {"STACKBASE_SSH_IDENTITY": "/home/me/.ssh/id_ed25519"}):
+                with deploy_identity(infra_dir, emit=emitted.append):
+                    self.assertEqual(os.environ["STACKBASE_SSH_IDENTITY"], "/home/me/.ssh/id_ed25519")
+
+            self.assertEqual(emitted, [])
+
+    def test_no_project_key_warns_once_and_leaves_the_agent_path_alone(self) -> None:
+        with TemporaryDirectory() as tmp:
+            emitted: list[str] = []
+            env = {key: value for key, value in os.environ.items() if key != "STACKBASE_SSH_IDENTITY"}
+
+            with mock.patch.dict(os.environ, env, clear=True):
+                with deploy_identity(Path(tmp), emit=emitted.append):
+                    self.assertNotIn("STACKBASE_SSH_IDENTITY", os.environ)
+
+            self.assertEqual(len(emitted), 1)
+            self.assertIn("deploy-key init", emitted[0])
+
+    @unittest.skipUnless(_AGE_AVAILABLE, "age / age-keygen not installed")
+    def test_deploy_age_is_decrypted_into_a_ram_dir_for_the_duration_only(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            identity_path, public_key = _generate_age_identity(Path(tmp))
+            (infra_dir / "deploy-recipients.txt").write_text(public_key + "\n", encoding="utf-8")
+            seen: dict[str, str] = {}
+
+            env = {key: value for key, value in os.environ.items() if key != "STACKBASE_SSH_IDENTITY"}
+            env["STACKBASE_AGE_IDENTITY"] = str(identity_path)
+            with mock.patch.dict(os.environ, env, clear=True):
+                save_secrets(infra_dir, {DEPLOY_KEY_NAME: _TEST_PRIVATE_KEY}, file=DEPLOY_FILE)
+
+                with deploy_identity(infra_dir, emit=lambda _line: None):
+                    key_path = Path(os.environ["STACKBASE_SSH_IDENTITY"])
+                    seen["path"] = str(key_path)
+                    self.assertTrue(key_path.is_absolute())
+                    self.assertEqual(key_path.read_text(encoding="utf-8"), _TEST_PRIVATE_KEY)
+                    self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
+                    self.assertFalse(
+                        str(key_path).startswith(str(infra_dir)),
+                        "the plaintext key must never be written inside the project",
+                    )
+
+                self.assertNotIn("STACKBASE_SSH_IDENTITY", os.environ)
+
+            self.assertFalse(Path(seen["path"]).exists(), "the RAM scratch file must be wiped on exit")
+
+    @unittest.skipUnless(_AGE_AVAILABLE, "age / age-keygen not installed")
+    def test_the_private_key_is_registered_for_redaction(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            identity_path, public_key = _generate_age_identity(Path(tmp))
+            (infra_dir / "deploy-recipients.txt").write_text(public_key + "\n", encoding="utf-8")
+            registered: list[str] = []
+
+            env = {key: value for key, value in os.environ.items() if key != "STACKBASE_SSH_IDENTITY"}
+            env["STACKBASE_AGE_IDENTITY"] = str(identity_path)
+            with mock.patch.dict(os.environ, env, clear=True):
+                save_secrets(infra_dir, {DEPLOY_KEY_NAME: _TEST_PRIVATE_KEY}, file=DEPLOY_FILE)
+
+                with deploy_identity(infra_dir, emit=lambda _line: None, register_secret=registered.append):
+                    pass
+
+            self.assertIn(_TEST_PRIVATE_KEY, registered)
+
+
+class DeployIdentityIsUsedByTheCommandsTests(unittest.TestCase):
+    def test_run_status_opens_the_identity_around_the_ssh_calls(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = RunDeploySkipBuildTests()._project(Path(tmp))
+            order: list[str] = []
+
+            @contextlib.contextmanager
+            def fake_identity(*_args, **_kwargs):
+                order.append("enter")
+                yield
+                order.append("exit")
+
+            with (
+                mock.patch("stackbase.release.deploy_identity", fake_identity),
+                mock.patch("stackbase.release.status_nodes", side_effect=lambda *a, **k: order.append("status")),
+            ):
+                run_status(infra_dir, emit=lambda _line: None)
+
+            self.assertEqual(order, ["enter", "status", "exit"])
 
 
 if __name__ == "__main__":
