@@ -1604,6 +1604,42 @@ class RebuildTests(unittest.TestCase):
         kwargs.setdefault("runner", FakeRunner(default=_cp(["ssh"], stdout="")))
         return _context(infra_dir, state=state, popen=popen, **kwargs)
 
+    def test_a_first_published_run_brings_the_lock_home(self) -> None:
+        # No infra/flake.lock yet and no local checkout: the wrapper resolved
+        # the release from flake.nix, the node wrote the lock during the
+        # rebuild, and it must come back so the project can commit it.
+        lock_json = b'{"nodes": {"root": {"inputs": {"stack-base": "stack-base"}}, "stack-base": {"locked": {"rev": "%s"}}}}' % (b"1" * 40)
+
+        def handler(argv, kwargs):
+            if argv[0] == "ssh" and "cat -- /etc/nixos/stack/flake.lock" in argv[-1]:
+                return _cp(argv, stdout=lock_json)
+            return None
+
+        popen = FakePopen()
+        popen.script(0, "building...\n")
+        popen.script(0, "switching...\n")
+        with Infra() as infra_dir:
+            (infra_dir / "flake.lock").unlink(missing_ok=True)
+            runner = FakeRunner(handler=handler, default=_cp(["ssh"], stdout=""))
+            with mock.patch.dict(os.environ, {"STACKBASE_RESOLVED_REV": "1" * 40}):
+                ctx, lines = self._ctx(infra_dir, popen, runner=runner)
+                apply([Step(Action.REBUILD, "a")], ctx, allow_purchase=False)
+
+            self.assertEqual((infra_dir / "flake.lock").read_bytes(), lock_json)
+            self.assertTrue(any("flake.lock updated from the node" in line for line in lines), lines)
+
+    def test_a_later_published_run_does_not_fetch_the_lock(self) -> None:
+        popen = FakePopen()
+        popen.script(0, "building...\n")
+        popen.script(0, "switching...\n")
+        with Infra() as infra_dir:
+            self.assertTrue((infra_dir / "flake.lock").exists())
+            ctx, lines = self._ctx(infra_dir, popen)
+            apply([Step(Action.REBUILD, "a")], ctx, allow_purchase=False)
+
+            fetches = [c for c in ctx.runner.calls if c["argv"][0] == "ssh" and "flake.lock" in c["argv"][-1]]
+            self.assertEqual(fetches, [])
+
     def test_it_tests_then_probes_then_switches_and_records_the_rev(self) -> None:
         popen = FakePopen()
         popen.script(0, "building...\n")

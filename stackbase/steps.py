@@ -520,7 +520,12 @@ def _rebuild(ctx: Context, step: Step) -> str:
     # infra/flake.lock, the node genuinely is out of date again, and the next
     # run should say so rather than call a stale node converged.
     ctx.node_state(node).applied_rev = compute_rev(ctx.infra_dir, stackbase_src=ctx.stackbase_src)
-    if ctx.stackbase_src:
+    # Two cases have no lock to commit yet: dev mode (the operator may have
+    # no Nix at all), and a project's very first published-mode run (the
+    # wrapper resolved the release from flake.nix; the node just wrote the
+    # lock that pins it). Every later run pushes the committed lock up, so
+    # bringing it back would be a no-op.
+    if ctx.stackbase_src or not (ctx.infra_dir / "flake.lock").exists():
         _fetch_lock_file(ctx, ssh)
     return f"node {node}: NixOS rebuilt and switched"
 
