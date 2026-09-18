@@ -279,6 +279,23 @@ STACKBASE_SSH_IDENTITY=<path to your SSH private key>
 ./infra/up deploy v1.2.3
 ```
 
+**Where the build happens.** `deploy` builds in a throwaway `git worktree`
+of the tag, but keeps cargo's incremental cache in
+`~/.cache/stack-base/target/<project>` so a second release is not a cold
+build. Set `$CARGO_TARGET_DIR` yourself to override it.
+
+**Building on NixOS.** Two things differ from a Debian-family machine, and
+`deploy` handles both: the musl cross compiler is called
+`x86_64-unknown-linux-musl-gcc` (it is wired into `$CC_x86_64_unknown_linux_musl`
+and `$CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER` automatically when it is
+on PATH and you have not set either yourself), and the standalone
+`tools/tailwindcss` binary cannot run at all — put `tailwindcss` on PATH and
+it is used in preference. A build shell that has everything:
+
+```bash
+nix-shell -p pkgsCross.musl64.stdenv.cc tailwindcss cargo rustc
+```
+
 `deploy` builds a clean, deterministic release from that tag (a fresh `git
 worktree`, never your working tree — the same build a GitHub Actions
 deploy runs, see [below](#deploying-from-github-actions-optional)), uploads

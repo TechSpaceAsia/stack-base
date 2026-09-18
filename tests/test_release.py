@@ -27,8 +27,12 @@ from unittest import mock
 from stackbase.config import AppConfig, Node, NodeState, StackConfig, StackState
 from stackbase.errors import StackError
 from stackbase.release import (
+    MUSL_CC_ENV,
+    MUSL_GCC,
+    MUSL_LINKER_ENV,
     Project,
     build,
+    cargo_target_dir,
     deploy_identity,
     package,
     project_from_cargo_toml,
@@ -52,6 +56,27 @@ _SHA = "a" * 64
 # philosophy as tests/test_secrets.py: faking the crypto would test nothing);
 # they are skipped rather than failed where those binaries are absent.
 _AGE_AVAILABLE = shutil.which("age") is not None and shutil.which("age-keygen") is not None
+
+# `build()` (Task 7) now honours an already-set $CARGO_TARGET_DIR to find
+# where cargo actually wrote the binary. A developer machine may have that
+# variable set globally in its shell profile for an unrelated project --
+# every test in this module that drives `build()` with a FAKE `popen`
+# (which never actually invokes cargo, so nothing is ever written under
+# such a directory) needs a clean slate, or the binary-not-produced check
+# fails for a reason that has nothing to do with what the test is checking.
+# Stripped once here, for the whole module, rather than in every individual
+# test that happens to call build().
+_SAVED_CARGO_TARGET_DIR: str | None = None
+
+
+def setUpModule() -> None:
+    global _SAVED_CARGO_TARGET_DIR
+    _SAVED_CARGO_TARGET_DIR = os.environ.pop("CARGO_TARGET_DIR", None)
+
+
+def tearDownModule() -> None:
+    if _SAVED_CARGO_TARGET_DIR is not None:
+        os.environ["CARGO_TARGET_DIR"] = _SAVED_CARGO_TARGET_DIR
 _GIT_ENV = {
     **os.environ,
     "GIT_AUTHOR_NAME": "Test",
@@ -429,6 +454,9 @@ class BuildTests(unittest.TestCase):
             self.assertIn("npm run build:css", argvs)
 
     def test_runs_tools_tailwindcss_when_no_package_json_script(self) -> None:
+        # Deterministic regardless of whether the test machine happens to
+        # have a real `tailwindcss` on PATH -- TailwindOnPathTests below
+        # covers that case explicitly; this one is about tools/tailwindcss.
         with TemporaryDirectory() as tmp:
             worktree = _worktree(Path(tmp), with_tailwind=True)
             popen = FakePopen()
@@ -436,7 +464,8 @@ class BuildTests(unittest.TestCase):
             popen.script(returncode=0, output="tailwind ok\n")
             project = Project(version="1.0.0", binary="stack_demo")
 
-            build(worktree, project, work_dir=Path(tmp), popen=popen, emit=lambda _line: None)
+            with mock.patch.dict(os.environ, {**os.environ, "PATH": str(Path(tmp) / "empty")}, clear=True):
+                build(worktree, project, work_dir=Path(tmp), popen=popen, emit=lambda _line: None)
 
             tailwind_call = popen.calls[1]
             self.assertTrue(tailwind_call["argv"][0].endswith("tools/tailwindcss"))
@@ -507,6 +536,220 @@ class BuildTests(unittest.TestCase):
 
             self.assertIn("line1", emitted)
             self.assertIn("line2", emitted)
+
+
+def _fake_musl_gcc(tmp: Path) -> Path:
+    """A directory containing an executable x86_64-unknown-linux-musl-gcc."""
+    bin_dir = tmp / "toolchain"
+    bin_dir.mkdir()
+    gcc = bin_dir / MUSL_GCC
+    gcc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    gcc.chmod(0o755)
+    return bin_dir
+
+
+class MuslToolchainTests(unittest.TestCase):
+    def test_a_cross_gcc_on_path_is_wired_into_both_variables(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = _worktree(root)
+            bin_dir = _fake_musl_gcc(root)
+            popen = FakePopen()
+            popen.script(returncode=0, output="ok\n")
+            project = Project(version="1.0.0", binary="stack_demo")
+
+            env_without = {
+                key: value
+                for key, value in os.environ.items()
+                if key not in (MUSL_CC_ENV, MUSL_LINKER_ENV)
+            }
+            env_without["PATH"] = str(bin_dir)
+            with mock.patch.dict(os.environ, env_without, clear=True):
+                build(worktree, project, work_dir=root, popen=popen, emit=lambda _line: None)
+
+            env = popen.calls[0]["kwargs"]["env"]
+            self.assertEqual(env[MUSL_CC_ENV], str(bin_dir / MUSL_GCC))
+            self.assertEqual(env[MUSL_LINKER_ENV], str(bin_dir / MUSL_GCC))
+
+    def test_no_cross_gcc_on_path_changes_nothing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = _worktree(root)
+            popen = FakePopen()
+            popen.script(returncode=0, output="ok\n")
+            project = Project(version="1.0.0", binary="stack_demo")
+
+            env_without = {
+                key: value
+                for key, value in os.environ.items()
+                if key not in (MUSL_CC_ENV, MUSL_LINKER_ENV)
+            }
+            env_without["PATH"] = str(root / "empty")
+            with mock.patch.dict(os.environ, env_without, clear=True):
+                build(worktree, project, work_dir=root, popen=popen, emit=lambda _line: None)
+
+            env = popen.calls[0]["kwargs"]["env"]
+            self.assertNotIn(MUSL_CC_ENV, env)
+            self.assertNotIn(MUSL_LINKER_ENV, env)
+
+    def test_an_operator_set_variable_is_never_overwritten(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = _worktree(root)
+            bin_dir = _fake_musl_gcc(root)
+            popen = FakePopen()
+            popen.script(returncode=0, output="ok\n")
+            project = Project(version="1.0.0", binary="stack_demo")
+
+            env = {**os.environ, "PATH": str(bin_dir), MUSL_CC_ENV: "/usr/bin/my-own-cc"}
+            env.pop(MUSL_LINKER_ENV, None)
+            with mock.patch.dict(os.environ, env, clear=True):
+                build(worktree, project, work_dir=root, popen=popen, emit=lambda _line: None)
+
+            call_env = popen.calls[0]["kwargs"]["env"]
+            self.assertEqual(call_env[MUSL_CC_ENV], "/usr/bin/my-own-cc")
+            self.assertNotIn(MUSL_LINKER_ENV, call_env)
+
+
+class CargoTargetDirTests(unittest.TestCase):
+    def test_it_is_under_xdg_cache_home_and_named_for_the_project(self) -> None:
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": "/cache"}, clear=False):
+            os.environ.pop("CARGO_TARGET_DIR", None)
+
+            self.assertEqual(cargo_target_dir("acme"), Path("/cache/stack-base/target/acme"))
+
+    def test_an_operator_set_cargo_target_dir_wins(self) -> None:
+        with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "/somewhere"}, clear=False):
+            self.assertIsNone(cargo_target_dir("acme"))
+
+    def test_build_uses_the_persistent_dir_and_finds_the_binary_there(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = _worktree(root)
+            # The binary must be found under the TARGET dir, not under the
+            # throwaway worktree -- a stale copy there would mask the bug.
+            shutil.rmtree(worktree / "target")
+            target_root = root / "cache" / "stack-base" / "target" / "acme"
+            release_dir = target_root / "x86_64-unknown-linux-musl" / "release"
+            release_dir.mkdir(parents=True)
+            (release_dir / "stack_demo").write_bytes(b"pretend-elf-binary")
+            popen = FakePopen()
+            popen.script(returncode=0, output="ok\n")
+            project = Project(version="1.0.0", binary="stack_demo")
+
+            env = {**os.environ, "XDG_CACHE_HOME": str(root / "cache")}
+            env.pop("CARGO_TARGET_DIR", None)
+            with mock.patch.dict(os.environ, env, clear=True):
+                bundle_dir = build(
+                    worktree, project, work_dir=root, project_slug="acme", popen=popen, emit=lambda _l: None
+                )
+
+            self.assertEqual(popen.calls[0]["kwargs"]["env"]["CARGO_TARGET_DIR"], str(target_root))
+            self.assertTrue((bundle_dir / "stack_demo").is_file())
+
+    def test_without_a_project_slug_the_worktree_target_is_used(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = _worktree(root)
+            popen = FakePopen()
+            popen.script(returncode=0, output="ok\n")
+            project = Project(version="1.0.0", binary="stack_demo")
+
+            env = {key: value for key, value in os.environ.items() if key != "CARGO_TARGET_DIR"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                build(worktree, project, work_dir=root, popen=popen, emit=lambda _line: None)
+
+            self.assertNotIn("CARGO_TARGET_DIR", popen.calls[0]["kwargs"]["env"])
+
+    def test_a_slug_with_a_path_separator_is_refused(self) -> None:
+        """`project_slug` becomes a single path segment under the cache root
+        -- a value containing '/' could otherwise escape it. `cfg.project` is
+        already constrained by config.py's _PROJECT_RE at stack.toml load
+        time, so this can't fire via run_deploy; it's a second, independent
+        guard on cargo_target_dir's own public contract.
+        """
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": "/cache"}, clear=False):
+            os.environ.pop("CARGO_TARGET_DIR", None)
+            with self.assertRaises(StackError):
+                cargo_target_dir("../../etc")
+            with self.assertRaises(StackError):
+                cargo_target_dir("acme/../../etc")
+
+    def test_a_slug_that_is_dot_dot_is_refused(self) -> None:
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": "/cache"}, clear=False):
+            os.environ.pop("CARGO_TARGET_DIR", None)
+            with self.assertRaises(StackError):
+                cargo_target_dir("..")
+
+    def test_a_slug_with_a_leading_hyphen_is_refused(self) -> None:
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": "/cache"}, clear=False):
+            os.environ.pop("CARGO_TARGET_DIR", None)
+            with self.assertRaises(StackError):
+                cargo_target_dir("-rf")
+
+
+class TailwindOnPathTests(unittest.TestCase):
+    def _fake_tailwind(self, tmp: Path) -> Path:
+        bin_dir = tmp / "tw"
+        bin_dir.mkdir()
+        binary = bin_dir / "tailwindcss"
+        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binary.chmod(0o755)
+        return bin_dir
+
+    def test_tailwindcss_on_path_is_preferred_over_the_downloaded_binary(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = _worktree(root, with_tailwind=True)
+            bin_dir = self._fake_tailwind(root)
+            popen = FakePopen()
+            popen.script(returncode=0, output="cargo ok\n")
+            popen.script(returncode=0, output="tailwind ok\n")
+            project = Project(version="1.0.0", binary="stack_demo")
+
+            with mock.patch.dict(os.environ, {**os.environ, "PATH": str(bin_dir)}, clear=True):
+                build(worktree, project, work_dir=root, popen=popen, emit=lambda _line: None)
+
+            tailwind_call = popen.calls[1]
+            self.assertEqual(tailwind_call["argv"][0], str(bin_dir / "tailwindcss"))
+            self.assertEqual(
+                tailwind_call["argv"][1:],
+                ["-i", "src/templates/input.css", "-o", "static/css/output.css", "--minify"],
+            )
+
+    def test_a_failing_css_build_names_both_ways_to_get_tailwind(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = _worktree(root, with_tailwind=True)
+            popen = FakePopen()
+            popen.script(returncode=0, output="cargo ok\n")
+            popen.script(returncode=1, output="tailwind blew up\n")
+            project = Project(version="1.0.0", binary="stack_demo")
+
+            with mock.patch.dict(os.environ, {**os.environ, "PATH": str(root / "empty")}, clear=True):
+                with self.assertRaises(StackError) as ctx:
+                    build(worktree, project, work_dir=root, popen=popen, emit=lambda _line: None)
+
+            hint = str(ctx.exception)
+            self.assertIn("tailwindcss on PATH", hint)
+            self.assertIn("tools/install-tailwindcss.sh", hint)
+
+    def test_the_skip_message_names_all_three_ways(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = _worktree(root)
+            popen = FakePopen()
+            popen.script(returncode=0, output="cargo ok\n")
+            emitted: list[str] = []
+            project = Project(version="1.0.0", binary="stack_demo")
+
+            with mock.patch.dict(os.environ, {**os.environ, "PATH": str(root / "empty")}, clear=True):
+                build(worktree, project, work_dir=root, popen=popen, emit=emitted.append)
+
+            skip = next(line for line in emitted if "no CSS build step" in line)
+            self.assertIn("build:css", skip)
+            self.assertIn("tailwindcss on PATH", skip)
+            self.assertIn("tools/tailwindcss", skip)
 
 
 # --------------------------------------------------------------------------
@@ -1158,9 +1401,19 @@ class RunDeploySkipBuildTests(unittest.TestCase):
 class RunDeployWorkDirTests(unittest.TestCase):
     """The full (non-skip-build) `run_deploy` path, against a REAL git repo
     (cheap -- matches this file's own stated philosophy) but a FAKE `popen`
-    for both cargo (via `with_binary=True`'s git-committed dummy binary --
-    see `_init_repo`) and every ssh call, so no real cargo/ssh ever runs.
+    for both cargo and every ssh call, so no real cargo/ssh ever runs.
+
+    `run_deploy` always passes `project_slug=cfg.project` (Task 7), so
+    `build()` looks for the binary under the persistent per-project cache
+    dir, not under the worktree -- `_seed_persistent_binary` pre-creates it
+    there, under a `$XDG_CACHE_HOME` scoped to this test's own tmpdir (never
+    the real developer home directory).
     """
+
+    def _seed_persistent_binary(self, cache_home: Path, *, project: str = "acme", binary: str = "stack_demo") -> None:
+        release_dir = cache_home / "stack-base" / "target" / project / "x86_64-unknown-linux-musl" / "release"
+        release_dir.mkdir(parents=True)
+        (release_dir / binary).write_bytes(b"#!/bin/sh\necho pretend-binary\n")
 
     def _infra(self, repo_dir: Path) -> Path:
         infra_dir = repo_dir / "infra"
@@ -1221,8 +1474,10 @@ class RunDeployWorkDirTests(unittest.TestCase):
 
     def test_work_dir_is_private_and_removed_on_success(self) -> None:
         with TemporaryDirectory() as tmp:
-            repo_dir = _init_repo(Path(tmp), cargo_version="1.0.0", tag="v1.0.0", with_binary=True)
+            repo_dir = _init_repo(Path(tmp), cargo_version="1.0.0", tag="v1.0.0")
             infra_dir = self._infra(repo_dir)
+            cache_home = Path(tmp) / "cache"
+            self._seed_persistent_binary(cache_home)
             spying_mkdtemp, created = self._spy_mkdtemp()
 
             popen = FakePopen()
@@ -1231,8 +1486,9 @@ class RunDeployWorkDirTests(unittest.TestCase):
             popen.script(returncode=0, output="✓ ok\n")  # deploy
             popen.script(returncode=0, output="active=blue (v1.0.0)\n")  # colors summary
 
-            with mock.patch("stackbase.release.tempfile.mkdtemp", side_effect=spying_mkdtemp):
-                run_deploy(infra_dir, "v1.0.0", popen=popen, emit=lambda _l: None)
+            with mock.patch.dict(os.environ, {**os.environ, "XDG_CACHE_HOME": str(cache_home)}, clear=True):
+                with mock.patch("stackbase.release.tempfile.mkdtemp", side_effect=spying_mkdtemp):
+                    run_deploy(infra_dir, "v1.0.0", popen=popen, emit=lambda _l: None)
 
             work_dirs = [(p, mode) for p, mode in created if p.name.startswith("stackbase-release-")]
             self.assertEqual(len(work_dirs), 1, f"expected exactly one private work dir, got: {created}")
@@ -1242,8 +1498,10 @@ class RunDeployWorkDirTests(unittest.TestCase):
 
     def test_work_dir_is_removed_on_a_mid_ship_failure(self) -> None:
         with TemporaryDirectory() as tmp:
-            repo_dir = _init_repo(Path(tmp), cargo_version="1.0.0", tag="v1.0.0", with_binary=True)
+            repo_dir = _init_repo(Path(tmp), cargo_version="1.0.0", tag="v1.0.0")
             infra_dir = self._infra(repo_dir)
+            cache_home = Path(tmp) / "cache"
+            self._seed_persistent_binary(cache_home)
             spying_mkdtemp, created = self._spy_mkdtemp()
 
             popen = FakePopen()
@@ -1251,9 +1509,10 @@ class RunDeployWorkDirTests(unittest.TestCase):
             popen.script(returncode=1, output="✗ sha256 mismatch\n")  # upload fails
             popen.script(returncode=0, output="active=blue (v0.9.0)\n")  # colors summary
 
-            with mock.patch("stackbase.release.tempfile.mkdtemp", side_effect=spying_mkdtemp):
-                with self.assertRaises(StackError):
-                    run_deploy(infra_dir, "v1.0.0", popen=popen, emit=lambda _l: None)
+            with mock.patch.dict(os.environ, {**os.environ, "XDG_CACHE_HOME": str(cache_home)}, clear=True):
+                with mock.patch("stackbase.release.tempfile.mkdtemp", side_effect=spying_mkdtemp):
+                    with self.assertRaises(StackError):
+                        run_deploy(infra_dir, "v1.0.0", popen=popen, emit=lambda _l: None)
 
             work_dirs = [p for p, _mode in created if p.name.startswith("stackbase-release-")]
             self.assertEqual(len(work_dirs), 1)
@@ -1265,8 +1524,10 @@ class RunDeployWorkDirTests(unittest.TestCase):
         system temp root -- P2's actual security-relevant point.
         """
         with TemporaryDirectory() as tmp:
-            repo_dir = _init_repo(Path(tmp), cargo_version="1.0.0", tag="v1.0.0", with_binary=True)
+            repo_dir = _init_repo(Path(tmp), cargo_version="1.0.0", tag="v1.0.0")
             infra_dir = self._infra(repo_dir)
+            cache_home = Path(tmp) / "cache"
+            self._seed_persistent_binary(cache_home)
             seen_tarball_dirs: list[Path] = []
 
             real_package = package
@@ -1288,8 +1549,9 @@ class RunDeployWorkDirTests(unittest.TestCase):
             popen.script(returncode=0, output="✓ ok\n")
             popen.script(returncode=0, output="active=blue (v1.0.0)\n")
 
-            with mock.patch("stackbase.release.package", side_effect=spying_package):
-                run_deploy(infra_dir, "v1.0.0", popen=popen, emit=lambda _l: None)
+            with mock.patch.dict(os.environ, {**os.environ, "XDG_CACHE_HOME": str(cache_home)}, clear=True):
+                with mock.patch("stackbase.release.package", side_effect=spying_package):
+                    run_deploy(infra_dir, "v1.0.0", popen=popen, emit=lambda _l: None)
 
             self.assertEqual(len(seen_tarball_dirs), 1)
             self.assertEqual(bundle_was_a_sibling, [True])

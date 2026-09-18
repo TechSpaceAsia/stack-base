@@ -71,6 +71,15 @@ _DEPLOY_SSH_USER = "deploy"
 _STREAM_TAIL_LINES = 20
 _TAR_EXTENSIONS = ("static", "migrations", "config")
 
+# NixOS ships the musl cross toolchain as `x86_64-unknown-linux-musl-gcc`,
+# not as the `musl-gcc` wrapper cargo looks for by default on Debian-family
+# distros -- so a `cargo build --target x86_64-unknown-linux-musl` there
+# fails at link time with "linker `cc` not found" unless these two are
+# set. This is exactly what obi's workflow does by hand.
+MUSL_GCC = "x86_64-unknown-linux-musl-gcc"
+MUSL_CC_ENV = "CC_x86_64_unknown_linux_musl"
+MUSL_LINKER_ENV = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"
+
 _MISSING_TOOL_HINTS: dict[str, str] = {
     "cargo": "install Rust: https://rustup.rs, then `rustup target add x86_64-unknown-linux-musl`",
     "npm": "install Node.js (npm ships with it): https://nodejs.org",
@@ -314,11 +323,55 @@ def release_worktree(repo_dir: Path, version: str, *, runner: Any = subprocess.r
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def cargo_target_dir(project_slug: str) -> Path | None:
+    """The persistent cargo target directory for this project, or `None`.
+
+    Every `deploy` builds in a FRESH `git worktree` (that is what makes a
+    release reproducible), which means cargo starts from nothing every
+    single time -- minutes of rebuilding dependencies that did not change.
+    Pointing `CARGO_TARGET_DIR` at one stable per-project directory keeps
+    the incremental cache across releases while the source tree stays
+    clean and detached.
+
+    `None` when the operator has already set `$CARGO_TARGET_DIR`: their
+    choice wins, and `build` then leaves the variable exactly as it found
+    it.
+
+    `project_slug` ends up as a single path segment under the cache root, so
+    it is checked the same way `package()`'s own `_validate_member_name`
+    checks a tarball member name -- refusing an empty value, ".", "..", a
+    path separator or a leading "-" (which a later shell/CLI invocation
+    could otherwise read as an option) before it is ever used to build a
+    path. In practice this can never fire via `run_deploy`: `project_slug`
+    is `cfg.project`, already constrained to `[a-z][a-z0-9-]{1,30}` by
+    config.py's `_PROJECT_RE` when `stack.toml` is loaded. This is a second,
+    independent layer for `cargo_target_dir`'s own public contract -- it
+    takes a bare string, not a validated `StackConfig`.
+    """
+    if os.environ.get("CARGO_TARGET_DIR"):
+        return None
+    if (
+        not project_slug
+        or project_slug in (".", "..")
+        or "/" in project_slug
+        or "\\" in project_slug
+        or project_slug.startswith("-")
+    ):
+        raise StackError(
+            f"invalid project slug for the build cache directory: {project_slug!r}",
+            "this is a bug in stack-base -- please report it (project should already be validated "
+            "when stack.toml is loaded)",
+        )
+    cache_home = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(cache_home) / "stack-base" / "target" / project_slug
+
+
 def build(
     worktree: Path,
     project: Project,
     *,
     work_dir: Path,
+    project_slug: str | None = None,
     runner: Any = subprocess.run,
     popen: Any = subprocess.Popen,
     emit: Callable[[str], None] = print,
@@ -349,6 +402,27 @@ def build(
     crt_static = "-C target-feature=+crt-static"
     rustflags = f"{existing_rustflags} {crt_static}" if existing_rustflags else crt_static
     env = {**os.environ, "RUSTFLAGS": rustflags}
+
+    # Only when BOTH are unset: an operator who set one deliberately keeps
+    # full control of the pair, rather than getting a half-overridden
+    # toolchain that is harder to reason about than either choice alone.
+    musl_gcc = shutil.which(MUSL_GCC)
+    if musl_gcc and not env.get(MUSL_CC_ENV) and not env.get(MUSL_LINKER_ENV):
+        env[MUSL_CC_ENV] = musl_gcc
+        env[MUSL_LINKER_ENV] = musl_gcc
+        emit(f"→ using {musl_gcc} as the musl C compiler and linker")
+
+    # A persistent, per-project target directory (see `cargo_target_dir`).
+    # Note the binary then lives THERE, not under the throwaway worktree --
+    # which is also the bug this fixes for anyone who already had
+    # $CARGO_TARGET_DIR set.
+    if project_slug:
+        target_dir = cargo_target_dir(project_slug)
+        if target_dir is not None:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            env["CARGO_TARGET_DIR"] = str(target_dir)
+            emit(f"→ reusing the build cache at {target_dir}")
+
     emit("→ building the release binary (cargo build --release --target x86_64-unknown-linux-musl)")
     returncode, tail = _stream_local(
         ["cargo", "build", "--release", "--target", "x86_64-unknown-linux-musl"],
@@ -362,7 +436,8 @@ def build(
 
     _build_css(worktree, popen=popen, emit=emit)
 
-    binary_path = worktree / "target" / "x86_64-unknown-linux-musl" / "release" / project.binary
+    target_root = Path(env["CARGO_TARGET_DIR"]) if env.get("CARGO_TARGET_DIR") else worktree / "target"
+    binary_path = target_root / "x86_64-unknown-linux-musl" / "release" / project.binary
     if not binary_path.is_file():
         raise StackError(
             f"cargo build succeeded but {binary_path} was not produced",
@@ -389,6 +464,12 @@ def _cargo_failure_hint(tail: list[str]) -> str:
     combined = "\n".join(tail)
     if "may not be installed" in combined or "error[E0463]" in combined:
         return "install the musl target: rustup target add x86_64-unknown-linux-musl"
+    if "linker `cc` not found" in combined or "cannot find crt1.o" in combined:
+        return (
+            "no musl C compiler was found -- on NixOS put one on PATH "
+            "(nix-shell -p pkgsCross.musl64.stdenv.cc), elsewhere install musl-tools "
+            "(e.g. `apt install musl-tools`)"
+        )
     if "musl-gcc" in combined:
         return "install musl-tools (e.g. `apt install musl-tools`) or the musl package for your distro"
     return _tail_hint(tail, "fix the build and re-run")
@@ -412,20 +493,42 @@ def _build_css(worktree: Path, *, popen: Any, emit: Callable[[str], None]) -> No
                 raise StackError(f"npm run build:css failed (exit {returncode})", _tail_hint(tail, "fix the CSS build and re-run"))
             return
 
-    tailwind = worktree / "tools" / "tailwindcss"
-    if tailwind.is_file():
-        emit("→ building CSS (tools/tailwindcss)")
-        returncode, tail = _stream_local(
-            [str(tailwind), "-i", "src/templates/input.css", "-o", "static/css/output.css", "--minify"],
-            cwd=worktree,
-            popen=popen,
-            emit=emit,
+    # `tailwindcss` on PATH beats `tools/tailwindcss`: the downloaded
+    # standalone binary is a patchelf-less glibc build that simply cannot
+    # execute on NixOS, so a project that has both must use the one from
+    # the environment.
+    tailwind_on_path = shutil.which("tailwindcss")
+    local_tailwind = worktree / "tools" / "tailwindcss"
+    if tailwind_on_path:
+        tailwind = tailwind_on_path
+        label = "tailwindcss on PATH"
+    elif local_tailwind.is_file():
+        tailwind = str(local_tailwind)
+        label = "tools/tailwindcss"
+    else:
+        emit(
+            "! no CSS build step found (no package.json build:css script, no tailwindcss on PATH, "
+            "no tools/tailwindcss) -- skipping"
         )
-        if returncode != 0:
-            raise StackError(f"tools/tailwindcss failed (exit {returncode})", _tail_hint(tail, "fix the CSS build and re-run"))
         return
 
-    emit("! no CSS build step found (no package.json build:css script and no tools/tailwindcss) -- skipping")
+    emit(f"→ building CSS ({label})")
+    returncode, tail = _stream_local(
+        [tailwind, "-i", "src/templates/input.css", "-o", "static/css/output.css", "--minify"],
+        cwd=worktree,
+        popen=popen,
+        emit=emit,
+    )
+    if returncode != 0:
+        raise StackError(
+            f"the CSS build failed (exit {returncode})",
+            _tail_hint(
+                tail,
+                f"stack-base used {tailwind} -- on NixOS, put tailwindcss on PATH "
+                "(nix-shell -p tailwindcss); elsewhere ./tools/install-tailwindcss.sh downloads "
+                "tools/tailwindcss",
+            ),
+        )
 
 
 def _stream_local(
@@ -997,7 +1100,15 @@ def run_deploy(
         mtime = tag_commit_timestamp(repo_dir, version, runner=runner)
         with release_worktree(repo_dir, version, runner=runner) as worktree:
             project = read_project(worktree, cfg)
-            bundle_dir = build(worktree, project, work_dir=work_dir, runner=runner, popen=popen, emit=emit)
+            bundle_dir = build(
+                worktree,
+                project,
+                work_dir=work_dir,
+                project_slug=cfg.project,
+                runner=runner,
+                popen=popen,
+                emit=emit,
+            )
             tarball, sha256 = package(bundle_dir, version, mtime, binary_name=project.binary)
         # Opened only now, not around the build: a cargo build can take many
         # minutes, and the decrypted key only needs to exist for the
