@@ -101,7 +101,11 @@ def _resolve_ref_to_rev(url: str, ref: str) -> str | None:
     "commit a flake.lock" error rather than surfacing a confusing git error.
     """
     result = subprocess.run(
-        ["git", "ls-remote", "--", url, ref, f"refs/tags/{ref}", f"refs/heads/{ref}"],
+        # The `^{}` pattern is not decoration: ls-remote only prints the
+        # peeled line (the COMMIT an annotated tag points at) when a pattern
+        # matches it. Without it the resolved sha is the tag object itself,
+        # which is not a commit and fails the pinned-checkout check later.
+        ["git", "ls-remote", "--", url, ref, f"refs/tags/{ref}", f"refs/tags/{ref}^{{}}", f"refs/heads/{ref}"],
         capture_output=True,
         text=True,
         check=False,

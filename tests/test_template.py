@@ -837,6 +837,7 @@ class TemplateUpUnlockedResolutionTests(unittest.TestCase):
                     "https://github.com/ExampleOrg/example-stack.git",
                     "v0.1.0",
                     "refs/tags/v0.1.0",
+                    "refs/tags/v0.1.0^{}",
                     "refs/heads/v0.1.0",
                 ],
                 capture_output=True,
