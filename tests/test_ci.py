@@ -204,6 +204,114 @@ class CiSetupUsesTheProjectDeployKeyTests(unittest.TestCase):
             self.assertEqual(pushed, [private_key.encode("utf-8"), private_key.encode("utf-8")])
 
 
+class CiSetupExistingKeyFailureAndRedactionTests(unittest.TestCase):
+    """Fix round 1 (task 2 review): three behaviours that are `ci_setup`'s
+    own -- not `deploy_key_init`'s -- and so are NOT covered by
+    `tests/test_secrets_cli.py`: `deploy_key_init` never runs `gh` at all,
+    and on an ordinary run against an EXISTING key (the common case)
+    `deploy_key_init` is never even called. Each test here uses
+    `_project_with_deploy_key()` for a real, already-existing `deploy.age`,
+    then substitutes a custom `FakeRunner` to script the `gh` failure/
+    verification path under test -- the fixture's own `_happy_path_handler`
+    runner is discarded for that purpose.
+    """
+
+    def test_a_gh_secret_set_failure_is_reported_with_its_stderr(self) -> None:
+        def handler(argv, kwargs):
+            if argv[:3] == ["git", "remote", "get-url"]:
+                return _cp(argv, stdout="git@github.com:acme/widgets.git\n")
+            if argv[:2] == ["gh", "auth"]:
+                return _cp(argv)
+            if argv[:3] == ["gh", "secret", "set"]:
+                return _cp(argv, returncode=1, stderr="permission denied\n")
+            return None
+
+        with _project_with_deploy_key() as (infra_dir, _fixture_runner, _private_key):
+            runner = FakeRunner(handler=handler)
+
+            with self.assertRaises(StackError) as caught:
+                ci_setup(infra_dir, runner=runner)
+
+            message = str(caught.exception)
+            self.assertIn(SECRET_NAME, message)
+            self.assertIn("permission denied", message)  # gh's own stderr surfaces, not a generic message
+
+    def test_a_gh_secret_set_failure_with_no_stderr_falls_back_to_the_documented_hint(self) -> None:
+        def handler(argv, kwargs):
+            if argv[:3] == ["git", "remote", "get-url"]:
+                return _cp(argv, stdout="git@github.com:acme/widgets.git\n")
+            if argv[:2] == ["gh", "auth"]:
+                return _cp(argv)
+            if argv[:3] == ["gh", "secret", "set"]:
+                return _cp(argv, returncode=1, stderr="")
+            return None
+
+        with _project_with_deploy_key() as (infra_dir, _fixture_runner, _private_key):
+            runner = FakeRunner(handler=handler)
+
+            with self.assertRaises(StackError) as caught:
+                ci_setup(infra_dir, runner=runner)
+
+            self.assertIn("gh auth status", str(caught.exception))
+
+    def test_a_secret_that_does_not_verify_afterwards_is_reported(self) -> None:
+        with _project_with_deploy_key() as (infra_dir, _fixture_runner, _private_key):
+            runner = FakeRunner(handler=_happy_path_handler(secret_list_names=["SOME_OTHER_SECRET"]))
+
+            with self.assertRaises(StackError) as caught:
+                ci_setup(infra_dir, runner=runner)
+
+            message = str(caught.exception)
+            self.assertIn(SECRET_NAME, message)
+            self.assertIn("acme/widgets", message)  # names the repo slug so the operator knows where to look
+
+    def test_the_private_key_is_registered_before_gh_secret_set(self) -> None:
+        # A tripwire runner: raises if `gh secret set` is ever reached before
+        # `register_secret` has already seen the whole key -- proving the
+        # registration happens strictly before that call, not just "at some
+        # point during the run" (same technique the deleted
+        # RegisterSecretForRedactionTests used against the old ssh-keygen
+        # path -- this is the distinct call site right before `gh secret
+        # set` in `ci_setup` itself, on the ordinary existing-key path).
+        registered: list[str] = []
+        state = {"registered_before_call": False}
+
+        def handler(argv, kwargs):
+            if argv[:3] == ["gh", "secret", "set"]:
+                state["registered_before_call"] = bool(registered)
+            return _happy_path_handler()(argv, kwargs)
+
+        with _project_with_deploy_key() as (infra_dir, _fixture_runner, private_key):
+            runner = FakeRunner(handler=handler)
+
+            ci_setup(infra_dir, runner=runner, emit=_silent, register_secret=registered.append)
+
+            self.assertTrue(
+                state["registered_before_call"],
+                "the private key was not registered before `gh secret set` ran",
+            )
+            self.assertIn(private_key, registered)
+
+    def test_registration_happens_even_when_gh_secret_set_fails(self) -> None:
+        def handler(argv, kwargs):
+            if argv[:3] == ["git", "remote", "get-url"]:
+                return _cp(argv, stdout="git@github.com:acme/widgets.git\n")
+            if argv[:2] == ["gh", "auth"]:
+                return _cp(argv)
+            if argv[:3] == ["gh", "secret", "set"]:
+                return _cp(argv, returncode=1, stderr="permission denied\n")
+            return None
+
+        with _project_with_deploy_key() as (infra_dir, _fixture_runner, private_key):
+            runner = FakeRunner(handler=handler)
+            registered: list[str] = []
+
+            with self.assertRaises(StackError):
+                ci_setup(infra_dir, runner=runner, emit=_silent, register_secret=registered.append)
+
+            self.assertIn(private_key, registered)
+
+
 class CiSetupRepoDetectionTests(unittest.TestCase):
     def test_a_failed_git_remote_lookup_is_a_clear_error(self) -> None:
         def handler(argv, kwargs):
