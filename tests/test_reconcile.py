@@ -15,6 +15,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import os
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -27,6 +28,7 @@ from stackbase.config import CloudflareState, HostingerState, Node, NodeState, S
 from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
 from stackbase.reconcile import (
+    locked_stack_base_rev,
     PUSH_EXCLUDES,
     Action,
     Context,
@@ -2782,6 +2784,19 @@ class PushExcludesGlobTests(unittest.TestCase):
             after = compute_rev(infra_dir, stackbase_src="/fake/src")
 
             self.assertEqual(before, after)
+
+    def test_no_lock_uses_the_rev_the_wrapper_resolved(self) -> None:
+        # A project's first run: no flake.lock yet, the wrapper resolved the
+        # release named in flake.nix and passed the commit down.
+        rev = "1a43b0bd0e58b26bd72afecbb2f1a0aaf8e12da7"
+        with Infra() as infra_dir:
+            (infra_dir / "flake.lock").unlink(missing_ok=True)
+            with mock.patch.dict(os.environ, {"STACKBASE_RESOLVED_REV": rev}):
+                self.assertEqual(locked_stack_base_rev(infra_dir), rev)
+            with mock.patch.dict(os.environ, {"STACKBASE_RESOLVED_REV": "not-a-sha"}):
+                with self.assertRaises(StackError) as ctx:
+                    locked_stack_base_rev(infra_dir)
+            self.assertIn("flake.lock is missing", str(ctx.exception))
 
 
 def _porcelain(*entries: str) -> str:

@@ -374,6 +374,13 @@ def locked_stack_base_rev(infra_dir: Path) -> str:
     """The stack-base commit pinned by `infra/flake.lock`."""
     lock_path = infra_dir / "flake.lock"
     if not lock_path.exists():
+        # A project's very first run has no lock yet: the wrapper resolved
+        # the release named in flake.nix itself and says which commit it
+        # fetched. The node writes the lock during this run, and every run
+        # after reads it from the file like normal.
+        resolved = os.environ.get("STACKBASE_RESOLVED_REV", "")
+        if re.fullmatch(r"[0-9a-f]{40}", resolved):
+            return resolved
         raise StackError(
             f"{lock_path} is missing and $STACKBASE_SRC is not set",
             "commit an infra/flake.lock (stack-base writes one for you after the first successful "

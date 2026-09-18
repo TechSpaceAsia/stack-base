@@ -278,6 +278,9 @@ def entry_point() -> Path:
         resolved = unlocked_stack_base(INFRA_DIR / "flake.nix")
         if resolved is not None:
             url, rev = resolved
+            # Tell the tool which commit is in play: with no lock to read,
+            # it needs this to fingerprint the run (and refuses without it).
+            os.environ["STACKBASE_RESOLVED_REV"] = rev
             return fetch(url, rev) / "bin" / "up"
         fail(
             f"{lock_path} is missing, so this project does not pin a version of stack-base",
