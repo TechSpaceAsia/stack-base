@@ -37,7 +37,7 @@
   # (or run `nix flake lock --update-input stack-base` if you have Nix
   # installed locally) and run ./infra/up -- it re-resolves the new ref and
   # writes a fresh lock.
-  inputs.stack-base.url = "github:TechSpaceAsia/stack-base/v0.1.4";
+  inputs.stack-base.url = "github:TechSpaceAsia/stack-base/v0.1.5";
 
   outputs = { self, stack-base }:
     let

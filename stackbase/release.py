@@ -419,6 +419,14 @@ def build(
     if project_slug:
         target_dir = cargo_target_dir(project_slug)
         if target_dir is not None:
+            # The cache ROOT (~/.cache/stack-base) is shared with the
+            # project wrapper, which runs stack-base's own code out of it
+            # and refuses a root other users can read or write. Create it
+            # private here too, so whichever of the two gets there first
+            # leaves a directory the other accepts.
+            root = target_dir.parent.parent
+            root.mkdir(parents=True, exist_ok=True)
+            root.chmod(0o700)
             target_dir.mkdir(parents=True, exist_ok=True)
             env["CARGO_TARGET_DIR"] = str(target_dir)
             emit(f"→ reusing the build cache at {target_dir}")

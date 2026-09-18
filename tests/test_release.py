@@ -15,6 +15,7 @@ import contextlib
 import hashlib
 import json
 import os
+import stat
 import shutil
 import subprocess
 import tarfile
@@ -696,6 +697,30 @@ class CargoTargetDirTests(unittest.TestCase):
             os.environ.pop("CARGO_TARGET_DIR", None)
             with self.assertRaises(StackError):
                 cargo_target_dir("-rf")
+
+
+class BuildCacheRootTests(unittest.TestCase):
+    def test_the_cache_root_is_created_private_like_the_wrapper_requires(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = _worktree(root)
+            # A cargo run from before this fix left the root world-readable
+            # (the wrapper refuses to run code out of such a directory).
+            cache_root = root / "cache" / "stack-base"
+            release_dir = cache_root / "target" / "demo" / "x86_64-unknown-linux-musl" / "release"
+            release_dir.mkdir(parents=True)
+            (release_dir / "stack_demo").write_bytes(b"pretend-elf-binary")
+            cache_root.chmod(0o755)
+            popen = FakePopen()
+            popen.script(returncode=0, output="cargo ok\n")
+            project = Project(version="1.0.0", binary="stack_demo")
+            env = {**os.environ, "XDG_CACHE_HOME": str(root / "cache")}
+            env.pop("CARGO_TARGET_DIR", None)
+
+            with mock.patch.dict(os.environ, env, clear=True):
+                build(worktree, project, work_dir=root, popen=popen, emit=lambda _line: None, project_slug="demo")
+
+            self.assertEqual(stat.S_IMODE(cache_root.stat().st_mode), 0o700)
 
 
 class TailwindOnPathTests(unittest.TestCase):

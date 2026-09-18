@@ -4,4 +4,4 @@
 # every outbound API request (see stackbase/http.py::USER_AGENT). Hostinger's
 # API sits behind Cloudflare, which 403s urllib's default
 # "Python-urllib/3.x" User-Agent -- an explicit, identifying one avoids it.
-__version__ = "0.1.4"
+__version__ = "0.1.5"
