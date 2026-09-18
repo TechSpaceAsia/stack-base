@@ -8,8 +8,8 @@ that exact version into ~/.cache/stack-base/<rev> (once), and hands over to it.
 It depends on nothing but Python 3, git and ssh -- you do not need Nix, and
 you do not need stack-base checked out anywhere.
 
-While stack-base itself is unpublished, point $STACKBASE_SRC at a local
-checkout instead and this script runs that directly:
+To work on stack-base itself, point $STACKBASE_SRC at a local checkout
+instead and this script runs that directly:
 
     STACKBASE_SRC=~/code/stack-base ./infra/up --plan
 """
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -75,6 +76,85 @@ def locked_stack_base(lock_path: Path) -> tuple[str, str]:
         "stack-base must be pinned from GitHub or a plain git URL",
     )
     raise AssertionError("unreachable")  # pragma: no cover
+
+
+# Matches `inputs.stack-base.url = "github:OWNER/REPO";` or
+# `"github:OWNER/REPO/REF";` in flake.nix. REPO is matched non-greedily so
+# the optional `/REF` group (which may itself contain slashes, e.g. a
+# branch like `refs/heads/foo`) gets first refusal on everything after the
+# first slash.
+_STACKBASE_INPUT_RE = re.compile(
+    r'inputs\.stack-base\.url\s*=\s*"github:([^/"]+)/([^/"]+?)(?:/([^"]+))?"'
+)
+
+
+def _resolve_ref_to_rev(url: str, ref: str) -> str | None:
+    """The commit `ref` (a tag, branch, or "HEAD") currently points to.
+
+    Returns None on any failure -- a missing network, a typo'd ref, a repo
+    that does not exist -- so the caller can fall back to the existing
+    "commit a flake.lock" error rather than surfacing a confusing git error.
+    """
+    result = subprocess.run(
+        ["git", "ls-remote", url, ref, f"refs/tags/{ref}", f"refs/heads/{ref}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    # An annotated tag's own object and the commit it points at are two
+    # different shas; git ls-remote lists both, with the peeled commit on a
+    # line ending "^{}". We want the commit, so prefer that line when
+    # present -- otherwise the first line (a lightweight tag, a branch, or
+    # HEAD) is already the commit.
+    peeled_name = f"refs/tags/{ref}^{{}}"
+    for line in lines:
+        sha, _, name = line.partition("\t")
+        if name == peeled_name:
+            return sha or None
+    sha, _, _ = lines[0].partition("\t")
+    return sha or None
+
+
+def unlocked_stack_base(flake_path: Path) -> tuple[str, str] | None:
+    """Resolve stack-base straight from flake.nix, before a flake.lock exists.
+
+    A freshly scaffolded project has no flake.lock yet -- normally stack-base
+    itself writes one, on the first successful run, but that first run needs
+    something to fetch. So: parse the `stack-base` input out of flake.nix and
+    resolve its ref to a commit with `git ls-remote`, using the exact same
+    download/cache/verify path a locked project uses.
+
+    Returns None (never raises) for anything that isn't a clean resolution --
+    no flake.nix, no matching input, or a failed/empty `git ls-remote` --
+    so the caller falls back to the existing "commit a flake.lock, or set
+    STACKBASE_SRC" error instead of a confusing git failure.
+    """
+    try:
+        text = flake_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    match = _STACKBASE_INPUT_RE.search(text)
+    if not match:
+        return None
+    owner, repo, ref = match.group(1), match.group(2), match.group(3) or "HEAD"
+
+    url = f"https://github.com/{owner}/{repo}.git"
+    rev = _resolve_ref_to_rev(url, ref)
+    if rev is None:
+        return None
+
+    print(
+        f"no infra/flake.lock yet — resolving {ref} from github:{owner}/{repo} "
+        "(the first run writes the lock)",
+        file=sys.stderr,
+    )
+    return url, rev
 
 
 def cache_root() -> Path:
@@ -186,6 +266,10 @@ def entry_point() -> Path:
 
     lock_path = INFRA_DIR / "flake.lock"
     if not lock_path.exists():
+        resolved = unlocked_stack_base(INFRA_DIR / "flake.nix")
+        if resolved is not None:
+            url, rev = resolved
+            return fetch(url, rev) / "bin" / "up"
         fail(
             f"{lock_path} is missing, so this project does not pin a version of stack-base",
             "either commit an infra/flake.lock (stack-base writes one for you after the first "

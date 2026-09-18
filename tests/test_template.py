@@ -16,6 +16,7 @@ import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _TEMPLATE_DIR = _REPO_ROOT / "templates" / "infra"
@@ -745,6 +746,161 @@ class TemplateUpScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("stack-base", result.stderr)
 
+    def test_a_flake_nix_without_a_recognizable_stack_base_input_falls_back_to_the_same_error(
+        self,
+    ) -> None:
+        """No flake.lock AND flake.nix doesn't name a `github:` stack-base
+        input (typo, different input name, a plain git URL) -- must still
+        fail with the original one-line message, not a confusing git error.
+        This never touches the network: the regex doesn't match, so
+        `unlocked_stack_base` returns before any subprocess call.
+        """
+        with TemporaryDirectory() as tmp:
+            infra_dir = self._infra_dir(tmp)
+            (infra_dir / "flake.nix").write_text(
+                'inputs.nixpkgs.url = "github:NixOS/nixpkgs";\n', encoding="utf-8"
+            )
+
+            result = self._run_up(infra_dir, "up", "--plan")
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("flake.lock", result.stderr)
+            self.assertIn("STACKBASE_SRC", result.stderr)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1, "failures are one line")
+
+
+class TemplateUpUnlockedResolutionTests(unittest.TestCase):
+    """The first `./infra/up` on a freshly scaffolded project has no
+    flake.lock yet -- `unlocked_stack_base` resolves the pinned ref straight
+    from flake.nix instead. Exercised as a direct import (like
+    `test_a_github_pinned_lock_resolves_to_the_public_repository` below) so
+    `git ls-remote` can be mocked in-process; no network is ever touched.
+    """
+
+    def _load_module(self):
+        import importlib.machinery
+        import importlib.util
+
+        loader = importlib.machinery.SourceFileLoader(
+            "template_up_unlocked", str(_TEMPLATE_DIR / "up")
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return module
+
+    def _write_flake(self, tmp: str, url: str) -> Path:
+        flake_path = Path(tmp) / "flake.nix"
+        flake_path.write_text(f'inputs.stack-base.url = "{url}";\n', encoding="utf-8")
+        return flake_path
+
+    def _ls_remote_result(self, stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+    def test_prefers_the_peeled_annotated_tag_object(self) -> None:
+        module = self._load_module()
+        with TemporaryDirectory() as tmp:
+            flake_path = self._write_flake(tmp, "github:ExampleOrg/example-stack/v0.1.0")
+            fake_stdout = (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v0.1.0\n"
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v0.1.0^{}\n"
+            )
+            with mock.patch.object(
+                module.subprocess, "run", return_value=self._ls_remote_result(fake_stdout)
+            ) as run_mock:
+                result = module.unlocked_stack_base(flake_path)
+
+            self.assertEqual(
+                result, ("https://github.com/ExampleOrg/example-stack.git", "b" * 40)
+            )
+            run_mock.assert_called_once_with(
+                [
+                    "git",
+                    "ls-remote",
+                    "https://github.com/ExampleOrg/example-stack.git",
+                    "v0.1.0",
+                    "refs/tags/v0.1.0",
+                    "refs/heads/v0.1.0",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+    def test_an_unpeeled_ref_resolves_from_its_own_line(self) -> None:
+        module = self._load_module()
+        with TemporaryDirectory() as tmp:
+            flake_path = self._write_flake(tmp, "github:ExampleOrg/example-stack/main")
+            fake_stdout = "cccccccccccccccccccccccccccccccccccccccc\trefs/heads/main\n"
+            with mock.patch.object(
+                module.subprocess, "run", return_value=self._ls_remote_result(fake_stdout)
+            ):
+                result = module.unlocked_stack_base(flake_path)
+
+            self.assertEqual(
+                result, ("https://github.com/ExampleOrg/example-stack.git", "c" * 40)
+            )
+
+    def test_a_ref_less_url_resolves_head(self) -> None:
+        module = self._load_module()
+        with TemporaryDirectory() as tmp:
+            flake_path = self._write_flake(tmp, "github:ExampleOrg/example-stack")
+            fake_stdout = "dddddddddddddddddddddddddddddddddddddddd\tHEAD\n"
+            with mock.patch.object(
+                module.subprocess, "run", return_value=self._ls_remote_result(fake_stdout)
+            ) as run_mock:
+                result = module.unlocked_stack_base(flake_path)
+
+            self.assertEqual(
+                result, ("https://github.com/ExampleOrg/example-stack.git", "d" * 40)
+            )
+            self.assertEqual(run_mock.call_args[0][0][3], "HEAD")
+
+    def test_a_failed_ls_remote_returns_none_so_the_caller_can_fall_back(self) -> None:
+        module = self._load_module()
+        with TemporaryDirectory() as tmp:
+            flake_path = self._write_flake(tmp, "github:ExampleOrg/example-stack/v9.9.9")
+            with mock.patch.object(
+                module.subprocess,
+                "run",
+                return_value=self._ls_remote_result("", returncode=128),
+            ):
+                result = module.unlocked_stack_base(flake_path)
+
+            self.assertIsNone(result)
+
+    def test_an_empty_ls_remote_returns_none(self) -> None:
+        module = self._load_module()
+        with TemporaryDirectory() as tmp:
+            flake_path = self._write_flake(tmp, "github:ExampleOrg/example-stack/v9.9.9")
+            with mock.patch.object(
+                module.subprocess, "run", return_value=self._ls_remote_result("")
+            ):
+                result = module.unlocked_stack_base(flake_path)
+
+            self.assertIsNone(result)
+
+    def test_no_matching_input_returns_none_without_touching_git(self) -> None:
+        module = self._load_module()
+        with TemporaryDirectory() as tmp:
+            flake_path = Path(tmp) / "flake.nix"
+            flake_path.write_text('inputs.nixpkgs.url = "github:NixOS/nixpkgs";\n', encoding="utf-8")
+            with mock.patch.object(module.subprocess, "run") as run_mock:
+                result = module.unlocked_stack_base(flake_path)
+
+            self.assertIsNone(result)
+            run_mock.assert_not_called()
+
+    def test_a_missing_flake_nix_returns_none_without_touching_git(self) -> None:
+        module = self._load_module()
+        with TemporaryDirectory() as tmp:
+            flake_path = Path(tmp) / "flake.nix"  # never written
+            with mock.patch.object(module.subprocess, "run") as run_mock:
+                result = module.unlocked_stack_base(flake_path)
+
+            self.assertIsNone(result)
+            run_mock.assert_not_called()
+
 
 class TemplateUpCacheTests(unittest.TestCase):
     """The cache holds code that gets executed -- it must be proved, not assumed.
@@ -979,6 +1135,20 @@ class TemplateFilesTests(unittest.TestCase):
         import stackbase
 
         self.assertEqual(stackbase.__version__, "0.1.0")
+
+    def test_the_template_flake_pins_the_release_being_shipped(self) -> None:
+        """`templates/infra/flake.nix`'s stack-base input must carry a
+        `/vX.Y.Z` ref matching `stackbase.__version__` -- a release that
+        forgets to bump the template's pin would otherwise ship silently.
+        """
+        import stackbase
+
+        text = (_TEMPLATE_DIR / "flake.nix").read_text(encoding="utf-8")
+        # Assembled at runtime, like the "one constant" test below, so this
+        # file is not itself a hit for that test's scan.
+        needle = "github:" + "TechSpaceAsia/stack-base" + f"/v{stackbase.__version__}"
+
+        self.assertIn(f'inputs.stack-base.url = "{needle}";', text)
 
     def test_a_github_pinned_lock_resolves_to_the_public_repository(self) -> None:
         """The `up` wrapper must turn a github-type flake.lock node into the

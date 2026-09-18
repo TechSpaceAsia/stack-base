@@ -31,9 +31,13 @@
 {
   description = "NixOS configuration for this project's servers";
 
-  # Where the shared stack-base modules come from. NOTE: this repository is
-  # not published yet -- confirm this URL before relying on it.
-  inputs.stack-base.url = "github:TechSpaceAsia/stack-base";
+  # Where the shared stack-base modules come from. The third path segment
+  # (v0.1.0) is the pinned release -- every project stays on it until you
+  # deliberately move. To upgrade: change it here, then delete flake.lock
+  # (or run `nix flake lock --update-input stack-base` if you have Nix
+  # installed locally) and run ./infra/up -- it re-resolves the new ref and
+  # writes a fresh lock.
+  inputs.stack-base.url = "github:TechSpaceAsia/stack-base/v0.1.0";
 
   outputs = { self, stack-base }:
     let

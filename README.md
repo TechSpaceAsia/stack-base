@@ -749,7 +749,7 @@ Every failure is one line: what went wrong, then what to check.
 | `You must set the option boot.loader…` or a `fileSystems` error | The provider module's defaults don't match this node's disk/network — see "First run on a new provider image" below |
 | `node a stopped answering SSH…` | See below |
 | `the SSH host key … does not match` | Either the server was reinstalled (delete its line from `infra/known_hosts`) or something is wrong. If you didn't reinstall it, stop and investigate |
-| `infra/flake.lock is missing` | First run against an unpublished stack-base: set `STACKBASE_SRC` (below) |
+| `infra/flake.lock is missing` | Normally the very first run resolves this itself from `infra/flake.nix` (no action needed). This error means that also failed — check your network, or that `infra/flake.nix`'s `stack-base` input names a real `github:OWNER/REPO[/REF]`. Working on stack-base itself? See [Working on stack-base itself](#working-on-stack-base-itself) below |
 | `app_env has a line that is not KEY=value` | Fix the offending line in `app_env` and re-encrypt `secrets.age` — see [The app's environment](#the-apps-environment-app_env) |
 | `node a has no '<project>' group yet` | Run `./infra/up` again once REBUILD has completed for that node at least once — the group is created by the first rebuild |
 | `infra/secrets.age's 'app_env' sets 'SOCKET_PATH', which is reserved` | Remove that line from `app_env` — the systemd unit sets it itself, per color |
@@ -849,10 +849,14 @@ If you cannot reach a server:
    reaches the machine even with no network and no sshd, and log in as `root`.
 3. Fix the cause in `infra/`, then run `./infra/up` again.
 
-## Running against an unpublished stack-base
+## Working on stack-base itself
 
-While stack-base has no published repository, point `STACKBASE_SRC` at a
-local clone:
+This section is for developing stack-base, not for using it. A consuming
+project needs none of this — `./infra/up` resolves and downloads a pinned
+stack-base release on its own, lock file or not (see below).
+
+If you're iterating on stack-base's own code, point `STACKBASE_SRC` at your
+local clone instead so a consuming project runs it directly:
 
 ```bash
 STACKBASE_SRC=~/code/stack-base ./infra/up --plan
@@ -862,7 +866,17 @@ In this mode the local checkout is uploaded to the server alongside your
 config and used directly, so edits to stack-base take effect on the next run.
 
 > `templates/infra/flake.nix` pins `inputs.stack-base.url` to
-> `github:TechSpaceAsia/stack-base`.
+> `github:TechSpaceAsia/stack-base/v0.1.0` — the third path segment is the
+> release every new project starts on. To move a project to a newer release,
+> change that segment and delete `infra/flake.lock` (or run `nix flake lock
+> --update-input stack-base` if Nix is installed locally), then run
+> `./infra/up`.
+>
+> A freshly scaffolded project has no `infra/flake.lock` yet. `./infra/up`
+> resolves the pinned release straight from `flake.nix` on that first run
+> (`git ls-remote`, no Nix required), downloads it the same way a locked
+> project would, and stack-base itself writes the lock once the run
+> succeeds — every run after that uses the lock, same as always.
 
 ## What the files are
 
