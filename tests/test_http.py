@@ -90,7 +90,7 @@ class HeadersTests(unittest.TestCase):
             self.assertIn("user-agent", headers)
             self.assertNotIn("python-urllib", headers["user-agent"].lower())
             self.assertTrue(headers["user-agent"].startswith("stack-base/"))
-            self.assertIn("github.com/matiboy/stack-base", headers["user-agent"])
+            self.assertIn("github.com/TechSpaceAsia/stack-base", headers["user-agent"])
             self.assertEqual(headers.get("accept"), "application/json")
 
     def test_the_user_agent_carries_stackbase_version(self) -> None:

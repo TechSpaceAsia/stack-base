@@ -33,7 +33,7 @@ _MAX_BACKOFF_SECONDS = 30.0
 # (curl with this exact string: 200; urllib's default: 403). An explicit,
 # identifying User-Agent -- plus an explicit Accept, since we never want to
 # rely on urllib's defaults here either -- sidesteps it.
-USER_AGENT = f"stack-base/{__version__} (+https://github.com/matiboy/stack-base)"
+USER_AGENT = f"stack-base/{__version__} (+https://github.com/TechSpaceAsia/stack-base)"
 
 # Hints are written for whoever is running `bin/up`, not necessarily an
 # infra person -- they say what to check, not what went wrong internally.

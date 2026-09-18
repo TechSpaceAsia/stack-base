@@ -29,7 +29,7 @@
 
   # Where the shared stack-base modules come from. NOTE: this repository is
   # not published yet -- confirm this URL before relying on it.
-  inputs.stack-base.url = "github:matiboy/stack-base";
+  inputs.stack-base.url = "github:TechSpaceAsia/stack-base";
 
   outputs = { self, stack-base }:
     let

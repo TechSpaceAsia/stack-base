@@ -567,10 +567,8 @@ STACKBASE_SRC=~/code/stack-base ./infra/up --plan
 In this mode the local checkout is uploaded to the server alongside your
 config and used directly, so edits to stack-base take effect on the next run.
 
-> **To be confirmed when the repository is published:**
 > `templates/infra/flake.nix` pins `inputs.stack-base.url` to
-> `github:matiboy/stack-base`. That URL is a placeholder — update it (and
-> re-lock) once the real location is known. It appears in exactly one place.
+> `github:TechSpaceAsia/stack-base`.
 
 ## What the files are
 

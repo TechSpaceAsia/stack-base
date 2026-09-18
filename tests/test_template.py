@@ -764,7 +764,7 @@ class TemplateFilesTests(unittest.TestCase):
     def test_the_upstream_flake_url_appears_only_in_the_template_and_the_readme(self) -> None:
         """The (unconfirmed) upstream URL is one constant, not a string scattered about."""
         # Assembled at runtime so that this file is not itself a hit.
-        needle = "github:" + "matiboy/stack-base"
+        needle = "github:" + "TechSpaceAsia/stack-base"
         hits = []
         for path in _REPO_ROOT.rglob("*"):
             if not path.is_file() or ".git/" in path.as_posix() or "/.superpowers/" in path.as_posix():
