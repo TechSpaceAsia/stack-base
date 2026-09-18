@@ -356,12 +356,28 @@ class ConfdTests(unittest.TestCase):
         plain, conflicting definitions of the same scalar is standard
         NixOS module-system behaviour (an eval-time conflict) that
         stack-base does not implement and is out of scope here.
+
+        Two-state, not one assertion (fix round 2): a lone `lib.mkForce`
+        definition merges to its own value regardless of whether anything
+        else defined the option at all, so asserting only the final value
+        with BOTH files present cannot tell "extra.nix's mkForce beat
+        conf.d's plain definition" apart from "conf.d was never loaded in
+        the first place" (e.g. the `stack-base.lib.confdModules ./conf.d`
+        wiring silently regressing). Step 1 (conf.d alone) proves conf.d is
+        genuinely live in the module set -- a regression there fails step 1
+        loudly, before step 2's mkForce assertion could paper over it.
         """
         with TemporaryDirectory() as tmp:
             directory = Path(tmp)
             _instantiate_template(directory)
             (directory / "conf.d").mkdir()
             (directory / "conf.d" / "domain.nix").write_text(_CONFD_SCALAR_DOMAIN, encoding="utf-8")
+
+            # Step 1 -- CONTROL: conf.d alone, no extra.nix yet. Proves the
+            # conf.d module is actually wired into the module set.
+            self.assertEqual(_nix_eval(directory)["domain"], "set-by-confd")
+
+            # Step 2: extra.nix's lib.mkForce must now win over it.
             (directory / "nodes" / "a" / "extra.nix").write_text(
                 _EXTRA_NIX_MKFORCE_DOMAIN, encoding="utf-8"
             )
