@@ -364,7 +364,12 @@ class ProjectFromCargoTomlTests(unittest.TestCase):
 
 
 def _worktree(
-    tmp: Path, *, with_package_json_css: bool = False, with_tailwind: bool = False, binary: str = "stack_demo"
+    tmp: Path,
+    *,
+    with_package_json_css: bool = False,
+    with_tailwind: bool = False,
+    with_input_css: bool = False,
+    binary: str = "stack_demo",
 ) -> Path:
     worktree = tmp / "worktree"
     release_dir = worktree / "target" / "x86_64-unknown-linux-musl" / "release"
@@ -379,13 +384,18 @@ def _worktree(
     if with_tailwind:
         (worktree / "tools").mkdir(parents=True, exist_ok=True)
         (worktree / "tools" / "tailwindcss").write_bytes(b"#!/bin/sh\n")
+    # A project that ships a Tailwind binary also has the entry point the CSS
+    # step compiles; without the entry point there is no CSS to build at all.
+    if with_tailwind or with_input_css:
+        (worktree / "src" / "templates").mkdir(parents=True, exist_ok=True)
+        (worktree / "src" / "templates" / "input.css").write_text("@import 'tailwindcss';\n", encoding="utf-8")
     return worktree
 
 
 class BuildTests(unittest.TestCase):
     def test_success_with_no_css_tool_skips_and_assembles_the_bundle(self) -> None:
         with TemporaryDirectory() as tmp:
-            worktree = _worktree(Path(tmp))
+            worktree = _worktree(Path(tmp), with_input_css=True)
             popen = FakePopen()
             popen.script(returncode=0, output="Compiling stack-demo\nFinished release\n")
             emitted: list[str] = []
@@ -697,6 +707,25 @@ class TailwindOnPathTests(unittest.TestCase):
         binary.chmod(0o755)
         return bin_dir
 
+    def test_no_input_css_skips_the_css_step_even_with_tailwindcss_on_path(self) -> None:
+        # Build hosts carry tailwindcss on PATH for every project; a project
+        # with no src/templates/input.css (a plain API, the hello app that
+        # proves a stack) must not be failed by a tool it never asked for.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = _worktree(root)  # no tools/tailwindcss, no input.css
+            bin_dir = self._fake_tailwind(root)
+            popen = FakePopen()
+            popen.script(returncode=0, output="cargo ok\n")
+            emitted: list[str] = []
+            project = Project(version="1.0.0", binary="stack_demo")
+
+            with mock.patch.dict(os.environ, {**os.environ, "PATH": str(bin_dir)}, clear=True):
+                build(worktree, project, work_dir=root, popen=popen, emit=emitted.append)
+
+            self.assertEqual(len(popen.calls), 1, "only cargo should have run")
+            self.assertTrue(any("no src/templates/input.css" in line for line in emitted), emitted)
+
     def test_tailwindcss_on_path_is_preferred_over_the_downloaded_binary(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -737,7 +766,7 @@ class TailwindOnPathTests(unittest.TestCase):
     def test_the_skip_message_names_all_three_ways(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            worktree = _worktree(root)
+            worktree = _worktree(root, with_input_css=True)
             popen = FakePopen()
             popen.script(returncode=0, output="cargo ok\n")
             emitted: list[str] = []

@@ -493,6 +493,15 @@ def _build_css(worktree: Path, *, popen: Any, emit: Callable[[str], None]) -> No
                 raise StackError(f"npm run build:css failed (exit {returncode})", _tail_hint(tail, "fix the CSS build and re-run"))
             return
 
+    # No Tailwind entry point means no CSS to build -- a plain API service,
+    # or the hello app used to prove a stack. Decide that on the PROJECT's
+    # files, not on whether a tailwindcss binary happens to be installed:
+    # build hosts have one on PATH for every project, so keying on the tool
+    # would fail exactly those projects that never asked for CSS.
+    if not (worktree / "src" / "templates" / "input.css").is_file():
+        emit("! no src/templates/input.css -- no CSS to build, skipping")
+        return
+
     # `tailwindcss` on PATH beats `tools/tailwindcss`: the downloaded
     # standalone binary is a patchelf-less glibc build that simply cannot
     # execute on NixOS, so a project that has both must use the one from

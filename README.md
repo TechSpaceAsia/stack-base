@@ -290,7 +290,9 @@ build. Set `$CARGO_TARGET_DIR` yourself to override it.
 and `$CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER` automatically when it is
 on PATH and you have not set either yourself), and the standalone
 `tools/tailwindcss` binary cannot run at all — put `tailwindcss` on PATH and
-it is used in preference. A build shell that has everything:
+it is used in preference. (A project with no `src/templates/input.css` has
+no CSS to build and skips the step whatever tools are installed.) A build
+shell that has everything:
 
 ```bash
 nix-shell -p pkgsCross.musl64.stdenv.cc tailwindcss cargo rustc
