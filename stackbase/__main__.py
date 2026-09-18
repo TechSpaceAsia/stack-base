@@ -249,7 +249,7 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> N
     # tree), so it reads naturally as the second half of "is it safe to
     # proceed" right before secrets.update() commits to actually running.
     if not args.plan and not args.allow_dirty:
-        check_infra_clean(infra_dir)
+        check_infra_clean(infra_dir, emit=_emit_plain)
     secrets.update(load_secrets(infra_dir))
 
     hostinger = HostingerClient(_token(secrets, "hostinger_token", "Hostinger"))

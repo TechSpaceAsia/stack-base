@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import unittest
 from dataclasses import replace
@@ -2529,6 +2530,9 @@ def _porcelain(*entries: str) -> str:
     return "".join(entry + "\0" for entry in entries)
 
 
+_GIT_AVAILABLE = shutil.which("git") is not None
+
+
 class CheckInfraCleanTests(unittest.TestCase):
     def _runner(self, stdout: str, returncode: int = 0) -> FakeRunner:
         return FakeRunner(
@@ -2607,6 +2611,62 @@ class CheckInfraCleanTests(unittest.TestCase):
 
         self.assertEqual(len(emitted), 1)
         self.assertIn("git", emitted[0])
+
+
+@unittest.skipUnless(_GIT_AVAILABLE, "git is not installed")
+class CheckInfraCleanRealGitTests(unittest.TestCase):
+    """`CheckInfraCleanTests` above hand-writes `git status --porcelain -z`
+    output as if git had already expanded every directory to individual
+    files -- that can never catch a bug in the INVOCATION itself, only in
+    the parsing of its output. This class drives a real git repository
+    instead (fix round 1, Finding 1): without `--untracked-files=all`, git
+    collapses a directory with no tracked file at all into a single
+    trailing-slash, no-filename record ("?? infra/conf.d/"), which
+    `_dirty_infra_paths` would then silently drop -- missing a project's
+    very first conf.d module, exactly the scenario this check exists for.
+    """
+
+    def _git(self, repo: Path, *args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    def _committed_repo(self, tmp: Path) -> Path:
+        """A repo with `infra/stack.toml` committed and nothing else dirty."""
+        repo = tmp / "repo"
+        infra_dir = repo / "infra"
+        infra_dir.mkdir(parents=True)
+        self._git(repo, "init", "-q")
+        # Local to this scratch repo only -- never touches the operator's
+        # real git identity.
+        self._git(repo, "config", "user.email", "test@example.com")
+        self._git(repo, "config", "user.name", "Test")
+        (infra_dir / "stack.toml").write_text('project = "acme"\n', encoding="utf-8")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-q", "-m", "initial")
+        return repo
+
+    def test_a_brand_new_confd_directory_with_no_tracked_file_is_caught(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = self._committed_repo(Path(tmp))
+            infra_dir = repo / "infra"
+            (infra_dir / "conf.d").mkdir()
+            (infra_dir / "conf.d" / "monitoring.nix").write_text("{ }\n", encoding="utf-8")
+
+            with self.assertRaises(StackError) as ctx:
+                check_infra_clean(infra_dir, emit=lambda _line: None)
+
+            self.assertIn("conf.d/monitoring.nix", str(ctx.exception))
+
+    def test_a_fully_committed_tree_passes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = self._committed_repo(Path(tmp))
+            infra_dir = repo / "infra"
+
+            check_infra_clean(infra_dir, emit=lambda _line: None)
 
 
 if __name__ == "__main__":

@@ -70,6 +70,25 @@ _CONFD_SECOND = """\
 }
 """
 
+# Decision 5 / fix round 1 controller-directed test: a conf.d module sets a
+# SCALAR option plainly; extra.nix sets the SAME option with lib.mkForce and
+# must win, exactly as it would against any other module -- conf.d being
+# listed first in the module list decides concatenation order for
+# LIST-valued options, not precedence for a scalar one.
+_CONFD_SCALAR_DOMAIN = """\
+{ ... }:
+{
+  networking.domain = "set-by-confd";
+}
+"""
+
+_EXTRA_NIX_MKFORCE_DOMAIN = """\
+{ lib, ... }:
+{
+  networking.domain = lib.mkForce "set-by-extra-mkforce";
+}
+"""
+
 
 def _instantiate_template(directory: Path) -> None:
     """Lay out `directory` the way a real project's infra/ looks after setup."""
@@ -327,6 +346,27 @@ class ConfdTests(unittest.TestCase):
             (directory / "conf.d").mkdir()
 
             self.assertFalse(self._eval(directory)["marker"])
+
+    def test_extra_nix_mkforce_wins_over_a_confd_plain_definition(self) -> None:
+        """Decision 5: conf.d is listed before extra.nix so LIST-valued
+        options concatenate project-wide-first, but that ordering alone
+        does not decide precedence for a SCALAR option -- extra.nix must
+        use lib.mkForce to win, exactly as it would against any other
+        module. This only tests the "extra.nix + mkForce wins" half; two
+        plain, conflicting definitions of the same scalar is standard
+        NixOS module-system behaviour (an eval-time conflict) that
+        stack-base does not implement and is out of scope here.
+        """
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+            (directory / "conf.d").mkdir()
+            (directory / "conf.d" / "domain.nix").write_text(_CONFD_SCALAR_DOMAIN, encoding="utf-8")
+            (directory / "nodes" / "a" / "extra.nix").write_text(
+                _EXTRA_NIX_MKFORCE_DOMAIN, encoding="utf-8"
+            )
+
+            self.assertEqual(_nix_eval(directory)["domain"], "set-by-extra-mkforce")
 
 
 @unittest.skipIf(_NIX is None, "nix is not installed")

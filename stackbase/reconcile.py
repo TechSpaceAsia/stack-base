@@ -489,7 +489,18 @@ def check_infra_clean(
     repo_dir = infra_dir.parent
     try:
         result = runner(
-            ["git", "-C", str(repo_dir), "status", "--porcelain", "-z", "--", str(infra_dir)],
+            # --untracked-files=all: WITHOUT it, git collapses a directory
+            # that has NO tracked file at all into one record ("?? infra/
+            # conf.d/" -- trailing slash, no filename) instead of listing
+            # each file inside it. `_dirty_infra_paths` below would then
+            # read an empty path and drop the record, silently missing a
+            # project's very first conf.d module -- exactly the scenario
+            # this whole check exists to catch. -uall forces git to always
+            # list every untracked file individually, never a directory.
+            [
+                "git", "-C", str(repo_dir), "status", "--porcelain",
+                "--untracked-files=all", "-z", "--", str(infra_dir),
+            ],
             capture_output=True,
             text=True,
             check=False,
