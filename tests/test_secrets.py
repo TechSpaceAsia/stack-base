@@ -301,6 +301,28 @@ class RecipientsSupersetTests(unittest.TestCase):
             self.assertIn("age1bbb", message)
             self.assertIn("deploy-key init --rotate", message)
 
+    def test_a_comment_only_deploy_recipients_file_means_nothing_to_check(self) -> None:
+        with TempInfraDir() as infra_dir:
+            (infra_dir / "age-recipients.txt").write_text("age1aaa\n", encoding="utf-8")
+            (infra_dir / "deploy-recipients.txt").write_text(
+                "# Who can decrypt infra/deploy.age.\n\n# One age public key per line.\n",
+                encoding="utf-8",
+            )
+
+            check_recipients_superset(infra_dir)  # must not raise
+
+    def test_a_deploy_recipients_file_with_one_real_key_is_still_checked(self) -> None:
+        with TempInfraDir() as infra_dir:
+            (infra_dir / "age-recipients.txt").write_text("age1aaa\nage1bbb\n", encoding="utf-8")
+            (infra_dir / "deploy-recipients.txt").write_text(
+                "# Who can decrypt infra/deploy.age.\nage1aaa\n", encoding="utf-8"
+            )
+
+            with self.assertRaises(StackError) as ctx:
+                check_recipients_superset(infra_dir)
+
+            self.assertIn("age1bbb", str(ctx.exception))
+
 
 class PublicKeyWriteTests(unittest.TestCase):
     def test_write_public_key_creates_the_parent_and_a_0644_file(self) -> None:

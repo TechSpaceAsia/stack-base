@@ -730,6 +730,15 @@ class TemplateFilesTests(unittest.TestCase):
         ]
         self.assertEqual(real_keys, [], "the template must not ship a real recipient key")
 
+    def test_the_shipped_deploy_recipients_file_has_no_recipients_yet(self) -> None:
+        """Ties the template's comment-only contract to
+        `check_recipients_superset`'s empty-list skip (fix round 1) -- if
+        either drifts on its own, a fresh project's first `up` breaks.
+        """
+        from stackbase.secrets import read_recipients
+
+        self.assertEqual(read_recipients(_TEMPLATE_DIR / "deploy-recipients.txt"), [])
+
     def test_the_gitignore_only_hides_build_output(self) -> None:
         entries = [
             line.strip()

@@ -238,13 +238,24 @@ def check_recipients_superset(infra_dir: Path) -> None:
     No `deploy-recipients.txt` at all means this project has not set up a
     deploy key yet: nothing to check, no warning -- `deploy-key init` is
     what creates both files together.
+
+    An empty (comment-only) `deploy-recipients.txt` means the same thing.
+    The template ships that file pre-populated with instructions and no
+    keys, so it exists in every freshly scaffolded project well before a
+    deploy key does. Widening the skip to cover this case cannot hide real
+    drift either: `save_secrets` shells out to `age -R <recipients file>`,
+    and age refuses outright on a recipients file with zero keys, so a
+    `deploy.age` can never exist alongside an empty recipients list.
     """
     deploy_recipients_path = infra_dir / DEPLOY_FILE.recipients_name
     if not deploy_recipients_path.exists():
         return
 
-    secrets_recipients_path = infra_dir / SECRETS_FILE.recipients_name
     allowed = set(read_recipients(deploy_recipients_path))
+    if not allowed:
+        return
+
+    secrets_recipients_path = infra_dir / SECRETS_FILE.recipients_name
     missing = [key for key in read_recipients(secrets_recipients_path) if key not in allowed]
     if not missing:
         return
