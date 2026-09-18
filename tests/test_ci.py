@@ -10,7 +10,9 @@ exercise the real code path rather than a shortcut around it.
 from __future__ import annotations
 
 import contextlib
+import os
 import re
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -19,7 +21,10 @@ from unittest import mock
 
 from stackbase.ci import SECRET_NAME, ci_setup, parse_github_repo
 from stackbase.errors import StackError
+from stackbase.secrets import DEPLOY_FILE, DEPLOY_KEY_NAME, load_secrets
+from stackbase.secrets_cli import deploy_key_init
 from tests.fakes import FakeRunner
+from tests.test_secrets import _generate_age_identity
 
 _PRIVATE_KEY_BODY = "-----BEGIN OPENSSH PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIExampleKeyMaterialNeverLeaksAnywhereElse\n-----END OPENSSH PRIVATE KEY-----\n"
 _PUBLIC_KEY_BODY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleCiDeployPublicKey ci-deploy@acme\n"
@@ -121,102 +126,82 @@ def _happy_path_handler(*, secret_list_names: list[str] | None = None):
     return handler
 
 
-class CiSetupHappyPathTests(unittest.TestCase):
-    def test_creates_the_pub_key_file_and_sets_the_secret(self) -> None:
-        with Project() as infra_dir:
+_DEPLOY_TOOLS = shutil.which("age") is not None and shutil.which("age-keygen") is not None and shutil.which("ssh-keygen") is not None
+
+
+@contextlib.contextmanager
+def _deploy_project(*, with_key: bool):
+    """A scratch infra/ with both recipients files, and optionally a real deploy key.
+
+    The age identity and the deploy key are both REAL here (no fake
+    subprocess): `ci_setup`'s whole job now is to read what
+    `deploy_key_init` wrote, so faking either end would test nothing.
+    """
+    if not _DEPLOY_TOOLS:
+        raise unittest.SkipTest("age / age-keygen / ssh-keygen not installed")
+    with Project() as infra_dir:
+        identity_path, public_key = _generate_age_identity(infra_dir.parent)
+        (infra_dir / "age-recipients.txt").write_text(public_key + "\n", encoding="utf-8")
+        (infra_dir / "deploy-recipients.txt").write_text(public_key + "\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(identity_path)}):
             runner = FakeRunner(handler=_happy_path_handler())
+            if with_key:
+                deploy_key_init(infra_dir, emit=_silent)
+                yield infra_dir, runner, load_secrets(infra_dir, file=DEPLOY_FILE)[DEPLOY_KEY_NAME]
+            else:
+                yield infra_dir, runner
 
-            ci_setup(infra_dir, runner=runner, emit=_silent)
 
-            pub_path = infra_dir / "keys" / "ci-deploy.pub"
-            self.assertTrue(pub_path.exists())
-            self.assertEqual(pub_path.read_text(encoding="utf-8"), _PUBLIC_KEY_BODY.strip() + "\n")
-            self.assertEqual(pub_path.stat().st_mode & 0o777, 0o644)
+def _project_with_deploy_key():
+    return _deploy_project(with_key=True)
 
-    def test_the_gh_secret_set_call_receives_the_private_key_only_via_stdin(self) -> None:
-        with Project() as infra_dir:
-            runner = FakeRunner(handler=_happy_path_handler())
 
-            ci_setup(infra_dir, runner=runner, emit=_silent)
+def _project_without_deploy_key():
+    return _deploy_project(with_key=False)
 
-            secret_set_calls = [c for c in runner.calls if c["argv"][:3] == ["gh", "secret", "set"]]
-            self.assertEqual(len(secret_set_calls), 1)
-            call = secret_set_calls[0]
-            self.assertNotIn(SECRET_NAME + "\n", " ".join(call["argv"]))  # sanity: argv has no key body
-            self.assertEqual(call["kwargs"].get("input"), _PRIVATE_KEY_BODY.encode("utf-8"))
-            # never via --body / an env var
-            self.assertNotIn("--body", call["argv"])
 
-    def test_refuses_to_overwrite_an_existing_pub_key_without_rotate(self) -> None:
-        with Project() as infra_dir:
-            (infra_dir / "keys" / "ci-deploy.pub").write_text("existing\n", encoding="utf-8")
-            runner = FakeRunner(handler=_happy_path_handler())
+class CiSetupUsesTheProjectDeployKeyTests(unittest.TestCase):
+    """`ci-setup` no longer mints its own key (Task 2): there is ONE project
+    deploy key, created by `deploy_key_init`, and ci-setup's whole job is to
+    read `deploy.age` and push it. Behaviour that used to belong to ci-setup
+    itself (ssh-keygen invocation, refuse-without-rotate, private-key-never-
+    leaks, registration-for-redaction) now belongs to `deploy_key_init` and
+    is covered in `tests/test_secrets_cli.py`.
+    """
 
-            with self.assertRaises(StackError) as caught:
-                ci_setup(infra_dir, runner=runner)
+    def test_it_never_runs_ssh_keygen_itself(self) -> None:
+        with _project_with_deploy_key() as (infra_dir, runner, _private_key):
+            ci_setup(infra_dir, emit=_silent, runner=runner)
 
-            self.assertIn("--rotate", str(caught.exception))
-            self.assertEqual(runner.calls, [])  # refused before any subprocess call
+            self.assertFalse(
+                any(call["argv"][0] == "ssh-keygen" for call in runner.calls),
+                "ci-setup must push the existing project deploy key, not mint its own",
+            )
 
-    def test_rotate_overwrites_an_existing_pub_key(self) -> None:
-        with Project() as infra_dir:
-            (infra_dir / "keys" / "ci-deploy.pub").write_text("old-key\n", encoding="utf-8")
-            runner = FakeRunner(handler=_happy_path_handler())
+    def test_it_pushes_exactly_the_bytes_held_in_deploy_age(self) -> None:
+        with _project_with_deploy_key() as (infra_dir, runner, private_key):
+            ci_setup(infra_dir, emit=_silent, runner=runner)
 
-            ci_setup(infra_dir, rotate=True, runner=runner, emit=_silent)
+            secret_calls = [c for c in runner.calls if c["argv"][:3] == ["gh", "secret", "set"]]
+            self.assertEqual(len(secret_calls), 1)
+            self.assertEqual(secret_calls[0]["kwargs"]["input"], private_key.encode("utf-8"))
 
-            pub_path = infra_dir / "keys" / "ci-deploy.pub"
-            self.assertEqual(pub_path.read_text(encoding="utf-8"), _PUBLIC_KEY_BODY.strip() + "\n")
+    def test_an_absent_deploy_age_is_created_first(self) -> None:
+        with _project_without_deploy_key() as (infra_dir, runner):
+            ci_setup(infra_dir, emit=_silent, runner=runner)
 
-    def test_rotate_warns_that_ci_deploys_break_until_commit_and_up(self) -> None:
-        """M5: the GitHub secret is replaced immediately by `gh secret set`
-        above (before the pub key is even written), so CI deploys are
-        broken until the new .pub is committed AND ./infra/up has run --
-        the OLD "the old key keeps working" wording was backwards."""
-        with Project() as infra_dir:
-            (infra_dir / "keys" / "ci-deploy.pub").write_text("old-key\n", encoding="utf-8")
-            runner = FakeRunner(handler=_happy_path_handler())
-            printed: list[str] = []
+            self.assertTrue((infra_dir / "deploy.age").exists())
+            self.assertTrue((infra_dir / "keys" / "deploy.pub").is_file())
 
-            ci_setup(infra_dir, rotate=True, runner=runner, emit=printed.append)
+    def test_a_second_run_without_rotate_reuses_the_same_key(self) -> None:
+        with _project_with_deploy_key() as (infra_dir, runner, private_key):
+            ci_setup(infra_dir, emit=_silent, runner=runner)
+            ci_setup(infra_dir, emit=_silent, runner=runner)
 
-            joined = "\n".join(printed)
-            self.assertIn("FAIL", joined)
-            self.assertNotIn("keeps working", joined)
-
-    def test_a_fresh_non_rotate_run_does_not_print_the_rotate_warning(self) -> None:
-        with Project() as infra_dir:
-            runner = FakeRunner(handler=_happy_path_handler())
-            printed: list[str] = []
-
-            ci_setup(infra_dir, runner=runner, emit=printed.append)
-
-            joined = "\n".join(printed)
-            self.assertNotIn("FAIL", joined)
-
-    def test_the_ssh_keygen_comment_names_the_project(self) -> None:
-        with Project() as infra_dir:
-            runner = FakeRunner(handler=_happy_path_handler())
-
-            ci_setup(infra_dir, runner=runner, emit=_silent)
-
-            keygen_call = next(c for c in runner.calls if c["argv"][0] == "ssh-keygen")
-            comment_index = keygen_call["argv"].index("-C") + 1
-            self.assertEqual(keygen_call["argv"][comment_index], "ci-deploy@acme")
-
-    def test_prints_next_steps_including_the_exact_cp_command(self) -> None:
-        with Project() as infra_dir:
-            runner = FakeRunner(handler=_happy_path_handler())
-            printed: list[str] = []
-
-            ci_setup(infra_dir, runner=runner, emit=printed.append)
-
-            joined = "\n".join(printed)
-            self.assertIn("git add", joined)
-            self.assertIn("./infra/up", joined)
-            self.assertIn("cp ", joined)
-            self.assertIn("deploy-stack.yml", joined)
-            self.assertIn(f"gh secret delete {SECRET_NAME}", joined)
+            pushed = [
+                c["kwargs"]["input"] for c in runner.calls if c["argv"][:3] == ["gh", "secret", "set"]
+            ]
+            self.assertEqual(pushed, [private_key.encode("utf-8"), private_key.encode("utf-8")])
 
 
 class CiSetupRepoDetectionTests(unittest.TestCase):
@@ -283,204 +268,6 @@ class CiSetupGhAuthTests(unittest.TestCase):
 
             self.assertIn("gh auth login", str(caught.exception))
             self.assertFalse(any(c["argv"][0] == "ssh-keygen" for c in runner.calls))
-
-
-class CiSetupFailureTests(unittest.TestCase):
-    def test_ssh_keygen_failure_is_reported_and_nothing_is_written(self) -> None:
-        def handler(argv, kwargs):
-            if argv[:3] == ["git", "remote", "get-url"]:
-                return _cp(argv, stdout="git@github.com:acme/widgets.git\n")
-            if argv[:2] == ["gh", "auth"]:
-                return _cp(argv)
-            if argv[0] == "ssh-keygen":
-                return _cp(argv, returncode=1, stderr="ssh-keygen: boom\n")
-            return None
-
-        with Project() as infra_dir:
-            runner = FakeRunner(handler=handler)
-
-            with self.assertRaises(StackError):
-                ci_setup(infra_dir, runner=runner)
-
-            self.assertFalse((infra_dir / "keys" / "ci-deploy.pub").exists())
-
-    def test_gh_secret_set_failure_is_reported_and_the_pub_key_is_never_written(self) -> None:
-        def handler(argv, kwargs):
-            if argv[:3] == ["git", "remote", "get-url"]:
-                return _cp(argv, stdout="git@github.com:acme/widgets.git\n")
-            if argv[:2] == ["gh", "auth"]:
-                return _cp(argv)
-            if argv[0] == "ssh-keygen":
-                key_path = Path(argv[argv.index("-f") + 1])
-                key_path.write_text(_PRIVATE_KEY_BODY, encoding="utf-8")
-                (key_path.parent / (key_path.name + ".pub")).write_text(_PUBLIC_KEY_BODY, encoding="utf-8")
-                return _cp(argv)
-            if argv[:3] == ["gh", "secret", "set"]:
-                return _cp(argv, returncode=1, stderr="permission denied\n")
-            return None
-
-        with Project() as infra_dir:
-            runner = FakeRunner(handler=handler)
-
-            with self.assertRaises(StackError):
-                ci_setup(infra_dir, runner=runner)
-
-            self.assertFalse((infra_dir / "keys" / "ci-deploy.pub").exists())
-
-    def test_a_secret_that_does_not_verify_afterwards_is_reported(self) -> None:
-        with Project() as infra_dir:
-            runner = FakeRunner(handler=_happy_path_handler(secret_list_names=["SOME_OTHER_SECRET"]))
-
-            with self.assertRaises(StackError) as caught:
-                ci_setup(infra_dir, runner=runner)
-
-            self.assertIn(SECRET_NAME, str(caught.exception))
-            # the pub key is only written once the secret has been verified
-            self.assertFalse((infra_dir / "keys" / "ci-deploy.pub").exists())
-
-
-class PrivateKeyNeverLeaksTests(unittest.TestCase):
-    """The private key must never appear in any argv, log line, exception, or
-    file outside the RAM dir (task brief). Scans every recorded argv/kwargs
-    and the whole temp project tree after a full run.
-
-    M2, Fix round 1: the leak scan used to exempt every bytes-typed kwarg
-    wholesale ("bytes are allowed to carry it"), which would also have
-    passed if the key had leaked into some OTHER bytes kwarg by mistake.
-    Tightened to exempt only `kwargs["input"]` of the `gh secret set` call,
-    and to assert positively that this is exactly where the key travels.
-    """
-
-    def test_the_private_key_appears_only_in_gh_secret_sets_input_kwarg_nowhere_else(self) -> None:
-        with Project() as infra_dir:
-            runner = FakeRunner(handler=_happy_path_handler())
-            printed: list[str] = []
-
-            ci_setup(infra_dir, runner=runner, emit=printed.append)
-
-            needle = _PRIVATE_KEY_BODY.strip()
-            needle_bytes = needle.encode("utf-8")
-            found_in_the_one_legitimate_channel = False
-
-            for call in runner.calls:
-                is_gh_secret_set = call["argv"][:3] == ["gh", "secret", "set"]
-                self.assertNotIn(needle, " ".join(call["argv"]))
-                for kwarg_name, value in call["kwargs"].items():
-                    if is_gh_secret_set and kwarg_name == "input":
-                        if isinstance(value, bytes) and needle_bytes in value:
-                            found_in_the_one_legitimate_channel = True
-                        continue
-                    if isinstance(value, bytes):
-                        self.assertNotIn(needle_bytes, value, f"leaked into {call['argv']}'s {kwarg_name}= kwarg")
-                    elif isinstance(value, str):
-                        self.assertNotIn(needle, value, f"leaked into {call['argv']}'s {kwarg_name}= kwarg")
-
-            self.assertTrue(
-                found_in_the_one_legitimate_channel,
-                "expected the private key in gh secret set's input= kwarg -- it never traveled at all",
-            )
-
-            self.assertNotIn(needle, "\n".join(printed))
-
-            for path in infra_dir.parent.rglob("*"):
-                if not path.is_file():
-                    continue
-                try:
-                    text = path.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                self.assertNotIn(needle, text, f"private key leaked into {path}")
-
-
-class RegisterSecretForRedactionTests(unittest.TestCase):
-    """F2, Fix round 1: `ci_setup` must feed the generated private key into
-    `register_secret` BEFORE the `gh secret set` call -- the one place it
-    could conceivably come back in a failure's stderr -- so the CLI's own
-    redaction net (`stackbase.__main__`'s `secrets` dict) knows about it
-    before any operation that could raise.
-    """
-
-    def test_the_whole_key_and_every_body_line_are_registered_before_gh_secret_set(self) -> None:
-        # A tripwire runner: raises if `gh secret set` is ever reached before
-        # `register_secret` has already seen the whole key -- proving the
-        # registration happens strictly before that call, not just "at some
-        # point during the run".
-        registered: list[str] = []
-        state = {"registered_before_call": False}
-
-        def handler(argv, kwargs):
-            if argv[:3] == ["gh", "secret", "set"]:
-                state["registered_before_call"] = _PRIVATE_KEY_BODY in registered
-            return _happy_path_handler()(argv, kwargs)
-
-        with Project() as infra_dir:
-            runner = FakeRunner(handler=handler)
-
-            ci_setup(infra_dir, runner=runner, emit=_silent, register_secret=registered.append)
-
-            self.assertTrue(
-                state["registered_before_call"],
-                "the private key was not registered before `gh secret set` ran",
-            )
-            # The whole PEM text was registered.
-            self.assertIn(_PRIVATE_KEY_BODY, registered)
-            # Every non-header/footer body line (>= 8 chars) was registered too.
-            for line in _PRIVATE_KEY_BODY.splitlines():
-                stripped = line.strip()
-                if stripped and not stripped.startswith("-----") and len(stripped) >= 8:
-                    self.assertIn(stripped, registered)
-
-    def test_registration_happens_even_when_gh_secret_set_fails(self) -> None:
-        def handler(argv, kwargs):
-            if argv[:3] == ["git", "remote", "get-url"]:
-                return _cp(argv, stdout="git@github.com:acme/widgets.git\n")
-            if argv[:2] == ["gh", "auth"]:
-                return _cp(argv)
-            if argv[0] == "ssh-keygen":
-                key_path = Path(argv[argv.index("-f") + 1])
-                key_path.write_text(_PRIVATE_KEY_BODY, encoding="utf-8")
-                (key_path.parent / (key_path.name + ".pub")).write_text(_PUBLIC_KEY_BODY, encoding="utf-8")
-                return _cp(argv)
-            if argv[:3] == ["gh", "secret", "set"]:
-                return _cp(argv, returncode=1, stderr="permission denied\n")
-            return None
-
-        with Project() as infra_dir:
-            runner = FakeRunner(handler=handler)
-            registered: list[str] = []
-
-            with self.assertRaises(StackError):
-                ci_setup(infra_dir, runner=runner, emit=_silent, register_secret=registered.append)
-
-            self.assertIn(_PRIVATE_KEY_BODY, registered)
-
-
-class PrivateKeyNeverLeaksRamdirTests(unittest.TestCase):
-    def test_the_ramdir_itself_no_longer_exists_once_ci_setup_returns(self) -> None:
-        """Belt-and-braces: the private key's own directory is gone, not just
-        its content unreferenced -- proves the `with private_ram_dir()` block
-        in `ci_setup` really does end (and clean up) before this function
-        returns, rather than the ramdir being leaked open.
-        """
-        from stackbase import ci as ci_module
-
-        seen: list[Path] = []
-        real_private_ram_dir = ci_module.private_ram_dir
-
-        @contextlib.contextmanager
-        def spying_ram_dir():
-            with real_private_ram_dir() as directory:
-                seen.append(directory)
-                yield directory
-
-        with Project() as infra_dir:
-            runner = FakeRunner(handler=_happy_path_handler())
-
-            with mock.patch.object(ci_module, "private_ram_dir", spying_ram_dir):
-                ci_setup(infra_dir, runner=runner, emit=_silent)
-
-        self.assertEqual(len(seen), 1)
-        self.assertFalse(seen[0].exists())
 
 
 # --------------------------------------------------------------------------

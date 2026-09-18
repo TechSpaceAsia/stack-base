@@ -295,6 +295,33 @@ after the swap (and, failing a graceful stop within `TimeoutStopSec`,
 force-killed). A client reconnecting picks up the new color; there's no
 in-place migration of an open connection.
 
+## The project deploy key
+
+Every project has exactly **one** SSH deploy key. You use it, a build host
+uses it, and GitHub Actions uses it — all through the same restricted door
+(`upload`, `deploy`, `rollback`, `status`, `colors`, `releases`, and
+nothing else).
+
+```bash
+./infra/up deploy-key init         # generates it; writes infra/deploy.age + infra/keys/deploy.pub
+./infra/up deploy-key show-pub     # prints the public half
+git add infra/deploy.age infra/keys/deploy.pub && git commit -m "deploy: add the project deploy key"
+./infra/up                         # installs it on every server
+```
+
+The private half is generated in RAM and goes straight into
+`infra/deploy.age`, encrypted to `infra/deploy-recipients.txt` — a
+**different** list from `infra/age-recipients.txt`, and one that must
+contain every name on it. That asymmetry is the point: a build host gets an
+age identity listed **only** in `deploy-recipients.txt`, so compromising it
+yields "can push a release through the restricted door" and nothing else —
+no API tokens, no TLS key, no `app_env`. `./infra/up` refuses to run if
+`deploy-recipients.txt` has fallen behind `age-recipients.txt`.
+
+`./infra/up deploy-key init --rotate` replaces both halves. It prints the
+sequence that has to follow (commit → `./infra/up` → `ci-setup`); until it
+is finished, anything still holding the old key cannot deploy.
+
 ## Deploying from GitHub Actions (optional)
 
 Deploys (`./infra/up deploy vX.Y.Z`) normally run from a laptop, over the
@@ -303,20 +330,19 @@ door can optionally also be driven by GitHub Actions on every tag push,
 so a release ships as soon as you `git push --tags`, with no laptop
 involved.
 
-**What `./infra/up ci-setup` does:** generates a fresh ed25519 key pair,
-held only in RAM on your machine (never written to your disk), and pushes
-the PRIVATE half straight into a **repository-level** GitHub Actions secret
+**What `./infra/up ci-setup` does:** pushes the project's own deploy key
+(above) straight into a **repository-level** GitHub Actions secret
 (`STACK_DEPLOY_KEY`) — repo-level, not organization-level, because this
-GitHub plan has no org-level secrets/variables to use instead. The PUBLIC
-half is written to `infra/keys/ci-deploy.pub`, which you commit like any
-other key. `ci-setup` needs the [`gh` CLI](https://cli.github.com),
-authenticated (`gh auth login`).
+GitHub plan has no org-level secrets/variables to use instead. If this
+project has no deploy key yet, `ci-setup` creates one first (same as running
+`deploy-key init` yourself). `ci-setup` needs the
+[`gh` CLI](https://cli.github.com), authenticated (`gh auth login`).
 
 **Turn it on** (three commands):
 
 ```bash
 ./infra/up ci-setup
-git add infra/keys/ci-deploy.pub && git commit -m "ci: add the CI deploy key"
+git add infra/deploy.age infra/keys/deploy.pub && git commit -m "ci: the project deploy key"
 ./infra/up                 # installs the key on every server
 ```
 
@@ -330,28 +356,34 @@ cp <stack-base checkout>/templates/github/deploy-stack.yml .github/workflows/dep
 git add .github/workflows/deploy-stack.yml && git commit -m "ci: add the deploy workflow"
 ```
 
-**Rotate it** with `./infra/up ci-setup --rotate` — this replaces the
-GitHub Actions secret (`STACK_DEPLOY_KEY`) **immediately**. There IS a
-window where CI deploys are broken: GitHub Actions is now offering the NEW
-private key, but every server still only trusts the OLD public one, until
-you commit the new `infra/keys/ci-deploy.pub` and run `./infra/up` (which
-is what installs the new key on every server):
+**Rotate it** with `./infra/up ci-setup --rotate` — this forwards to
+`./infra/up deploy-key init --rotate` and immediately replaces the GitHub
+Actions secret (`STACK_DEPLOY_KEY`) with the new key. There IS a window
+where CI deploys are broken: GitHub Actions is now offering the NEW private
+key, but every server still only trusts the OLD public one, until you
+commit the new `infra/deploy.age`/`infra/keys/deploy.pub` and run
+`./infra/up` (which is what installs the new key on every server):
 
 ```bash
-git add infra/keys/ci-deploy.pub && git commit -m "ci: rotate the CI deploy key"
+git add infra/deploy.age infra/keys/deploy.pub && git commit -m "deploy: rotate the project deploy key"
 ./infra/up                 # installs the new key on every server -- CI deploys work again after this
 ```
 
-Laptop deploys using a teammate's own key are unaffected either way — only
-the `ci-deploy` entry changes.
+Because it's the SAME key everywhere, rotating it also replaces what you
+and any build host deploy with — there is no "laptop deploys are
+unaffected" any more (Task 2 removed the separate `ci-deploy` key).
 
-**Turn it off:**
+**Turn it off** (CI only — this does not remove the deploy key itself,
+since it's also your own):
 
 ```bash
-rm infra/keys/ci-deploy.pub
-./infra/up                                        # removes the key from every server
 gh secret delete STACK_DEPLOY_KEY --repo <owner>/<repo>
 ```
+
+A project upgraded from an older stack-base that still has
+`infra/keys/ci-deploy.pub` should delete that file and run
+`./infra/up deploy-key init` — the template flake no longer reads that
+path.
 
 **What a leaked CI key can and cannot do.** It's just another
 `stackbase.deploy.keys` entry, confined the same way every one of them is
@@ -447,6 +479,8 @@ Every failure is one line: what went wrong, then what to check.
 |---|---|
 | `secrets.age not found` | Do step 4 above — the message includes the exact command |
 | `failed to decrypt …/secrets.age` | Your age key isn't a recipient yet. Ask a teammate to re-encrypt it for you |
+| `infra/deploy-recipients.txt is missing N recipient(s)` | Add the listed key(s) to `deploy-recipients.txt`, then `./infra/up deploy-key init --rotate` |
+| `infra/deploy.age already exists` | Pass `--rotate` if you really mean to replace the project's deploy key |
 | `the API token is wrong or expired` | Re-issue the token and re-create `secrets.age` |
 | `the API token doesn't have permission` | Cloudflare: add **Zone → SSL and Certificates → Edit**. Hostinger: use a full-access token |
 | `no Cloudflare zone found for domain …` | The token can't see that zone — check it's scoped to the right account |
@@ -578,6 +612,9 @@ config and used directly, so edits to stack-base take effect on the next run.
 | `keys/*.pub` | Everyone's SSH public key. Commit |
 | `age-recipients.txt` | Everyone's age public key — who can read the secrets. Commit |
 | `secrets.age` | The encrypted API tokens, TLS key and the app's own `app_env`. Commit (it's encrypted) |
+| `deploy-recipients.txt` | Who can decrypt `deploy.age` — a superset of `age-recipients.txt`. Commit |
+| `deploy.age` | The project's encrypted SSH deploy key. Commit (it's encrypted) |
+| `keys/deploy.pub` | The deploy key's public half — this is what gets installed on the servers. Commit |
 | `stack.state.json` | What stack-base has done so far — addresses, record ids, fingerprints. Written for you: commit it, don't edit it. The servers' configuration is built from `stack.toml` alone, so nothing in here changes what gets installed |
 | `known_hosts` | The servers' SSH fingerprints. Commit |
 | `nodes/<name>/` | Each server's own disk and boot settings, copied off the machine. Commit |

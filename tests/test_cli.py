@@ -930,5 +930,26 @@ class CiSetupAndSecretsWiringTests(unittest.TestCase):
             self.assertEqual(edit_key_mock.call_args.args, (infra_dir, "app_env"))
 
 
+class DeployKeyCLIWiringTests(unittest.TestCase):
+    def test_init_forwards_rotate(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            with mock.patch("stackbase.__main__.deploy_key_init") as init_mock:
+                main(["--infra-dir", str(infra_dir), "deploy-key", "init", "--rotate"])
+
+            self.assertEqual(init_mock.call_args.args[0], infra_dir)
+            self.assertTrue(init_mock.call_args.kwargs["rotate"])
+
+    def test_show_pub_is_wired(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            with mock.patch("stackbase.__main__.deploy_key_show_pub") as show_mock:
+                main(["--infra-dir", str(infra_dir), "deploy-key", "show-pub"])
+
+            show_mock.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

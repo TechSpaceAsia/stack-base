@@ -18,9 +18,12 @@ from pathlib import Path
 from unittest import mock
 
 from stackbase.errors import StackError
-from stackbase.secrets import load_secrets, save_secrets
+from stackbase.secrets import DEPLOY_FILE, DEPLOY_KEY_NAME, load_secrets, save_secrets
 from stackbase.secrets_cli import (
+    DEPLOY_PUB_FILENAME,
     REQUIRED_KEY,
+    deploy_key_init,
+    deploy_key_show_pub,
     edit_key,
     list_key_names,
     set_key,
@@ -28,6 +31,7 @@ from stackbase.secrets_cli import (
 )
 
 _AGE_AVAILABLE = shutil.which("age") is not None and shutil.which("age-keygen") is not None
+_SSH_KEYGEN_AVAILABLE = shutil.which("ssh-keygen") is not None
 
 
 class TempInfraDir:
@@ -437,6 +441,166 @@ class ReadmeDocumentsTheSafeFlowTests(unittest.TestCase):
     def test_the_new_subcommands_are_documented(self) -> None:
         for command in ("secrets keys", "secrets set", "secrets unset", "secrets edit"):
             self.assertIn(command, self._README)
+
+
+_DEPLOY_KEY_STACK_TOML = """\
+project    = "acme"
+domain     = "acme.example.com"
+owner      = "matt"
+datacenter = "kul"
+plan       = "KVM 1"
+admins     = ["matt"]
+
+[nodes.a]
+role   = "primary"
+vps_id = 1984476
+"""
+
+
+def _deploy_project(infra_dir: Path, recipient: str) -> None:
+    """A minimal infra/ with a valid stack.toml and both recipients files."""
+    infra_dir.mkdir(parents=True, exist_ok=True)
+    (infra_dir / "stack.toml").write_text(_DEPLOY_KEY_STACK_TOML, encoding="utf-8")
+    (infra_dir / "keys").mkdir(exist_ok=True)
+    (infra_dir / "keys" / "matt.pub").write_text(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForTemplateEval matt@laptop\n",
+        encoding="utf-8",
+    )
+    (infra_dir / "age-recipients.txt").write_text(recipient + "\n", encoding="utf-8")
+    (infra_dir / "deploy-recipients.txt").write_text(recipient + "\n", encoding="utf-8")
+
+
+@unittest.skipUnless(
+    _AGE_AVAILABLE and _SSH_KEYGEN_AVAILABLE, "age / ssh-keygen not installed"
+)
+class DeployKeyInitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.identity_path, self.public_key = _generate_age_identity(self.root)
+        self.infra_dir = self.root / "infra"
+        _deploy_project(self.infra_dir, self.public_key)
+        self.env = mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(self.identity_path)})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_creates_deploy_age_and_the_public_half(self) -> None:
+        emitted: list[str] = []
+
+        deploy_key_init(self.infra_dir, emit=emitted.append)
+
+        pub_path = self.infra_dir / "keys" / DEPLOY_PUB_FILENAME
+        self.assertTrue((self.infra_dir / "deploy.age").exists())
+        self.assertTrue(pub_path.read_text(encoding="utf-8").startswith("ssh-ed25519 "))
+        self.assertIn("deploy@acme", pub_path.read_text(encoding="utf-8"))
+
+        stored = load_secrets(self.infra_dir, file=DEPLOY_FILE)
+        self.assertEqual(list(stored), [DEPLOY_KEY_NAME])
+        self.assertIn("PRIVATE KEY", stored[DEPLOY_KEY_NAME])
+        self.assertTrue(any("deploy-key" in line or "deploy key" in line for line in emitted))
+
+    def test_the_private_key_never_lands_on_disk_outside_the_encrypted_file(self) -> None:
+        deploy_key_init(self.infra_dir, emit=lambda _line: None)
+        private_key = load_secrets(self.infra_dir, file=DEPLOY_FILE)[DEPLOY_KEY_NAME]
+        body = [line for line in private_key.splitlines() if not line.startswith("-----")][0]
+
+        for path in self.root.rglob("*"):
+            if not path.is_file() or path.name == "deploy.age":
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            self.assertNotIn(body, text, f"private key material leaked into {path}")
+
+    def test_refuses_to_replace_an_existing_key_without_rotate(self) -> None:
+        deploy_key_init(self.infra_dir, emit=lambda _line: None)
+        first = (self.infra_dir / "keys" / DEPLOY_PUB_FILENAME).read_text(encoding="utf-8")
+
+        with self.assertRaises(StackError) as ctx:
+            deploy_key_init(self.infra_dir, emit=lambda _line: None)
+
+        self.assertIn("--rotate", str(ctx.exception))
+        self.assertEqual((self.infra_dir / "keys" / DEPLOY_PUB_FILENAME).read_text(encoding="utf-8"), first)
+
+    def test_rotate_replaces_both_halves_and_prints_the_follow_up_sequence(self) -> None:
+        deploy_key_init(self.infra_dir, emit=lambda _line: None)
+        first = (self.infra_dir / "keys" / DEPLOY_PUB_FILENAME).read_text(encoding="utf-8")
+        emitted: list[str] = []
+
+        deploy_key_init(self.infra_dir, rotate=True, emit=emitted.append)
+
+        self.assertNotEqual((self.infra_dir / "keys" / DEPLOY_PUB_FILENAME).read_text(encoding="utf-8"), first)
+        joined = "\n".join(emitted)
+        self.assertIn("./infra/up", joined)
+        self.assertIn("ci-setup", joined)
+
+    def test_a_deploy_recipients_file_that_is_not_a_superset_is_refused_before_keygen(self) -> None:
+        (self.infra_dir / "age-recipients.txt").write_text(
+            self.public_key + "\nage1someoneelse\n", encoding="utf-8"
+        )
+
+        with self.assertRaises(StackError) as ctx:
+            deploy_key_init(self.infra_dir, emit=lambda _line: None)
+
+        self.assertIn("age1someoneelse", str(ctx.exception))
+        self.assertFalse((self.infra_dir / "deploy.age").exists())
+
+    def test_a_missing_deploy_recipients_file_names_the_file_to_create(self) -> None:
+        (self.infra_dir / "deploy-recipients.txt").unlink()
+
+        with self.assertRaises(StackError) as ctx:
+            deploy_key_init(self.infra_dir, emit=lambda _line: None)
+
+        self.assertIn("deploy-recipients.txt", str(ctx.exception))
+
+    def test_an_empty_deploy_recipients_file_is_refused_before_save(self) -> None:
+        """Controller ruling (task-2 brief): a comment-only deploy-recipients.txt
+        (the template's shipped, pre-scaffold state) means the operator has not
+        yet listed anyone -- `deploy_key_init` must say so BEFORE it ever calls
+        `save_secrets`, or the operator sees raw `age` stderr ("no recipients")
+        instead of an instruction naming the file to edit.
+        """
+        (self.infra_dir / "deploy-recipients.txt").write_text(
+            "# nobody listed yet\n", encoding="utf-8"
+        )
+
+        with self.assertRaises(StackError) as ctx:
+            deploy_key_init(self.infra_dir, emit=lambda _line: None)
+
+        self.assertIn("deploy-recipients.txt", str(ctx.exception))
+        self.assertFalse((self.infra_dir / "deploy.age").exists())
+
+    def test_the_private_key_is_registered_for_redaction(self) -> None:
+        registered: list[str] = []
+
+        deploy_key_init(self.infra_dir, emit=lambda _line: None, register_secret=registered.append)
+
+        private_key = load_secrets(self.infra_dir, file=DEPLOY_FILE)[DEPLOY_KEY_NAME]
+        self.assertIn(private_key, registered)
+
+
+class DeployKeyShowPubTests(unittest.TestCase):
+    def test_prints_the_committed_public_half(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp)
+            (infra_dir / "keys").mkdir()
+            (infra_dir / "keys" / DEPLOY_PUB_FILENAME).write_text(
+                "ssh-ed25519 AAAA deploy@acme\n", encoding="utf-8"
+            )
+            emitted: list[str] = []
+
+            deploy_key_show_pub(infra_dir, emit=emitted.append)
+
+            self.assertEqual(emitted, ["ssh-ed25519 AAAA deploy@acme"])
+
+    def test_a_missing_public_half_names_the_init_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(StackError) as ctx:
+                deploy_key_show_pub(Path(tmp), emit=lambda _line: None)
+
+            self.assertIn("deploy-key init", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -24,10 +24,20 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+from stackbase.config import load_config
 from stackbase.errors import StackError
 from stackbase.ramdir import private_ram_dir
 from stackbase.reconcile import validate_app_env
-from stackbase.secrets import load_secrets, save_secrets
+from stackbase.secrets import (
+    DEPLOY_FILE,
+    DEPLOY_KEY_NAME,
+    check_recipients_superset,
+    load_secrets,
+    read_recipients,
+    register_private_key,
+    save_secrets,
+    write_public_key,
+)
 
 KEY_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
 
@@ -243,3 +253,123 @@ def edit_key(
     secrets[key] = edited
     save_secrets(infra_dir, secrets)
     emit(f"{key}: saved")
+
+
+# The PUBLIC half of the project's deploy key, committed like any other
+# key under infra/keys/. The private half only ever exists inside
+# infra/deploy.age (encrypted) and, for the seconds a command needs it, in
+# a RAM-backed scratch directory.
+DEPLOY_PUB_FILENAME = "deploy.pub"
+
+
+def _noop_register_value(_value: str) -> None:
+    pass
+
+
+def deploy_key_init(
+    infra_dir: Path,
+    *,
+    rotate: bool = False,
+    runner: Any = subprocess.run,
+    emit: Callable[[str], None] = print,
+    register_secret: Callable[[str], None] = _noop_register_value,
+) -> None:
+    """Generate the project's ONE SSH deploy key: `deploy.age` + `keys/deploy.pub`.
+
+    The private half is generated inside `private_ram_dir()` (never a real
+    disk), encrypted straight into `infra/deploy.age` against
+    `infra/deploy-recipients.txt`, and then the RAM directory is wiped.
+    The public half is written to `infra/keys/deploy.pub`, which the
+    project's flake reads into `stackbase.deploy.keys` -- that is what
+    installs it on every server.
+
+    Refuses outright when `deploy.age` already exists unless `rotate` is
+    set: replacing a live key is a sequence (commit, `up`, `ci-setup`), not
+    a side effect of a mistyped command.
+
+    `register_secret(value)` feeds the CLI's own redaction net (the same
+    mechanism `ci_setup` uses) -- the private key is registered the moment
+    it is read, before anything else can echo it.
+    """
+    cfg = load_config(infra_dir)
+    deploy_path = infra_dir / DEPLOY_FILE.name
+    pub_path = infra_dir / "keys" / DEPLOY_PUB_FILENAME
+
+    if deploy_path.exists() and not rotate:
+        raise StackError(
+            f"{deploy_path} already exists",
+            "pass --rotate to replace it -- the old key keeps working on the servers until you "
+            "commit the new infra/keys/deploy.pub and run ./infra/up",
+        )
+
+    recipients_path = infra_dir / DEPLOY_FILE.recipients_name
+    if not recipients_path.exists():
+        raise StackError(
+            f"{recipients_path} not found",
+            "create infra/deploy-recipients.txt with one age public key per line -- it must list "
+            "every recipient of infra/age-recipients.txt, plus any build host that deploys",
+        )
+    # The template ships deploy-recipients.txt present but comment-only (no
+    # keys yet) -- caught here, by name, before save_secrets ever shells out
+    # to `age -R` (which would otherwise fail with a bare "no recipients"
+    # error that names no file and offers no next step).
+    if not read_recipients(recipients_path):
+        raise StackError(
+            f"{recipients_path} lists no recipients yet",
+            "add at least your own age public key (the same one that is in infra/age-recipients.txt) "
+            "to infra/deploy-recipients.txt before initialising the deploy key",
+        )
+    # Checked BEFORE ssh-keygen runs: a key encrypted to a list that has
+    # already drifted would lock an admin out the moment it is committed.
+    check_recipients_superset(infra_dir)
+
+    with private_ram_dir() as ramdir:
+        key_path = ramdir / "deploy_key"
+        keygen = runner(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"deploy@{cfg.project}", "-f", str(key_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if keygen.returncode != 0:
+            raise StackError(
+                "ssh-keygen failed while generating the project deploy key",
+                (keygen.stderr or "").strip() or "check that ssh-keygen is installed",
+            )
+
+        pub_key_path = ramdir / "deploy_key.pub"
+        if not key_path.is_file() or not pub_key_path.is_file():
+            raise StackError(
+                "ssh-keygen did not produce both key files",
+                "this is a bug in stack-base -- please report it",
+            )
+
+        private_key = key_path.read_text(encoding="utf-8")
+        register_private_key(private_key, register_secret)
+        public_key = pub_key_path.read_text(encoding="utf-8").strip() + "\n"
+
+        save_secrets(infra_dir, {DEPLOY_KEY_NAME: private_key}, file=DEPLOY_FILE)
+
+    # Past this point the RAM directory (and the private key it held) is
+    # gone -- only the PUBLIC key is still in hand.
+    write_public_key(pub_path, public_key)
+
+    action = "rotated" if rotate else "created"
+    emit(f"project deploy key {action}: {deploy_path} (encrypted) and {pub_path} (public).")
+    emit("Next steps:")
+    emit(f"  1. git add {deploy_path} {pub_path} && git commit -m 'deploy: {action} the project deploy key'")
+    emit("  2. ./infra/up                 # installs the key on every server")
+    emit("  3. ./infra/up ci-setup        # only if GitHub Actions deploys this project")
+    if rotate:
+        emit("  Deploys using the OLD key (CI, and any build host) FAIL until steps 1-3 are done.")
+
+
+def deploy_key_show_pub(infra_dir: Path, *, emit: Callable[[str], None] = print) -> None:
+    """Print the deploy key's PUBLIC half -- never touches deploy.age."""
+    pub_path = infra_dir / "keys" / DEPLOY_PUB_FILENAME
+    if not pub_path.is_file():
+        raise StackError(
+            f"{pub_path} not found",
+            "run `./infra/up deploy-key init` first -- it writes the public half there",
+        )
+    emit(pub_path.read_text(encoding="utf-8").strip())

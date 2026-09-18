@@ -43,25 +43,25 @@
       admins = builtins.listToAttrs
         (map (admin: { name = admin; value = adminKey admin; }) stack.admins);
 
-      # The optional GitHub Actions deploy key (Task 4). Present only once
-      # an operator has run `ci-setup`, which writes this file's PUBLIC half
-      # -- the private half never leaves GitHub (see the README). Layered on
-      # TOP of the admin keys below, never merged into `admins` itself: every
-      # admin key also goes into stackbase.deploy.keys (so an admin can
-      # deploy from their own laptop with the same key they already log in
-      # with), but `ci-deploy` must never be able to reach root's or any
-      # admin's own authorized_keys -- only nixos/deploy.nix's forced-command
-      # door reads stackbase.deploy.keys.
-      ciDeployPubPath = ./keys/ci-deploy.pub;
-      ciDeployKeys =
-        if builtins.pathExists ciDeployPubPath
+      # The project's ONE deploy key (`./infra/up deploy-key init`). Present
+      # as soon as an operator has created it; the PRIVATE half lives only
+      # in infra/deploy.age (and, for CI, in the repo's STACK_DEPLOY_KEY
+      # secret). Layered on TOP of the admin keys below, never merged into
+      # `admins` itself: every admin key also goes into
+      # stackbase.deploy.keys (so an admin can deploy from their own laptop
+      # with the same key they already log in with), but `deploy` must never
+      # be able to reach root's or any admin's own authorized_keys -- only
+      # nixos/deploy.nix's forced-command door reads stackbase.deploy.keys.
+      deployPubPath = ./keys/deploy.pub;
+      projectDeployKeys =
+        if builtins.pathExists deployPubPath
         then {
-          ci-deploy = builtins.replaceStrings [ "\n" ] [ "" ]
-            (builtins.readFile ciDeployPubPath);
+          deploy = builtins.replaceStrings [ "\n" ] [ "" ]
+            (builtins.readFile deployPubPath);
         }
         else { };
 
-      deployKeys = admins // ciDeployKeys;
+      deployKeys = admins // projectDeployKeys;
 
       # I6: the optional [app] table in stack.toml -- overrides for what
       # nixos/deploy.nix's stackbase.app.* options would otherwise default

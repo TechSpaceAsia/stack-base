@@ -41,7 +41,7 @@ from stackbase.reconcile import (
 )
 from stackbase.release import run_deploy, run_rollback, run_status
 from stackbase.secrets import check_recipients_superset, load_secrets, redact
-from stackbase.secrets_cli import edit_key, list_key_names, set_key, unset_key
+from stackbase.secrets_cli import deploy_key_init, deploy_key_show_pub, edit_key, list_key_names, set_key, unset_key
 from stackbase.ssh import Ssh
 
 _DEFAULT_INFRA_DIR = "./infra"
@@ -90,6 +90,20 @@ def build_parser() -> argparse.ArgumentParser:
     ci_setup_p.add_argument("--rotate", action="store_true", help="replace an existing CI deploy key")
     ci_setup_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
 
+    deploy_key_p = commands.add_parser(
+        "deploy-key", help="the project's SSH deploy key -- used by you, by a build host, and by CI"
+    )
+    deploy_key_sub = deploy_key_p.add_subparsers(dest="deploy_key_command", required=True)
+
+    deploy_key_init_p = deploy_key_sub.add_parser(
+        "init", help="generate it in RAM: writes infra/deploy.age and infra/keys/deploy.pub"
+    )
+    deploy_key_init_p.add_argument("--rotate", action="store_true", help="replace an existing deploy key")
+    deploy_key_init_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
+
+    deploy_key_show_p = deploy_key_sub.add_parser("show-pub", help="print the deploy key's public half")
+    deploy_key_show_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
+
     secrets_p = commands.add_parser(
         "secrets", help="manage infra/secrets.age one key at a time -- never to disk unencrypted"
     )
@@ -137,6 +151,8 @@ def main(argv: list[str] | None = None) -> None:
             _status(args, infra_dir)
         elif args.command == "ci-setup":
             _ci_setup(args, infra_dir, secrets)
+        elif args.command == "deploy-key":
+            _deploy_key(args, infra_dir, secrets)
         elif args.command == "secrets":
             _secrets(args, infra_dir, secrets)
         else:
@@ -361,6 +377,25 @@ def _ci_setup(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]
         emit=_emit_plain,
         register_secret=_secret_register_counter(secrets),
     )
+
+
+def _deploy_key(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+    if args.deploy_key_command == "init":
+        deploy_key_init(
+            infra_dir,
+            rotate=args.rotate,
+            emit=_emit_plain,
+            register_secret=_secret_register_counter(secrets),
+        )
+    elif args.deploy_key_command == "show-pub":
+        deploy_key_show_pub(infra_dir, emit=_emit_plain)
+    else:
+        # deploy_key_sub is required=True, so this is unreachable in
+        # practice -- an explicit branch beats a bare `else` doing nothing.
+        raise StackError(
+            f"unknown deploy-key command '{args.deploy_key_command}'",
+            "this is a bug in stack-base -- please report it",
+        )
 
 
 def _secrets(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:

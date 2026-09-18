@@ -255,15 +255,15 @@ class TemplateFlakeEvaluatesTests(unittest.TestCase):
 
 
 @unittest.skipIf(_NIX is None, "nix is not installed")
-class CiDeployKeyTests(unittest.TestCase):
-    """Task 4: an optional GitHub Actions deploy key, `ci-deploy`, layered
-    on top of every admin key. It must reach stackbase.deploy.keys (so it
-    can drive the SSH forced-command door) but never stackbase.admins
-    itself -- root's and every admin's own authorized_keys must never
-    contain it.
+class ProjectDeployKeyTests(unittest.TestCase):
+    """Task 2: the project's ONE deploy key (`./infra/up deploy-key init`),
+    layered on top of every admin key. It must reach stackbase.deploy.keys
+    (so it can drive the SSH forced-command door) but never
+    stackbase.admins itself -- root's and every admin's own authorized_keys
+    must never contain it.
     """
 
-    _CI_PUB = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAACIExampleCiDeployKey ci-deploy@acme\n"
+    _DEPLOY_PUB = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAACIExampleDeployKey deploy@acme\n"
 
     def _eval(self, directory: Path) -> dict:
         apply_fn = (
@@ -289,31 +289,31 @@ class CiDeployKeyTests(unittest.TestCase):
             raise AssertionError(f"nix eval failed:\n{result.stderr}")
         return json.loads(result.stdout)
 
-    def test_ci_deploy_key_reaches_deploy_keys_but_never_admin_or_root_keys(self) -> None:
+    def test_project_deploy_key_reaches_deploy_keys_but_never_admin_or_root_keys(self) -> None:
         with TemporaryDirectory() as tmp:
             directory = Path(tmp)
             _instantiate_template(directory)
-            (directory / "keys" / "ci-deploy.pub").write_text(self._CI_PUB, encoding="utf-8")
+            (directory / "keys" / "deploy.pub").write_text(self._DEPLOY_PUB, encoding="utf-8")
 
             facts = self._eval(directory)
 
-            self.assertIn("ci-deploy", facts["deployKeys"])
-            self.assertNotIn("ExampleCiDeployKey", "".join(facts["rootKeys"]))
-            self.assertNotIn("ExampleCiDeployKey", "".join(facts["mattKeys"]))
+            self.assertIn("deploy", facts["deployKeys"])
+            self.assertNotIn("ExampleDeployKey", "".join(facts["rootKeys"]))
+            self.assertNotIn("ExampleDeployKey", "".join(facts["mattKeys"]))
             self.assertTrue(facts["deployAuthorizedKeys"], "expected at least one deploy authorized_keys line")
             self.assertTrue(
                 all(line.startswith("restrict,command=") for line in facts["deployAuthorizedKeys"]),
                 facts["deployAuthorizedKeys"],
             )
 
-    def test_no_ci_deploy_pub_file_means_no_ci_deploy_key_and_evaluation_still_succeeds(self) -> None:
+    def test_no_deploy_pub_file_means_no_project_deploy_key_and_evaluation_still_succeeds(self) -> None:
         with TemporaryDirectory() as tmp:
             directory = Path(tmp)
             _instantiate_template(directory)
 
             facts = self._eval(directory)
 
-            self.assertNotIn("ci-deploy", facts["deployKeys"])
+            self.assertNotIn("deploy", facts["deployKeys"])
             self.assertTrue(facts["deployAuthorizedKeys"], "admin keys should still reach the deploy door")
             self.assertTrue(
                 all(line.startswith("restrict,command=") for line in facts["deployAuthorizedKeys"]),
