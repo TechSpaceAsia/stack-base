@@ -124,6 +124,11 @@ def _nix_eval(directory: Path) -> dict:
         " appHealthPath = node.config.stackbase.app.healthPath;"
         " appHealthTries = node.config.stackbase.app.healthTries;"
         " appHealthSleep = node.config.stackbase.app.healthSleep;"
+        " backupsEnable = node.config.stackbase.backups.enable;"
+        " backupsBucket = node.config.stackbase.backups.bucket;"
+        " backupsRetentionDays = node.config.stackbase.backups.retentionDays;"
+        " backupsExtraPaths = node.config.stackbase.backups.extraPaths;"
+        " backupsOnCalendar = node.config.stackbase.backups.onCalendar;"
         " }"
     )
     result = subprocess.run(
@@ -265,6 +270,55 @@ class TemplateFlakeEvaluatesTests(unittest.TestCase):
             self.assertEqual(facts["appHealthPath"], "/health")
             self.assertEqual(facts["appHealthTries"], 30)
             self.assertEqual(facts["appHealthSleep"], 2)
+
+    def test_no_backups_table_leaves_backups_off(self) -> None:
+        """No bucket named, no nightly job -- and the module's own defaults
+        are still what an operator would see if they turned it on."""
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+
+            facts = _nix_eval(directory)
+
+            self.assertFalse(facts["backupsEnable"])
+            self.assertEqual(facts["backupsBucket"], "")
+            self.assertEqual(facts["backupsRetentionDays"], 30)
+            self.assertEqual(facts["backupsExtraPaths"], [])
+            self.assertEqual(facts["backupsOnCalendar"], "03:00")
+
+    def test_backups_table_is_mapped_to_stackbase_backups_options(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+            (directory / "stack.toml").write_text(
+                _SAMPLE_STACK_TOML
+                + '\n[backups]\nbucket = "acme-backups"\nretention_days = 14\n'
+                'extra_paths = ["/var/lib/acme/uploads"]\non_calendar = "04:30"\n',
+                encoding="utf-8",
+            )
+
+            facts = _nix_eval(directory)
+
+            self.assertTrue(facts["backupsEnable"])
+            self.assertEqual(facts["backupsBucket"], "acme-backups")
+            self.assertEqual(facts["backupsRetentionDays"], 14)
+            self.assertEqual(facts["backupsExtraPaths"], ["/var/lib/acme/uploads"])
+            self.assertEqual(facts["backupsOnCalendar"], "04:30")
+
+    def test_naming_only_a_bucket_turns_backups_on_and_keeps_every_other_default(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+            (directory / "stack.toml").write_text(
+                _SAMPLE_STACK_TOML + '\n[backups]\nbucket = "acme-backups"\n', encoding="utf-8"
+            )
+
+            facts = _nix_eval(directory)
+
+            self.assertTrue(facts["backupsEnable"])
+            self.assertEqual(facts["backupsRetentionDays"], 30)
+            self.assertEqual(facts["backupsExtraPaths"], [])
+            self.assertEqual(facts["backupsOnCalendar"], "03:00")
 
     def test_an_extra_nix_can_override_the_providers_mkdefault_grub_device(self) -> None:
         """The provider module must set boot.loader.grub.device with
@@ -887,6 +941,15 @@ class TemplateFilesTests(unittest.TestCase):
         for key in ("project", "domain", "owner", "datacenter", "plan", "price_item", "auto_patch", "admins"):
             self.assertIn(key, data)
         self.assertEqual(data["nodes"]["a"]["role"], "primary")
+
+        # [backups] is documented as a COMMENTED-OUT block: a project turns
+        # backups on deliberately, by naming a bucket. If it ever stopped
+        # being a comment, every new project would get a bucket called
+        # "acme-backups" it does not own.
+        text = (_TEMPLATE_DIR / "stack.toml.example").read_text(encoding="utf-8")
+        self.assertNotIn("backups", data)
+        self.assertIn("bucket", text)
+        self.assertIn("retention_days", text)
 
     def test_the_example_stack_toml_has_no_real_vps_id_and_still_loads(self) -> None:
         """The example must never carry a real Hostinger VPS id (Finding 7)."""

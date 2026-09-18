@@ -408,6 +408,106 @@ class AppEnvPlanTests(unittest.TestCase):
         self.assertEqual(render_description(step, has_cloudflare_token=True), step.description)
 
 
+class BackupEnvPlanTests(unittest.TestCase):
+    """Task 5: ENSURE_BACKUP_ENV is planned per node from
+    `Local.backup_env_sha` alone -- `plan()` never reads `secrets` itself
+    (see `local_facts`), exactly like ENSURE_APP_ENV above."""
+
+    _R2 = {
+        "r2_access_key_id": "AKIAEXAMPLE",
+        "r2_secret_access_key": "s3cr3t-example",
+        "r2_endpoint": "https://abc123.r2.cloudflarestorage.com",
+    }
+
+    def _observed(self, sha: str | None, *, nodes=("a",), rev: str = _REV) -> Observed:
+        base = _converged_observed(rev=rev, nodes=nodes)
+        return replace(base, local=replace(base.local, backup_env_sha=sha))
+
+    def _two_node_config(self) -> StackConfig:
+        return _config(
+            nodes={
+                "a": Node(name="a", role="primary", vps_id=_VPS_ID),
+                "b": Node(name="b", role="replica", vps_id=_VPS_ID),
+            }
+        )
+
+    def test_absent_r2_secrets_plan_no_step(self) -> None:
+        with Infra() as infra_dir:
+            local = local_facts(infra_dir, {"hostinger_token": "htok"})
+
+            self.assertIsNone(local.backup_env_sha)
+
+        actions = [s.action for s in plan(_config(), _converged_state(), self._observed(None))]
+
+        self.assertNotIn(Action.ENSURE_BACKUP_ENV, actions)
+
+    def test_an_incomplete_set_of_r2_secrets_plans_no_step_either(self) -> None:
+        """All three or none -- a half-filled credentials file would let the
+        unit start and fail every night."""
+        for missing in self._R2:
+            with self.subTest(missing=missing):
+                partial = {k: v for k, v in self._R2.items() if k != missing}
+                with Infra() as infra_dir:
+                    self.assertIsNone(local_facts(infra_dir, partial).backup_env_sha)
+
+    def test_all_three_present_with_no_recorded_sha_plans_the_step_for_every_node(self) -> None:
+        with Infra() as infra_dir:
+            sha = local_facts(infra_dir, self._R2).backup_env_sha
+
+        self.assertIsNotNone(sha)
+        steps = plan(
+            self._two_node_config(),
+            _converged_state(nodes=("a", "b")),
+            self._observed(sha, nodes=("a", "b")),
+        )
+
+        self.assertEqual(
+            steps,
+            [Step(Action.ENSURE_BACKUP_ENV, "a"), Step(Action.ENSURE_BACKUP_ENV, "b")],
+        )
+
+    def test_when_rebuild_is_also_needed_backup_env_comes_after_it(self) -> None:
+        actions = [
+            s.action
+            for s in plan(
+                _config(), _converged_state(rev="old-rev"), self._observed("newsha")
+            )
+        ]
+
+        self.assertEqual(
+            actions, [Action.PUSH_CONFIG, Action.REBUILD, Action.ENSURE_BACKUP_ENV]
+        )
+
+    def test_a_matching_recorded_sha_plans_nothing(self) -> None:
+        state = _converged_state()
+        state.nodes["a"].backup_env_sha = "samesha"
+
+        actions = [s.action for s in plan(_config(), state, self._observed("samesha"))]
+
+        self.assertNotIn(Action.ENSURE_BACKUP_ENV, actions)
+
+    def test_a_changed_endpoint_plans_the_step_again(self) -> None:
+        with Infra() as infra_dir:
+            first = local_facts(infra_dir, self._R2).backup_env_sha
+            rotated = local_facts(
+                infra_dir, {**self._R2, "r2_endpoint": "https://other.r2.cloudflarestorage.com"}
+            ).backup_env_sha
+
+        self.assertNotEqual(first, rotated)
+        state = _converged_state()
+        state.nodes["a"].backup_env_sha = first
+
+        actions = [s.action for s in plan(_config(), state, self._observed(rotated))]
+
+        self.assertEqual(actions, [Action.ENSURE_BACKUP_ENV])
+
+    def test_the_step_carries_no_content_so_plan_output_cannot_reveal_any(self) -> None:
+        step = Step(Action.ENSURE_BACKUP_ENV, "a")
+
+        self.assertEqual(step.description, "node a: updating the backup credentials on the server")
+        self.assertEqual(render_description(step, has_cloudflare_token=True), step.description)
+
+
 class CloudflareOptionalPlanTests(unittest.TestCase):
     """Task 7b change 1: no Cloudflare token in secrets -> no cert, no DNS."""
 
@@ -2065,6 +2165,145 @@ class EnsureAppEnvTests(unittest.TestCase):
             self.assertIsNone(ctx.state.nodes["a"].app_env_sha)
             self.assertFalse(
                 any(c["argv"][-1].startswith("systemctl") for c in ctx.runner.calls if c["argv"][0] == "ssh")
+            )
+
+
+class EnsureBackupEnvTests(unittest.TestCase):
+    """Task 5: pushing secrets.age's r2_* credentials to the node's
+    /var/lib/stackbase/backup.env, over the same ssh-stdin model
+    `_ensure_app_env` uses -- but root-only, and with nothing restarted."""
+
+    _SECRET_VALUE = "s3cr3t-example-long-value"
+    _SECRETS = {
+        "hostinger_token": "htok",
+        "cloudflare_token": "ctok",
+        "r2_access_key_id": "AKIAEXAMPLE",
+        "r2_secret_access_key": _SECRET_VALUE,
+        "r2_endpoint": "https://abc123.r2.cloudflarestorage.com",
+    }
+    _DIR_CMD = "set -eu; install -d -m 0750 /var/lib/stackbase"
+    _TMP_CMD = "set -eu; install -m 0600 -o root -g root /dev/null /var/lib/stackbase/backup.env.new"
+    _CAT_CMD = "set -eu; cat > /var/lib/stackbase/backup.env.new"
+    _MV_CMD = "set -eu; mv -f /var/lib/stackbase/backup.env.new /var/lib/stackbase/backup.env"
+
+    def _ctx(self, infra_dir: Path, *, runner: FakeRunner, secrets: dict[str, str] | None = None, state=None):
+        return _context(
+            infra_dir,
+            state=state
+            if state is not None
+            else StackState(nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)}),
+            secrets=dict(self._SECRETS if secrets is None else secrets),
+            runner=runner,
+        )
+
+    def _runner(self, *, failing: str | None = None) -> FakeRunner:
+        def handler(argv, kwargs):
+            if not argv or argv[0] != "ssh":
+                return None
+            cmd = argv[-1]
+            if cmd not in (self._DIR_CMD, self._TMP_CMD, self._CAT_CMD, self._MV_CMD):
+                return None
+            if cmd == failing:
+                return _cp(argv, returncode=1, stderr="no space left on device\n")
+            return _cp(argv, returncode=0)
+
+        return FakeRunner(handler=handler)
+
+    def test_the_temp_file_gets_its_final_owner_and_mode_before_any_content_is_written(self) -> None:
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(infra_dir, runner=self._runner())
+
+            apply([Step(Action.ENSURE_BACKUP_ENV, "a")], ctx, allow_purchase=False)
+
+            commands = [c["argv"][-1] for c in ctx.runner.calls if c["argv"][0] == "ssh"]
+            self.assertEqual(commands, [self._DIR_CMD, self._TMP_CMD, self._CAT_CMD, self._MV_CMD])
+            self.assertLess(commands.index(self._TMP_CMD), commands.index(self._CAT_CMD))
+
+    def test_content_travels_only_via_stdin_never_argv_never_a_local_file(self) -> None:
+        with Infra() as infra_dir:
+            before = {p for p in infra_dir.rglob("*") if p.is_file()}
+            ctx, _ = self._ctx(infra_dir, runner=self._runner())
+
+            apply([Step(Action.ENSURE_BACKUP_ENV, "a")], ctx, allow_purchase=False)
+
+            after = {p for p in infra_dir.rglob("*") if p.is_file()}
+            self.assertEqual({p.name for p in after - before}, {"stack.state.json"})
+            for path in after:
+                self.assertNotIn(self._SECRET_VALUE, path.read_text(encoding="utf-8", errors="replace"))
+
+            for call in ctx.runner.calls:
+                self.assertNotIn(self._SECRET_VALUE, " ".join(call["argv"]))
+                self.assertNotIn("RCLONE_CONFIG_BACKUP_SECRET_ACCESS_KEY", " ".join(call["argv"]))
+
+            cat_call = next(c for c in ctx.runner.calls if c["argv"][-1] == self._CAT_CMD)
+            self.assertEqual(
+                cat_call["kwargs"].get("input"),
+                "RCLONE_CONFIG_BACKUP_TYPE=s3\n"
+                "RCLONE_CONFIG_BACKUP_PROVIDER=Cloudflare\n"
+                "RCLONE_CONFIG_BACKUP_ACCESS_KEY_ID=AKIAEXAMPLE\n"
+                f"RCLONE_CONFIG_BACKUP_SECRET_ACCESS_KEY={self._SECRET_VALUE}\n"
+                "RCLONE_CONFIG_BACKUP_ENDPOINT=https://abc123.r2.cloudflarestorage.com\n",
+            )
+
+    def test_the_pushed_value_is_masked_out_of_every_printed_line(self) -> None:
+        with Infra() as infra_dir:
+            ctx, lines = self._ctx(infra_dir, runner=self._runner())
+
+            apply([Step(Action.ENSURE_BACKUP_ENV, "a")], ctx, allow_purchase=False)
+
+            self.assertTrue(any("backup credentials updated" in line for line in lines))
+            for line in lines:
+                self.assertNotIn(self._SECRET_VALUE, line)
+
+    def test_a_successful_push_records_the_content_digest(self) -> None:
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(infra_dir, runner=self._runner())
+
+            apply([Step(Action.ENSURE_BACKUP_ENV, "a")], ctx, allow_purchase=False)
+
+            from stackbase.backups import backup_env_content, backup_env_digest
+
+            expected = backup_env_digest(backup_env_content(self._SECRETS))
+            self.assertEqual(ctx.state.nodes["a"].backup_env_sha, expected)
+
+    def test_a_failing_mv_leaves_the_sha_unset_so_the_step_retries_next_run(self) -> None:
+        with Infra() as infra_dir:
+            from stackbase.config import load_state, save_state
+
+            state = StackState(nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)})
+            save_state(infra_dir, state)
+            ctx, _ = self._ctx(infra_dir, runner=self._runner(failing=self._MV_CMD), state=state)
+
+            with self.assertRaises(StackError):
+                apply([Step(Action.ENSURE_BACKUP_ENV, "a")], ctx, allow_purchase=False)
+
+            self.assertIsNone(ctx.state.nodes["a"].backup_env_sha)
+            self.assertIsNone(load_state(infra_dir).nodes["a"].backup_env_sha)
+
+    def test_incomplete_credentials_are_refused_before_any_ssh_call(self) -> None:
+        """`plan()` never emits this step without all three keys, so reaching
+        it with an incomplete set is a stack-base bug -- it must still not
+        open a connection or write a half-file."""
+        partial = {k: v for k, v in self._SECRETS.items() if k != "r2_endpoint"}
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(infra_dir, runner=FakeRunner(), secrets=partial)
+
+            with self.assertRaises(StackError):
+                apply([Step(Action.ENSURE_BACKUP_ENV, "a")], ctx, allow_purchase=False)
+
+            self.assertEqual(ctx.runner.calls, [])
+
+    def test_nothing_is_restarted_and_no_systemctl_is_ever_run(self) -> None:
+        """Unlike app.env, a new backup.env needs no restart: the unit reads
+        it when the timer next fires (or `backup-now` runs it)."""
+        with Infra() as infra_dir:
+            ctx, _ = self._ctx(infra_dir, runner=self._runner())
+
+            apply([Step(Action.ENSURE_BACKUP_ENV, "a")], ctx, allow_purchase=False)
+
+            self.assertFalse(
+                any("systemctl" in " ".join(c["argv"]) for c in ctx.runner.calls),
+                ctx.runner.argv_strings(),
             )
 
 

@@ -102,6 +102,7 @@ class Action(Enum):
     PUSH_CONFIG = "push_config"
     REBUILD = "rebuild"
     ENSURE_APP_ENV = "ensure_app_env"
+    ENSURE_BACKUP_ENV = "ensure_backup_env"
     UPSERT_DNS = "upsert_dns"
 
 
@@ -120,6 +121,7 @@ _DOING: dict[Action, str] = {
     Action.PUSH_CONFIG: "uploading the configuration and the origin certificate",
     Action.REBUILD: "rebuilding NixOS (this can take a few minutes)",
     Action.ENSURE_APP_ENV: "updating the application's environment file",
+    Action.ENSURE_BACKUP_ENV: "updating the backup credentials on the server",
     Action.UPSERT_DNS: "pointing the domain at the server in Cloudflare",
 }
 
@@ -190,6 +192,10 @@ class Local:
     # fails fast (one plain-English line, nothing echoed) on every `up`
     # invocation, `--plan` included, rather than surfacing later at push time.
     app_env_sha: str | None = None
+    # sha256 of the rendered backup.env (from secrets.age's r2_* keys), or
+    # None when the project has no R2 credentials. Compared against each
+    # node's recorded `NodeState.backup_env_sha` -- see `_needs_backup_env`.
+    backup_env_sha: str | None = None
 
 
 def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str | None = None) -> Local:
@@ -198,7 +204,13 @@ def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str 
     `desired_rev` is the fingerprint a node records once it has successfully
     rebuilt -- see `compute_rev`.
     """
+    # Deferred, not module-scope: stackbase/backups.py imports SSH_USER from
+    # this module, so importing it at the top would be a cycle -- the same
+    # trick `apply()` already uses for `stackbase.steps`.
+    from stackbase.backups import backup_env_content, backup_env_digest
+
     app_env_raw = secrets.get("app_env")
+    backup_env = backup_env_content(secrets)
     return Local(
         desired_rev=compute_rev(infra_dir, stackbase_src=stackbase_src),
         has_origin_cert=bool(secrets.get("origin_cert")) and bool(secrets.get("origin_key")),
@@ -206,6 +218,7 @@ def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str 
         captured_nodes=_captured_nodes(infra_dir / "nodes"),
         has_cloudflare_token=bool(secrets.get("cloudflare_token")),
         app_env_sha=app_env_digest(validate_app_env(app_env_raw)) if app_env_raw else None,
+        backup_env_sha=backup_env_digest(backup_env) if backup_env else None,
     )
 
 
@@ -931,6 +944,12 @@ def plan(cfg: StackConfig, state: StackState, observed: Observed) -> list[Step]:
         # None) plans nothing and removes nothing -- see `_needs_app_env`.
         if _needs_app_env(state, observed, name):
             steps.append(Step(Action.ENSURE_APP_ENV, name))
+        # Same placement and contract as ENSURE_APP_ENV: after REBUILD (the
+        # /var/lib/stackbase directory and the backup unit only exist once
+        # the node has rebuilt), and absent r2_* secrets plan nothing and
+        # remove nothing.
+        if _needs_backup_env(state, observed, name):
+            steps.append(Step(Action.ENSURE_BACKUP_ENV, name))
 
     if has_cloudflare and not _dns_converged(state, observed):
         steps.append(Step(Action.UPSERT_DNS, primary_node(cfg)))
@@ -1031,6 +1050,18 @@ def _needs_app_env(state: StackState, observed: Observed, name: str) -> bool:
         return False
     node_state = state.nodes.get(name) or NodeState()
     return node_state.app_env_sha != desired
+
+
+def _needs_backup_env(state: StackState, observed: Observed, name: str) -> bool:
+    """True when secrets.age has a complete set of R2 credentials whose sha
+    differs from what this node last had pushed. `backup_env_sha is None`
+    means no (or an incomplete) set of r2_* keys -- deliberately not a step,
+    and deliberately not a removal, exactly like `_needs_app_env`."""
+    desired = observed.local.backup_env_sha
+    if desired is None:
+        return False
+    node_state = state.nodes.get(name) or NodeState()
+    return node_state.backup_env_sha != desired
 
 
 def _dns_converged(state: StackState, observed: Observed) -> bool:

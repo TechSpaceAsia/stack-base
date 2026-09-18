@@ -7,6 +7,7 @@ from pathlib import Path
 
 from stackbase.config import (
     AppConfig,
+    BackupsConfig,
     CloudflareState,
     HostingerState,
     Node,
@@ -308,6 +309,112 @@ class LoadConfigTests(unittest.TestCase):
 
             self.assertIn("bogus", str(caught.exception))
 
+    def test_backups_table_is_absent_by_default(self) -> None:
+        with TempInfraDir() as infra_dir:
+            write_toml(infra_dir, VALID_TOML)
+            write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+            config = load_config(infra_dir)
+
+            self.assertEqual(config.backups, BackupsConfig())
+            self.assertIsNone(config.backups.bucket)
+            self.assertIsNone(config.backups.retention_days)
+            self.assertIsNone(config.backups.extra_paths)
+            self.assertIsNone(config.backups.on_calendar)
+
+    def test_backups_table_is_parsed(self) -> None:
+        with TempInfraDir() as infra_dir:
+            toml = VALID_TOML + (
+                "\n[backups]\n"
+                'bucket = "acme-backups"\n'
+                "retention_days = 14\n"
+                'extra_paths = ["/var/lib/acme/uploads"]\n'
+                'on_calendar = "04:30"\n'
+            )
+            write_toml(infra_dir, toml)
+            write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+            config = load_config(infra_dir)
+
+            self.assertEqual(
+                config.backups,
+                BackupsConfig(
+                    bucket="acme-backups",
+                    retention_days=14,
+                    extra_paths=["/var/lib/acme/uploads"],
+                    on_calendar="04:30",
+                ),
+            )
+
+    def test_backups_table_fields_are_all_optional(self) -> None:
+        """Naming a bucket is all it takes -- every other field keeps
+        nixos/backups.nix's own module-level default."""
+        with TempInfraDir() as infra_dir:
+            write_toml(infra_dir, VALID_TOML + '\n[backups]\nbucket = "acme-backups"\n')
+            write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+            config = load_config(infra_dir)
+
+            self.assertEqual(config.backups.bucket, "acme-backups")
+            self.assertIsNone(config.backups.retention_days)
+            self.assertIsNone(config.backups.extra_paths)
+            self.assertIsNone(config.backups.on_calendar)
+
+    def test_backups_table_rejects_unknown_keys(self) -> None:
+        with TempInfraDir() as infra_dir:
+            write_toml(infra_dir, VALID_TOML + '\n[backups]\nbucket = "b"\nbogus = "x"\n')
+            write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+            with self.assertRaises(StackError) as caught:
+                load_config(infra_dir)
+
+            self.assertIn("bogus", str(caught.exception))
+
+    def test_backups_bucket_rejects_shell_unsafe_and_empty_values(self) -> None:
+        """The bucket is interpolated into an rclone remote path in a root
+        shell on the node -- nothing with a space, a quote or a leading
+        dash gets that far."""
+        for bad in ('""', '"my bucket"', '"-flag"', '"a;rm -rf /"', '"a$(id)"'):
+            with self.subTest(bad=bad):
+                with TempInfraDir() as infra_dir:
+                    write_toml(infra_dir, VALID_TOML + f"\n[backups]\nbucket = {bad}\n")
+                    write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+                    with self.assertRaises(StackError):
+                        load_config(infra_dir)
+
+    def test_backups_retention_days_rejects_zero_and_out_of_range_values(self) -> None:
+        """0 would mean `rclone delete --min-age 0d` -- "everything,
+        including what was just written". It must never be expressible."""
+        for line in ("retention_days = 0", "retention_days = -1", "retention_days = 3651", "retention_days = true"):
+            with self.subTest(line=line):
+                with TempInfraDir() as infra_dir:
+                    write_toml(infra_dir, VALID_TOML + f'\n[backups]\nbucket = "b"\n{line}\n')
+                    write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+                    with self.assertRaises(StackError):
+                        load_config(infra_dir)
+
+    def test_backups_extra_paths_must_be_absolute_with_no_whitespace_or_quotes(self) -> None:
+        for bad in ('["relative/path"]', '["/a b"]', '["/a\'b"]', '["/a\\"b"]', "[1]", '"/not-a-list"'):
+            with self.subTest(bad=bad):
+                with TempInfraDir() as infra_dir:
+                    write_toml(infra_dir, VALID_TOML + f'\n[backups]\nbucket = "b"\nextra_paths = {bad}\n')
+                    write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+                    with self.assertRaises(StackError):
+                        load_config(infra_dir)
+
+    def test_backups_on_calendar_must_be_a_24_hour_time(self) -> None:
+        for bad in ("25:00", "3:00", "03:60", "daily", "03:00:00"):
+            with self.subTest(bad=bad):
+                with TempInfraDir() as infra_dir:
+                    write_toml(infra_dir, VALID_TOML + f'\n[backups]\nbucket = "b"\non_calendar = "{bad}"\n')
+                    write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+                    with self.assertRaises(StackError):
+                        load_config(infra_dir)
+
 
 class StateRoundTripTests(unittest.TestCase):
     def test_missing_state_file_is_empty_state(self) -> None:
@@ -332,6 +439,7 @@ class StateRoundTripTests(unittest.TestCase):
                     hardware_captured=True,
                     applied_rev="abc123",
                     app_env_sha="deadbeef" * 8,
+                    backup_env_sha="feedface" * 8,
                 ),
             },
             cloudflare=CloudflareState(zone_id="zone-1", record_id="record-1"),
@@ -412,6 +520,18 @@ class StateRoundTripTests(unittest.TestCase):
             state = load_state(infra_dir)
 
             self.assertIsNone(state.nodes["a"].app_env_sha)
+
+    def test_node_state_backup_env_sha_defaults_to_none_for_older_state_files(self) -> None:
+        """Same contract as app_env_sha above: a state file written before
+        backups existed must load, with None meaning "never pushed"."""
+        with TempInfraDir() as infra_dir:
+            (infra_dir / "stack.state.json").write_text(
+                json.dumps({"version": 1, "nodes": {"a": {"vps_id": 1}}}), encoding="utf-8"
+            )
+
+            state = load_state(infra_dir)
+
+            self.assertIsNone(state.nodes["a"].backup_env_sha)
 
     def test_load_state_rejects_unknown_node_key(self) -> None:
         with TempInfraDir() as infra_dir:

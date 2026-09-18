@@ -25,6 +25,7 @@ import subprocess
 from collections import deque
 from typing import Callable
 
+from stackbase.backups import backup_env_content, backup_env_digest
 from stackbase.errors import StackError
 from stackbase.reconcile import (
     PUSH_EXCLUDES,
@@ -804,6 +805,47 @@ def _restart_active_color(ctx: Context, ssh: Ssh, node: str, project: str) -> st
     return color
 
 
+# --------------------------------------------------------------------------
+# Backup credentials: push backup.env, root-only
+# --------------------------------------------------------------------------
+
+
+def _ensure_backup_env(ctx: Context, step: Step) -> str:
+    """Push the rclone credentials to /var/lib/stackbase/backup.env, 0600 root:root.
+
+    Same model as `_ensure_app_env`: the content travels over an ssh stdin
+    pipe only -- never a local file, never an argv -- into a temp name
+    created with its final owner/mode BEFORE any content is written, then
+    `mv -f`d into place. Root-only, unlike app.env: the app has no business
+    reading the bucket's credentials, and neither has `deploy`.
+
+    Nothing is restarted: the backup unit reads this file when the timer
+    next fires (or when `./infra/up backup-now` runs it).
+    """
+    node = _node(step)
+    content = backup_env_content(ctx.secrets)
+    if not content:
+        raise StackError(
+            "infra/secrets.age has no complete set of R2 credentials to push",
+            "this is a bug in stack-base -- please report it",
+        )
+
+    ssh = ctx.ssh(node)
+    tmp_path = _cert_path("backup.env.new")
+    final_path = _cert_path("backup.env")
+    ssh.run(f"set -eu; install -d -m 0750 {shlex.quote(REMOTE_CERT_DIR)}")
+    ssh.run(f"set -eu; install -m 0600 -o root -g root /dev/null {tmp_path}")
+    ssh.run(f"set -eu; cat > {tmp_path}", input=content)
+    ssh.run(f"set -eu; mv -f {tmp_path} {final_path}")
+
+    # Recorded only after the final `mv -f` has succeeded: a failure any
+    # earlier leaves state untouched, so the next `up` replans the step
+    # rather than calling a node with no (or half-written) credentials
+    # converged.
+    ctx.node_state(node).backup_env_sha = backup_env_digest(content)
+    return f"node {node}: backup credentials updated"
+
+
 def _tail_hint(tail: list[str], advice: str) -> str:
     text = "\n".join(tail).strip()
     return f"{text}\n{advice}" if text else advice
@@ -853,5 +895,6 @@ _EXECUTORS: dict[Action, Callable[[Context, Step], str]] = {
     Action.PUSH_CONFIG: _push_config,
     Action.REBUILD: _rebuild,
     Action.ENSURE_APP_ENV: _ensure_app_env,
+    Action.ENSURE_BACKUP_ENV: _ensure_backup_env,
     Action.UPSERT_DNS: _upsert_dns,
 }

@@ -53,6 +53,13 @@ _VALID_ROLES = frozenset({"primary", "replica"})
 # app.healthTries/app.healthSleep option types (1..300 / 1..60).
 _APP_BINARY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
+# The [backups] table. `bucket` is an R2/S3 bucket name (or, in the VM
+# test, a local directory) -- conservative on purpose: it is interpolated
+# into an rclone remote path on the node. `on_calendar` is a 24h HH:MM,
+# expanded to "*-*-* HH:MM:00" by the module.
+_BUCKET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{1,127}$")
+_ON_CALENDAR_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+
 
 # --------------------------------------------------------------------------
 # stack.toml -> StackConfig
@@ -83,6 +90,21 @@ class AppConfig:
 
 
 @dataclass(frozen=True)
+class BackupsConfig:
+    """The optional `[backups]` table -- overrides for nixos/backups.nix's
+    own `stackbase.backups.*` defaults. Every field is `None` when the
+    project never set it, so an unset field keeps the module's default.
+    No bucket at all means backups are off (the module's `enable` defaults
+    to "a bucket is set").
+    """
+
+    bucket: str | None = None
+    retention_days: int | None = None
+    extra_paths: list[str] | None = None
+    on_calendar: str | None = None
+
+
+@dataclass(frozen=True)
 class StackConfig:
     project: str
     domain: str
@@ -95,6 +117,7 @@ class StackConfig:
     nodes: dict[str, Node]
     admin_keys: dict[str, str]
     app: AppConfig = field(default_factory=AppConfig)
+    backups: BackupsConfig = field(default_factory=BackupsConfig)
 
 
 def load_config(infra_dir: Path) -> StackConfig:
@@ -142,6 +165,7 @@ def load_config(infra_dir: Path) -> StackConfig:
     nodes = _parse_nodes(data, toml_path)
     admin_keys = _load_admin_keys(admins, infra_dir)
     app = _parse_app(data, toml_path)
+    backups = _parse_backups(data, toml_path)
 
     return StackConfig(
         project=project,
@@ -155,6 +179,7 @@ def load_config(infra_dir: Path) -> StackConfig:
         nodes=nodes,
         admin_keys=admin_keys,
         app=app,
+        backups=backups,
     )
 
 
@@ -300,17 +325,79 @@ def _parse_app(data: dict[str, Any], toml_path: Path) -> AppConfig:
     return AppConfig(binary=binary, health_path=health_path, health_tries=health_tries, health_sleep=health_sleep)
 
 
-def _optional_ranged_int(data: dict[str, Any], key: str, low: int, high: int, toml_path: Path) -> int | None:
+def _optional_ranged_int(
+    data: dict[str, Any], key: str, low: int, high: int, toml_path: Path, *, table: str = "app"
+) -> int | None:
+    """One optional, range-checked integer out of `[<table>]`.
+
+    `table` only names the table in the message -- it defaults to "app"
+    because that is where this started, and `[backups]` passes its own so
+    an operator reading `[backups].retention_days must be...` is not sent
+    looking at the wrong section.
+    """
     value = data.get(key)
     if value is None:
         return None
     # bool is a subclass of int in Python -- same trap as vps_id above.
     if isinstance(value, bool) or not isinstance(value, int) or not (low <= value <= high):
         raise StackError(
-            f"{toml_path} has an invalid [app].{key} {value!r}",
-            f"[app].{key} must be an integer between {low} and {high}",
+            f"{toml_path} has an invalid [{table}].{key} {value!r}",
+            f"[{table}].{key} must be an integer between {low} and {high}",
         )
     return value
+
+
+def _parse_backups(data: dict[str, Any], toml_path: Path) -> BackupsConfig:
+    raw = data.get("backups")
+    if raw is None:
+        return BackupsConfig()
+    if not isinstance(raw, dict):
+        raise StackError(
+            f"{toml_path} has an invalid '[backups]' table",
+            '[backups] must be a table, e.g. [backups]\\nbucket = "acme-backups"',
+        )
+    _reject_unknown_keys(raw, BackupsConfig, f"{toml_path} [backups]")
+
+    bucket = raw.get("bucket")
+    if bucket is not None and (not isinstance(bucket, str) or not _BUCKET_RE.match(bucket)):
+        raise StackError(
+            f"{toml_path} has an invalid [backups].bucket {bucket!r}",
+            "bucket must match ^[A-Za-z0-9][A-Za-z0-9._/-]{1,127}$ -- the R2 bucket's name",
+        )
+
+    # 1 at the bottom, deliberately: the node deletes with `rclone delete
+    # --min-age <retention_days>d`, and a retention of 0 would mean "every
+    # object, including the one just written". 3650 (ten years) at the top
+    # is an obvious-typo guard, not a policy.
+    retention_days = _optional_ranged_int(raw, "retention_days", 1, 3650, toml_path, table="backups")
+
+    extra_paths = raw.get("extra_paths")
+    if extra_paths is not None:
+        if not isinstance(extra_paths, list) or not all(isinstance(item, str) for item in extra_paths):
+            raise StackError(
+                f"{toml_path} has an invalid [backups].extra_paths",
+                'extra_paths must be a list of absolute paths, e.g. ["/var/lib/acme/uploads"]',
+            )
+        for item in extra_paths:
+            # Interpolated into a root shell command on the node. The
+            # module quotes it too; this is the first of those two layers.
+            if not item.startswith("/") or any(ch.isspace() for ch in item) or '"' in item or "'" in item:
+                raise StackError(
+                    f"{toml_path} has an invalid [backups].extra_paths entry {item!r}",
+                    "each entry must be an absolute path with no whitespace or quotes",
+                )
+        extra_paths = list(extra_paths)
+
+    on_calendar = raw.get("on_calendar")
+    if on_calendar is not None and (not isinstance(on_calendar, str) or not _ON_CALENDAR_RE.match(on_calendar)):
+        raise StackError(
+            f"{toml_path} has an invalid [backups].on_calendar {on_calendar!r}",
+            'on_calendar must be a 24-hour UTC time like "03:00"',
+        )
+
+    return BackupsConfig(
+        bucket=bucket, retention_days=retention_days, extra_paths=extra_paths, on_calendar=on_calendar
+    )
 
 
 def _load_admin_keys(admins: list[str], infra_dir: Path) -> dict[str, str]:
@@ -362,6 +449,9 @@ class NodeState:
     # sha256 of the app_env content (from secrets.age) most recently pushed
     # to this node's /var/lib/stackbase/app.env. None until the first push.
     app_env_sha: str | None = None
+    # sha256 of the backup.env content (from secrets.age's r2_* keys) most
+    # recently pushed to this node. None until the first push.
+    backup_env_sha: str | None = None
 
 
 @dataclass

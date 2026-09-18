@@ -19,6 +19,9 @@
         self.nixosModules.appHost
         self.nixosModules.postgres
         self.nixosModules.deploy
+        # Every server gets the module; `enable` defaults to false until a
+        # bucket is named in stack.toml's [backups] table.
+        self.nixosModules.backups
       ];
     in
     {
@@ -27,6 +30,7 @@
       nixosModules.postgres = import ./nixos/postgres.nix;
       nixosModules.hostinger = import ./nixos/providers/hostinger.nix;
       nixosModules.deploy = import ./nixos/deploy.nix;
+      nixosModules.backups = import ./nixos/backups.nix;
       nixosModules.default = { imports = baseModules; };
 
       # `provider` selects the module that reproduces one hosting provider's

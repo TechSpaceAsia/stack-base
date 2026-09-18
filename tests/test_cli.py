@@ -961,6 +961,50 @@ class DeployKeyCLIWiringTests(unittest.TestCase):
             show_mock.assert_called_once()
 
 
+class BackupNowCLIWiringTests(unittest.TestCase):
+    """`backup-now` reaches `backups.run_backup_now` with the node filter and
+    a masking emit -- never the restricted `deploy` door (decision 9)."""
+
+    def test_it_forwards_the_infra_dir_and_no_node_by_default(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            with mock.patch("stackbase.__main__.run_backup_now") as run_mock:
+                main(["--infra-dir", str(infra_dir), "backup-now"])
+
+            self.assertEqual(run_mock.call_args.args[0], infra_dir)
+            self.assertIsNone(run_mock.call_args.kwargs["node"])
+            self.assertTrue(callable(run_mock.call_args.kwargs["emit"]))
+
+    def test_node_is_forwarded(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            with mock.patch("stackbase.__main__.run_backup_now") as run_mock:
+                main(["--infra-dir", str(infra_dir), "backup-now", "--node", "b"])
+
+            self.assertEqual(run_mock.call_args.kwargs["node"], "b")
+
+    def test_a_failure_is_one_line_and_exit_1(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            stderr = io.StringIO()
+            with (
+                mock.patch(
+                    "stackbase.__main__.run_backup_now",
+                    side_effect=StackError("this project has no backup bucket", "add a [backups] section"),
+                ),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as caught,
+            ):
+                main(["--infra-dir", str(infra_dir), "backup-now"])
+
+            self.assertEqual(caught.exception.code, 1)
+            self.assertEqual(len(stderr.getvalue().strip().splitlines()), 1)
+            self.assertIn("no backup bucket", stderr.getvalue())
+
+
 class AllowDirtyTests(unittest.TestCase):
     def test_up_checks_the_working_tree_by_default(self) -> None:
         with TemporaryDirectory() as tmp:

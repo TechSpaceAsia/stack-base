@@ -514,6 +514,67 @@ secrets inside `app_env` itself, so keep at least one long, random value in
 there (the session secret already is one) rather than only short,
 guessable values.
 
+## Backups
+
+Every server backs itself up nightly, off-box and encrypted, as soon as you
+name a bucket:
+
+```toml
+# infra/stack.toml
+[backups]
+bucket = "acme-backups"
+retention_days = 30
+extra_paths = ["/var/lib/acme/uploads"]
+```
+
+```bash
+R2_ACCESS_KEY_ID=<paste here>
+R2_SECRET_ACCESS_KEY=<paste here>
+R2_ENDPOINT=<paste here, e.g. https://<account>.r2.cloudflarestorage.com>
+printf '%s' "$R2_ACCESS_KEY_ID"     | ./infra/up secrets set r2_access_key_id
+printf '%s' "$R2_SECRET_ACCESS_KEY" | ./infra/up secrets set r2_secret_access_key
+printf '%s' "$R2_ENDPOINT"          | ./infra/up secrets set r2_endpoint
+./infra/up
+```
+
+All three credentials or none: with an incomplete set, `./infra/up` pushes
+nothing and the nightly job stays off, rather than failing quietly at 03:00
+every night.
+
+What happens at 03:00 UTC on each node:
+
+| | |
+|---|---|
+| database | `pg_dump` → `zstd` → `age` → `backup:<bucket>/db/<project>_<stamp>.sql.zst.age` |
+| each `extra_paths` entry | `tar` → `zstd` → `age` → `backup:<bucket>/files/<basename>_<stamp>.tar.zst.age` |
+| then | anything older than `retention_days` is deleted from those two prefixes |
+
+`retention_days` defaults to 30 and `on_calendar` to `"03:00"` (UTC). The
+deletion only ever runs against `<bucket>/db/` and `<bucket>/files/` — never
+the bucket root, and never with a retention of 0.
+
+Nothing is ever written to the node's disk in the clear, and **no key that
+can decrypt a backup exists on the server**: the recipients are your own
+`infra/age-recipients.txt`, so restoring needs an age identity that only
+your team holds. The R2 credentials live in `secrets.age` and are pushed to
+`/var/lib/stackbase/backup.env` (root-only, 0600) — never into the Nix
+store, which is world-readable.
+
+```bash
+./infra/up backup-now            # run it now on every node, then list the bucket
+./infra/up backup-now --node a
+```
+
+Each node backs up **its own** database (see "What a replica is TODAY"), so
+a two-node project produces two independent sets of objects.
+
+To restore, fetch an object with any rclone/S3 client and reverse the
+pipeline on a machine that holds one of the recipient identities:
+
+```bash
+age -d -i ~/.config/age/keys.txt backup.sql.zst.age | zstd -d | psql acme
+```
+
 ## When it fails
 
 Every failure is one line: what went wrong, then what to check.
@@ -543,6 +604,8 @@ Every failure is one line: what went wrong, then what to check.
 | `this server's default binary name` (during `deploy`) | Your crate's binary name doesn't match `<project>` with `-` → `_`. Add `[app] binary = "..."` to `stack.toml` (the message gives the exact value) and run `./infra/up` before deploying again |
 | Cargo.toml declares several `[[bin]]` entries and stack.toml has no `[app].binary` | Ambiguous — add `[app] binary = "..."` to `stack.toml`, choosing one of the listed candidates |
 | `infra/ has uncommitted changes that would be pushed` | Commit them, or re-run with `--allow-dirty` if you are deliberately testing |
+| `the backup unit failed on node a` | `./infra/up ssh a -- journalctl -u stackbase-backup -n 50` — the usual causes are wrong R2 credentials or a bucket that does not exist |
+| `this project has no backup bucket` | Add `[backups] bucket = "..."` to `stack.toml` and run `./infra/up` |
 
 A failed run changes nothing further and can always simply be run again: it
 picks up exactly where it stopped.

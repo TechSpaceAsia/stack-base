@@ -83,6 +83,17 @@
         // (if appConfig ? health_tries then { healthTries = appConfig.health_tries; } else { })
         // (if appConfig ? health_sleep then { healthSleep = appConfig.health_sleep; } else { });
 
+      # The optional [backups] table in stack.toml -> nixos/backups.nix's
+      # stackbase.backups.* options. Naming a bucket is all it takes to
+      # turn nightly backups on; every other field keeps the module's own
+      # default when stack.toml does not set it.
+      backupsConfig = stack.backups or { };
+      backupsOptions =
+        (if backupsConfig ? bucket then { bucket = backupsConfig.bucket; } else { })
+        // (if backupsConfig ? retention_days then { retentionDays = backupsConfig.retention_days; } else { })
+        // (if backupsConfig ? extra_paths then { extraPaths = backupsConfig.extra_paths; } else { })
+        // (if backupsConfig ? on_calendar then { onCalendar = backupsConfig.on_calendar; } else { });
+
       nodeConfig = name:
         let
           extra = ./nodes + "/${name}/extra.nix";
@@ -97,6 +108,7 @@
               stackbase.admins = admins;
               stackbase.deploy.keys = deployKeys;
               stackbase.app = appOptions;
+              stackbase.backups = backupsOptions;
             }
           ]
           # Project-wide modules: every infra/conf.d/*.nix lands on EVERY

@@ -23,6 +23,7 @@ import traceback
 from pathlib import Path
 from typing import Callable
 
+from stackbase.backups import run_backup_now
 from stackbase.ci import ci_setup
 from stackbase.cloudflare import CloudflareClient
 from stackbase.config import load_config, load_state
@@ -90,6 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--node", help="restrict to one node")
     status.add_argument("--debug", action="store_true", help="print the full traceback on failure")
 
+    backup_now_p = commands.add_parser("backup-now", help="run the backup on every node now and list the bucket")
+    backup_now_p.add_argument("--node", help="restrict to one node")
+    backup_now_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
+
     ci_setup_p = commands.add_parser(
         "ci-setup", help="provision an optional GitHub Actions deploy key for this project"
     )
@@ -155,6 +160,8 @@ def main(argv: list[str] | None = None) -> None:
             _rollback(args, infra_dir, secrets)
         elif args.command == "status":
             _status(args, infra_dir, secrets)
+        elif args.command == "backup-now":
+            _backup_now(args, infra_dir, secrets)
         elif args.command == "ci-setup":
             _ci_setup(args, infra_dir, secrets)
         elif args.command == "deploy-key":
@@ -388,6 +395,18 @@ def _status(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) 
         emit=_emit_masked(secrets),
         register_secret=_secret_register_counter(secrets),
     )
+
+
+def _backup_now(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+    """Run the node's backup unit now, then list what landed in the bucket.
+
+    `secrets` is empty here -- nothing is decrypted for this command, which
+    only starts a unit as root -- but the emit still goes through
+    `_emit_masked` rather than `_emit_plain`: the streamed output is the
+    node's own, and the masking path should not depend on today's happening
+    to have nothing to mask.
+    """
+    run_backup_now(infra_dir, node=args.node, emit=_emit_masked(secrets))
 
 
 def _secret_register_counter(secrets: dict[str, str]) -> Callable[[str], None]:

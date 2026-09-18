@@ -68,3 +68,15 @@ role = "primary"
 # health_path = "/health"
 # health_tries = 30
 # health_sleep = 2
+
+# Optional. Nightly off-box backups: the project's database, plus any
+# directories listed here, encrypted to infra/age-recipients.txt and
+# uploaded to Cloudflare R2. Naming a bucket is what turns them on; the
+# credentials live in secrets.age as r2_access_key_id,
+# r2_secret_access_key and r2_endpoint. retention_days defaults to 30 and
+# on_calendar to "03:00" (UTC).
+# [backups]
+# bucket = "acme-backups"
+# retention_days = 30
+# extra_paths = ["/var/lib/acme/uploads"]
+# on_calendar = "03:00"
