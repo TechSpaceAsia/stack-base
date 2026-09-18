@@ -359,11 +359,28 @@ def _parse_backups(data: dict[str, Any], toml_path: Path) -> BackupsConfig:
     _reject_unknown_keys(raw, BackupsConfig, f"{toml_path} [backups]")
 
     bucket = raw.get("bucket")
-    if bucket is not None and (not isinstance(bucket, str) or not _BUCKET_RE.match(bucket)):
-        raise StackError(
-            f"{toml_path} has an invalid [backups].bucket {bucket!r}",
-            "bucket must match ^[A-Za-z0-9][A-Za-z0-9._/-]{1,127}$ -- the R2 bucket's name",
-        )
+    if bucket is not None:
+        if not isinstance(bucket, str) or not _BUCKET_RE.match(bucket):
+            raise StackError(
+                f"{toml_path} has an invalid [backups].bucket {bucket!r}",
+                "bucket must match ^[A-Za-z0-9][A-Za-z0-9._/-]{1,127}$ -- the R2 bucket's name",
+            )
+        # `.` and `/` are allowed, because a bucket may legitimately carry a
+        # prefix ("acme-backups/prod") -- which lets ".." through the regex
+        # above. Against a real S3 bucket that is inert (keys are literal
+        # strings, not paths), but the rclone remote is configured entirely
+        # from backup.env, and with RCLONE_CONFIG_BACKUP_TYPE=local -- how
+        # the VM test exercises the whole pipeline -- a ".." segment walks
+        # OUT of the remote's root, taking `rclone delete --min-age` with it.
+        # An empty or "." segment is not traversal, but it is never what
+        # anyone meant either, so the whole shape is refused in one place.
+        if any(segment in ("", ".", "..") for segment in bucket.split("/")):
+            raise StackError(
+                f"{toml_path} has an invalid [backups].bucket {bucket!r}",
+                'a bucket may carry a prefix ("acme-backups/prod") but no empty, "." or ".." '
+                'path segment -- ".." would let the nightly prune delete outside the project\'s '
+                "own prefix",
+            )
 
     # 1 at the bottom, deliberately: the node deletes with `rclone delete
     # --min-age <retention_days>d`, and a retention of 0 would mean "every

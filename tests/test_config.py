@@ -37,6 +37,12 @@ role = "replica"
 
 VALID_ED25519_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBoguskeydataherefortesting matt@example.com\n"
 
+# A bucket line that is itself valid, for the [backups] tests that are about
+# some OTHER field. Deliberately not a one-character name: `_BUCKET_RE`
+# requires at least two, so a short placeholder would make those tests pass
+# because the BUCKET was rejected, never reaching the field under test.
+_VALID_BUCKET = 'bucket = "acme-backups"'
+
 
 class TempInfraDir:
     """Context manager for a scratch infra/ directory with a stack.toml and keys/."""
@@ -362,7 +368,7 @@ class LoadConfigTests(unittest.TestCase):
 
     def test_backups_table_rejects_unknown_keys(self) -> None:
         with TempInfraDir() as infra_dir:
-            write_toml(infra_dir, VALID_TOML + '\n[backups]\nbucket = "b"\nbogus = "x"\n')
+            write_toml(infra_dir, VALID_TOML + f'\n[backups]\n{_VALID_BUCKET}\nbogus = "x"\n')
             write_key(infra_dir, "matt", VALID_ED25519_KEY)
 
             with self.assertRaises(StackError) as caught:
@@ -383,37 +389,77 @@ class LoadConfigTests(unittest.TestCase):
                     with self.assertRaises(StackError):
                         load_config(infra_dir)
 
+    def test_backups_bucket_rejects_a_dot_dot_path_segment(self) -> None:
+        """Fix round 1, finding 3: the regex allows '.' and '/' so a bucket
+        may carry a prefix -- which let '..' through. Against a real S3
+        bucket keys are literal, but Task 6's VM subtest runs the same code
+        with RCLONE_CONFIG_BACKUP_TYPE=local, where '..' escapes the remote's
+        root and `rclone delete --min-age` follows it out."""
+        for bad in ("a/../..", "../evil", "acme-backups/..", "a/./b", "a//b", "acme-backups/"):
+            with self.subTest(bad=bad):
+                with TempInfraDir() as infra_dir:
+                    write_toml(infra_dir, VALID_TOML + f'\n[backups]\nbucket = "{bad}"\n')
+                    write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+                    with self.assertRaises(StackError) as caught:
+                        load_config(infra_dir)
+
+                    self.assertIn("bucket", str(caught.exception))
+
+    def test_backups_bucket_still_allows_a_plain_name_and_a_prefix(self) -> None:
+        """The traversal guard must not cost a project its legitimate
+        `<bucket>/<prefix>` layout."""
+        for good in ("acme-backups", "acme-backups/prod", "acme.backups", "acme_backups-2"):
+            with self.subTest(good=good):
+                with TempInfraDir() as infra_dir:
+                    write_toml(infra_dir, VALID_TOML + f'\n[backups]\nbucket = "{good}"\n')
+                    write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+                    self.assertEqual(load_config(infra_dir).backups.bucket, good)
+
     def test_backups_retention_days_rejects_zero_and_out_of_range_values(self) -> None:
         """0 would mean `rclone delete --min-age 0d` -- "everything,
         including what was just written". It must never be expressible."""
         for line in ("retention_days = 0", "retention_days = -1", "retention_days = 3651", "retention_days = true"):
             with self.subTest(line=line):
                 with TempInfraDir() as infra_dir:
-                    write_toml(infra_dir, VALID_TOML + f'\n[backups]\nbucket = "b"\n{line}\n')
+                    write_toml(infra_dir, VALID_TOML + f"\n[backups]\n{_VALID_BUCKET}\n{line}\n")
                     write_key(infra_dir, "matt", VALID_ED25519_KEY)
 
-                    with self.assertRaises(StackError):
+                    with self.assertRaises(StackError) as caught:
                         load_config(infra_dir)
+
+                    # Named explicitly so this cannot pass because the
+                    # BUCKET was rejected first and retention never looked at.
+                    self.assertIn("retention_days", str(caught.exception))
 
     def test_backups_extra_paths_must_be_absolute_with_no_whitespace_or_quotes(self) -> None:
         for bad in ('["relative/path"]', '["/a b"]', '["/a\'b"]', '["/a\\"b"]', "[1]", '"/not-a-list"'):
             with self.subTest(bad=bad):
                 with TempInfraDir() as infra_dir:
-                    write_toml(infra_dir, VALID_TOML + f'\n[backups]\nbucket = "b"\nextra_paths = {bad}\n')
+                    write_toml(
+                        infra_dir, VALID_TOML + f"\n[backups]\n{_VALID_BUCKET}\nextra_paths = {bad}\n"
+                    )
                     write_key(infra_dir, "matt", VALID_ED25519_KEY)
 
-                    with self.assertRaises(StackError):
+                    with self.assertRaises(StackError) as caught:
                         load_config(infra_dir)
+
+                    self.assertIn("extra_paths", str(caught.exception))
 
     def test_backups_on_calendar_must_be_a_24_hour_time(self) -> None:
         for bad in ("25:00", "3:00", "03:60", "daily", "03:00:00"):
             with self.subTest(bad=bad):
                 with TempInfraDir() as infra_dir:
-                    write_toml(infra_dir, VALID_TOML + f'\n[backups]\nbucket = "b"\non_calendar = "{bad}"\n')
+                    write_toml(
+                        infra_dir, VALID_TOML + f'\n[backups]\n{_VALID_BUCKET}\non_calendar = "{bad}"\n'
+                    )
                     write_key(infra_dir, "matt", VALID_ED25519_KEY)
 
-                    with self.assertRaises(StackError):
+                    with self.assertRaises(StackError) as caught:
                         load_config(infra_dir)
+
+                    self.assertIn("on_calendar", str(caught.exception))
 
 
 class StateRoundTripTests(unittest.TestCase):

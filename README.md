@@ -575,6 +575,23 @@ pipeline on a machine that holds one of the recipient identities:
 age -d -i ~/.config/age/keys.txt backup.sql.zst.age | zstd -d | psql acme
 ```
 
+**A bucket listing is not a success report.** Each object is streamed
+straight to the bucket as it is produced, so a run that dies part-way
+through — the database goes away mid-dump, the node runs out of network —
+leaves a **short, still-encrypted object** behind that looks exactly like a
+good one in a listing. Two things follow:
+
+- **The unit is the source of truth, not the bucket.** A broken pipe fails
+  the whole run loudly (`systemctl status stackbase-backup`, or `./infra/up
+  ssh a -- journalctl -u stackbase-backup -n 50`), and the pruning step
+  never runs on a failed run — so a bad night can never delete good
+  backups. If you monitor one thing, monitor that unit.
+- **A truncated object fails to restore; it does not restore badly.** The
+  `age`/`zstd` pipeline above stops with a decompression error on a short
+  object rather than handing `psql` half a database — so a restore that
+  starts is a restore you can trust. Restore the previous timestamp if one
+  fails.
+
 ## When it fails
 
 Every failure is one line: what went wrong, then what to check.

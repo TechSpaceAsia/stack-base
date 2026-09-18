@@ -20,6 +20,7 @@ unit is not one of that door's six words, and never should be.
 from __future__ import annotations
 
 import hashlib
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Callable
@@ -46,6 +47,33 @@ _R2_KEYS: tuple[tuple[str, str], ...] = (
     ("r2_endpoint", "RCLONE_CONFIG_BACKUP_ENDPOINT"),
 )
 
+# What a credential VALUE is allowed to contain. An allowlist, not a list of
+# banned metacharacters: the file is read two ways on the node, and only one
+# of them is a parser.
+#
+#   - the unit reads it with systemd's `EnvironmentFile`, which does no
+#     substitution at all -- safe either way;
+#   - `stackbase-backup-ls` (the `./infra/up backup-now` path) has to get the
+#     same variables into its own environment, and any shell-level way of
+#     doing that (`source`, `. file`, `eval`) evaluates the line. A value of
+#     `a$(id)`, `a;id` or `` a`id` `` would then RUN as root.
+#
+# nixos/backups.nix now parses the file without a shell (see its
+# `stackbase-backup-ls`), so this is the second of two layers rather than the
+# only one -- but a guard that depends on a shell script elsewhere staying
+# written a particular way is not a guard. Banning a handful of characters
+# would also be a game of whack-a-mole (`$`, backtick, quote, backslash,
+# `;`, `&`, `|`, `<`, `>`, `(`, `)`, `#`, glob characters, ...); an allowlist
+# is finite and auditable.
+#
+# The set is what a real S3/R2 credential is actually made of: an access key
+# id and secret are base64/hex (`+`, `/`, `=` appear in AWS-style secrets),
+# and the endpoint is an https URL. None of them ever contains whitespace or
+# a shell metacharacter.
+_VALUE_RE = re.compile(r"^[A-Za-z0-9._:/+=@-]+$")
+
+_VALUE_SHAPE = "letters, digits and any of . _ : / + = @ -"
+
 
 def backup_env_content(secrets: dict[str, str]) -> str | None:
     """Render `/var/lib/stackbase/backup.env`, or `None` if R2 isn't configured.
@@ -54,20 +82,34 @@ def backup_env_content(secrets: dict[str, str]) -> str | None:
     unit start and fail every night. Absent, no step is planned and nothing
     on the node is removed -- same contract as `app_env`.
 
-    A newline in any value would smuggle an extra `KEY=value` line into a
-    root-owned EnvironmentFile, so it is refused -- naming the KEY, never
-    any part of the value (the global "secrets are never echoed" rule).
+    Every value is held to `_VALUE_RE`. A line break would smuggle an extra
+    `KEY=value` line into a root-owned EnvironmentFile; anything else outside
+    the allowlist (whitespace, `$`, a backtick, a quote, a backslash, `;`,
+    ...) would be re-interpreted by any shell that ever evaluated the file.
+    Both are refused, naming the KEY and the allowed SHAPE -- never any part
+    of the value (the global "secrets are never echoed" rule).
     """
     values = []
     for key, _variable in _R2_KEYS:
         value = secrets.get(key)
         if not value:
             return None
+        # Kept as its own message: a line break is the one case whose
+        # consequence is injection into the FILE (a second KEY=value line
+        # that systemd itself would honour), not just into a shell.
         if "\n" in value or "\r" in value:
             raise StackError(
-                f"infra/secrets.age's '{key}' contains a newline",
-                f"R2 credentials must be single-line values -- fix it with "
-                f"`./infra/up secrets set {key}` and run `up` again",
+                f"infra/secrets.age's '{key}' contains a line break",
+                f"R2 credentials are single-line values -- re-issue it and set it with "
+                f"`./infra/up secrets set {key}`, then run `up` again",
+            )
+        if not _VALUE_RE.match(value):
+            raise StackError(
+                f"infra/secrets.age's '{key}' contains whitespace or a character a shell "
+                "would reinterpret",
+                f"an R2 access key, secret and endpoint contain only {_VALUE_SHAPE} -- this "
+                f"one does not, so re-issue it in the Cloudflare dashboard and set it with "
+                f"`./infra/up secrets set {key}`, then run `up` again",
             )
         values.append(value)
 

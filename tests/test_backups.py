@@ -88,6 +88,77 @@ class BackupEnvContentTests(unittest.TestCase):
         self.assertIn("r2_access_key_id", message)
         self.assertNotIn("EVIL", message)
 
+    def test_a_value_a_shell_would_reinterpret_is_refused(self) -> None:
+        """Fix round 1, finding 1: the credentials file is read by systemd's
+        EnvironmentFile parser (which substitutes nothing) AND has to reach
+        `stackbase-backup-ls`'s environment on the node. Anything a shell
+        would evaluate -- command substitution, a backtick, a separator, a
+        quote, a backslash -- must never be written into it in the first
+        place. One case per rejected class."""
+        cases = {
+            "command substitution": "AKIA$(id)",
+            "parameter expansion": "AKIA${HOME}",
+            "backtick": "AKIA`id`",
+            "command separator": "AKIA;id",
+            "background/and": "AKIA&id",
+            "pipe": "AKIA|id",
+            "redirect": "AKIA>/etc/shadow",
+            "space": "AKIA EVIL",
+            "tab": "AKIA\tEVIL",
+            "single quote": "AKIA'x'",
+            "double quote": 'AKIA"x"',
+            "backslash": "AKIA\\x",
+            "glob": "AKIA*",
+            "comment": "AKIA#x",
+        }
+        for label, value in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaises(StackError) as ctx:
+                    backup_env_content({**_FULL_SECRETS, "r2_access_key_id": value})
+
+                message = str(ctx.exception)
+                self.assertIn("r2_access_key_id", message)
+                # The KEY and the allowed SHAPE -- never the value itself.
+                self.assertNotIn(value, message)
+
+    def test_every_r2_key_is_checked_not_just_the_first(self) -> None:
+        for key in _FULL_SECRETS:
+            with self.subTest(key=key):
+                with self.assertRaises(StackError) as ctx:
+                    backup_env_content({**_FULL_SECRETS, key: "value$(id)"})
+
+                self.assertIn(key, str(ctx.exception))
+
+    def test_a_realistic_credential_set_still_passes(self) -> None:
+        """The guard must not cost an operator a legitimate credential: an
+        AWS-style base64 secret (with `+`, `/` and a trailing `=`), a hex
+        key id, and an endpoint URL carrying a port and a path."""
+        realistic = {
+            "r2_access_key_id": "0123456789abcdef0123456789abcdef",
+            "r2_secret_access_key": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY=",
+            "r2_endpoint": "https://abc123.r2.cloudflarestorage.com:443/acme",
+        }
+
+        content = backup_env_content(realistic)
+
+        self.assertIn(
+            "RCLONE_CONFIG_BACKUP_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY=\n", content
+        )
+        self.assertIn(
+            "RCLONE_CONFIG_BACKUP_ENDPOINT=https://abc123.r2.cloudflarestorage.com:443/acme\n", content
+        )
+
+    def test_every_rendered_line_is_exactly_one_key_equals_value(self) -> None:
+        """The point of both guards above: whatever the credentials are, the
+        file can only ever be the five lines this function writes, and no
+        line can carry whitespace a shell would split on."""
+        content = backup_env_content(_FULL_SECRETS)
+
+        lines = content.splitlines()
+        self.assertEqual(len(lines), 5)
+        for line in lines:
+            self.assertRegex(line, r"^RCLONE_CONFIG_BACKUP_[A-Z_]+=\S*$")
+
     def test_the_digest_is_stable_and_content_addressed(self) -> None:
         content = backup_env_content(_FULL_SECRETS)
         self.assertEqual(backup_env_digest(content), backup_env_digest(content))
@@ -99,7 +170,14 @@ class BackupEnvContentTests(unittest.TestCase):
     def test_the_env_path_is_root_only_stackbase_state(self) -> None:
         """Pinned here because nixos/backups.nix hard-codes the same path in
         its EnvironmentFile -- the two must never drift apart."""
+        from stackbase.reconcile import REMOTE_CERT_DIR
+
         self.assertEqual(BACKUP_ENV_PATH, "/var/lib/stackbase/backup.env")
+        # steps._ensure_backup_env builds the path from REMOTE_CERT_DIR
+        # rather than from this constant, so tie the two together here --
+        # otherwise the pin above could stay green while the step wrote
+        # somewhere else entirely.
+        self.assertEqual(BACKUP_ENV_PATH, f"{REMOTE_CERT_DIR}/backup.env")
 
 
 class RunBackupNowTests(unittest.TestCase):

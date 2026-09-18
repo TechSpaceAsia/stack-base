@@ -111,6 +111,16 @@ let
   # Listing the bucket needs the same credentials the unit gets from its
   # EnvironmentFile -- `./infra/up backup-now` runs this as root right
   # after the unit, so an operator sees what actually landed.
+  #
+  # The credentials are READ, never SOURCED. `source`/`.` is full shell
+  # evaluation of every line, so a value containing `$(...)`, a backtick or
+  # a `;` would EXECUTE as root -- and unlike the unit above, which gets the
+  # same file through systemd's `EnvironmentFile` (a parser that does no
+  # substitution at all), this is a shell. `read -r` plus
+  # `export "name=value"` sets each variable from data without ever
+  # re-evaluating it. stackbase/backups.py also refuses to WRITE a value
+  # containing anything a shell would reinterpret; this is the second of
+  # those two layers, so neither one alone is what holds the line.
   backupLsScript = pkgs.writeShellApplication {
     name = "stackbase-backup-ls";
     runtimeInputs = [ pkgs.coreutils pkgs.rclone ];
@@ -119,10 +129,29 @@ let
         echo "stackbase-backup-ls: no credentials in ${backupEnvFile}" >&2
         exit 1
       fi
-      set -a
-      # shellcheck source=/dev/null
-      source ${backupEnvFile}
-      set +a
+
+      # Split on the FIRST '=' with parameter expansion, NOT with
+      # `IFS='=' read -r name value`: that form silently drops a TRAILING
+      # '=', and an AWS-style base64 secret routinely ends in one (verified
+      # -- the secret came back one character short). `IFS=` on the read
+      # keeps leading/trailing whitespace out of the value's way too.
+      while IFS= read -r line || [ -n "$line" ]; do
+        name=''${line%%=*}
+        value=''${line#*=}
+        case "$name" in
+          # Only this file's own rclone settings are ever exported: a stray
+          # line could not set PATH, LD_PRELOAD or anything else that would
+          # change what runs below.
+          RCLONE_CONFIG_BACKUP_*) export "''${name}=''${value}" ;;
+          *) ;;
+        esac
+      done < ${backupEnvFile}
+
+      if [ -z "''${RCLONE_CONFIG_BACKUP_TYPE:-}" ]; then
+        echo "stackbase-backup-ls: ${backupEnvFile} has no rclone settings in it" >&2
+        exit 1
+      fi
+
       rclone lsl ${lib.escapeShellArg "backup:${backups.bucket}"}
     '';
   };
