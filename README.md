@@ -244,7 +244,15 @@ git push origin v1.2.3
 3. Your `ssh-agent`, with a warning that no project key was found.
 
 The decrypted key never touches a real disk, and `./infra/up deploy` deletes
-it the moment the command ends (including on Ctrl-C).
+it the moment the command ends (including on Ctrl-C). Step 3 is only for a
+project that has no deploy key at all: once `infra/deploy.age` exists, a
+machine that cannot decrypt it is refused rather than quietly falling back to
+your agent. If you hold no age identity, step 1 is your way in:
+
+```bash
+STACKBASE_SSH_IDENTITY=<path to your SSH private key>
+./infra/up deploy v1.2.3
+```
 
 `deploy` builds a clean, deterministic release from that tag (a fresh `git
 worktree`, never your working tree — the same build a GitHub Actions

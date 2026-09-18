@@ -53,7 +53,13 @@ from typing import Any, Callable, Iterator
 from stackbase.config import StackConfig, StackState, load_config, load_state
 from stackbase.errors import StackError
 from stackbase.ramdir import private_ram_dir
-from stackbase.secrets import DEPLOY_FILE, DEPLOY_KEY_NAME, load_secrets, register_private_key
+from stackbase.secrets import (
+    DEPLOY_FILE,
+    DEPLOY_KEY_NAME,
+    _identity_path,
+    load_secrets,
+    register_private_key,
+)
 from stackbase.ssh import Ssh
 
 # vMAJOR.MINOR.PATCH exactly -- no leading zeros, no pre-release/build
@@ -632,7 +638,9 @@ def deploy_identity(
     Unlike everything else in this module, path 2 needs an age identity.
     That is deliberate (it is what lets a build host deploy with a key that
     unlocks nothing else); a teammate who only holds an SSH key still
-    deploys via path 1 or 3.
+    deploys via path 1 or 3. Path 3 is for a project with NO deploy key --
+    once `deploy.age` exists, an operator who cannot decrypt it is refused
+    rather than silently dropped back onto their ssh-agent.
     """
     if os.environ.get(_SSH_IDENTITY_ENV):
         yield
@@ -643,6 +651,33 @@ def deploy_identity(
         emit(_NO_PROJECT_KEY_WARNING)
         yield
         return
+
+    # A project that HAS a deploy key, on a machine that cannot decrypt it, is
+    # a misconfiguration (the archetypal case: a build host whose file identity
+    # is missing or wrong) -- it must fail loudly rather than quietly deploying
+    # with whatever an ssh-agent happens to hold. `load_secrets` would say so
+    # already, but in age's own terms ("age identity ... not found"), which
+    # tells an operator halfway through a deploy neither what this has to do
+    # with deploying nor that there is a way out that decrypts nothing.
+    #
+    # The check is done HERE rather than by catching `load_secrets`' StackError
+    # and matching on its text: its other failures (a corrupt deploy.age, a
+    # non-JSON payload, a decrypt against the wrong-but-present identity) are
+    # genuinely different problems and must keep their own precise messages.
+    # `_identity_path` is imported rather than re-derived so this pre-check can
+    # never disagree with the resolution `load_secrets` itself performs.
+    identity_path = _identity_path()
+    if not identity_path.exists():
+        raise StackError(
+            f"this project has a deploy key ({deploy_path}) but this machine cannot decrypt it",
+            f"the age identity {identity_path} does not exist -- either point "
+            "$STACKBASE_AGE_IDENTITY at an identity listed in "
+            f"infra/{DEPLOY_FILE.recipients_name}, or deploy without decrypting anything by "
+            "pointing $STACKBASE_SSH_IDENTITY at an SSH private key whose public half is in "
+            "stackbase.deploy.keys:\n"
+            "STACKBASE_SSH_IDENTITY=<path to your SSH private key>\n"
+            "./infra/up deploy <version>",
+        )
 
     private_key = load_secrets(infra_dir, file=DEPLOY_FILE).get(DEPLOY_KEY_NAME)
     if not private_key:

@@ -1476,6 +1476,61 @@ class DeployIdentityTests(unittest.TestCase):
 
             self.assertIn(_TEST_PRIVATE_KEY, registered)
 
+    def test_a_missing_age_identity_is_explained_in_deploys_own_terms(self) -> None:
+        """A project WITH a deploy key, on a machine that cannot decrypt it, is
+        a misconfiguration and is refused loudly -- but the refusal must name
+        both ways out, not just say "age identity not found".
+        """
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            (infra_dir / "deploy.age").write_bytes(b"encrypted-to-someone-else")
+
+            env = {key: value for key, value in os.environ.items() if key != "STACKBASE_SSH_IDENTITY"}
+            env["STACKBASE_AGE_IDENTITY"] = str(Path(tmp) / "no-such-identity.txt")
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(StackError) as ctx:
+                    with deploy_identity(infra_dir, emit=lambda _line: None):
+                        self.fail("the guarded block must never run without an identity")
+
+            text = f"{ctx.exception.message} {ctx.exception.hint}"
+            self.assertIn("deploy.age", text)
+            self.assertIn("STACKBASE_AGE_IDENTITY", text)
+            self.assertIn("STACKBASE_SSH_IDENTITY", text)
+            # Not the bare age wording load_secrets would have produced.
+            self.assertNotIn("age identity", ctx.exception.message)
+
+    @unittest.skipUnless(_AGE_AVAILABLE, "age / age-keygen not installed")
+    def test_a_wrong_but_existing_identity_still_reports_a_decrypt_failure(self) -> None:
+        """The missing-identity check must not swallow `load_secrets`' other
+        failures: decrypting with the WRONG identity is a different problem and
+        keeps its own message.
+        """
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            owner_dir = Path(tmp) / "owner"
+            owner_dir.mkdir()
+            stranger_dir = Path(tmp) / "stranger"
+            stranger_dir.mkdir()
+            owner_identity, owner_public_key = _generate_age_identity(owner_dir)
+            stranger_identity, _stranger_public_key = _generate_age_identity(stranger_dir)
+            (infra_dir / "deploy-recipients.txt").write_text(owner_public_key + "\n", encoding="utf-8")
+
+            env = {key: value for key, value in os.environ.items() if key != "STACKBASE_SSH_IDENTITY"}
+            env["STACKBASE_AGE_IDENTITY"] = str(owner_identity)
+            with mock.patch.dict(os.environ, env, clear=True):
+                save_secrets(infra_dir, {DEPLOY_KEY_NAME: _TEST_PRIVATE_KEY}, file=DEPLOY_FILE)
+
+            env["STACKBASE_AGE_IDENTITY"] = str(stranger_identity)
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(StackError) as ctx:
+                    with deploy_identity(infra_dir, emit=lambda _line: None):
+                        self.fail("the guarded block must never run when the key cannot be decrypted")
+
+            self.assertIn("failed to decrypt", ctx.exception.message)
+            self.assertNotIn("STACKBASE_SSH_IDENTITY", f"{ctx.exception.message} {ctx.exception.hint}")
+
 
 class DeployIdentityIsUsedByTheCommandsTests(unittest.TestCase):
     def test_run_status_opens_the_identity_around_the_ssh_calls(self) -> None:
