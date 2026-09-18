@@ -797,6 +797,22 @@ class TemplateUpUnlockedResolutionTests(unittest.TestCase):
     def _ls_remote_result(self, stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
 
+    def test_a_ref_that_looks_like_a_git_flag_never_reaches_git(self) -> None:
+        # flake.nix is project-controlled, but nothing parsed out of it may
+        # become a git option: a ref of `--upload-pack=...` would otherwise
+        # run an arbitrary command. The parser refuses the shape outright.
+        module = self._load_module()
+        with TemporaryDirectory() as tmp:
+            for url in (
+                "github:ExampleOrg/example-stack/--upload-pack=touch${IFS}x",
+                "github:-ExampleOrg/example-stack/v0.1.0",
+                "github:ExampleOrg/example-stack/v0.1.0;id",
+            ):
+                flake_path = self._write_flake(tmp, url)
+                with mock.patch.object(module.subprocess, "run") as run_mock:
+                    self.assertIsNone(module.unlocked_stack_base(flake_path), url)
+                run_mock.assert_not_called()
+
     def test_prefers_the_peeled_annotated_tag_object(self) -> None:
         module = self._load_module()
         with TemporaryDirectory() as tmp:
@@ -817,6 +833,7 @@ class TemplateUpUnlockedResolutionTests(unittest.TestCase):
                 [
                     "git",
                     "ls-remote",
+                    "--",
                     "https://github.com/ExampleOrg/example-stack.git",
                     "v0.1.0",
                     "refs/tags/v0.1.0",
@@ -854,7 +871,7 @@ class TemplateUpUnlockedResolutionTests(unittest.TestCase):
             self.assertEqual(
                 result, ("https://github.com/ExampleOrg/example-stack.git", "d" * 40)
             )
-            self.assertEqual(run_mock.call_args[0][0][3], "HEAD")
+            self.assertEqual(run_mock.call_args[0][0][4], "HEAD")
 
     def test_a_failed_ls_remote_returns_none_so_the_caller_can_fall_back(self) -> None:
         module = self._load_module()
@@ -1131,10 +1148,12 @@ class TemplateFilesTests(unittest.TestCase):
                     f"{path} must be committable, but .gitignore's '{pattern}' hides it",
                 )
 
-    def test_the_version_is_the_one_being_released(self) -> None:
+    def test_the_version_is_a_plain_semver_release(self) -> None:
+        # The tag is `v` + this string; the template flake below must pin the
+        # same release. Pre-release suffixes would break both.
         import stackbase
 
-        self.assertEqual(stackbase.__version__, "0.1.0")
+        self.assertRegex(stackbase.__version__, r"^\d+\.\d+\.\d+$")
 
     def test_the_template_flake_pins_the_release_being_shipped(self) -> None:
         """`templates/infra/flake.nix`'s stack-base input must carry a

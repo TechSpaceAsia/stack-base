@@ -83,8 +83,13 @@ def locked_stack_base(lock_path: Path) -> tuple[str, str]:
 # the optional `/REF` group (which may itself contain slashes, e.g. a
 # branch like `refs/heads/foo`) gets first refusal on everything after the
 # first slash.
+# owner and repo are GitHub names; ref is a tag or branch. Every group is
+# limited to name characters and may not start with `-`, so nothing parsed
+# out of flake.nix can ever reach git as a flag (`--upload-pack=...`).
 _STACKBASE_INPUT_RE = re.compile(
-    r'inputs\.stack-base\.url\s*=\s*"github:([^/"]+)/([^/"]+?)(?:/([^"]+))?"'
+    r'inputs\.stack-base\.url\s*=\s*"github:'
+    r'([A-Za-z0-9_][A-Za-z0-9._-]*)/([A-Za-z0-9_][A-Za-z0-9._-]*?)'
+    r'(?:/([A-Za-z0-9_][A-Za-z0-9._/-]*))?"'
 )
 
 
@@ -96,7 +101,7 @@ def _resolve_ref_to_rev(url: str, ref: str) -> str | None:
     "commit a flake.lock" error rather than surfacing a confusing git error.
     """
     result = subprocess.run(
-        ["git", "ls-remote", url, ref, f"refs/tags/{ref}", f"refs/heads/{ref}"],
+        ["git", "ls-remote", "--", url, ref, f"refs/tags/{ref}", f"refs/heads/{ref}"],
         capture_output=True,
         text=True,
         check=False,
