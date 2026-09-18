@@ -23,6 +23,20 @@ let
   certDir = "/var/lib/stackbase";
   keyFile = "${certDir}/origin.key";
   certFile = "${certDir}/origin.crt";
+
+  # A throwaway age identity, generated at BUILD time (a plain derivation --
+  # `nix flake check` already realizes derivations referenced from module
+  # config, so this needs no special IFD flag). Its PRIVATE half is in the
+  # world-readable Nix store, which is exactly what makes it a test-only
+  # identity: it proves a backup can be decrypted, and protects nothing.
+  testAgeIdentity = pkgs.runCommand "stackbase-test-age-identity" { nativeBuildInputs = [ pkgs.age ]; } ''
+    mkdir -p "$out"
+    age-keygen -o "$out/key.txt" 2>/dev/null
+    grep '^# public key: ' "$out/key.txt" | cut -d' ' -f4 > "$out/recipients.txt"
+  '';
+
+  backupBucket = "/var/backup-target";
+  uploadsDir = "/var/lib/teststack-uploads";
 in
 pkgs.testers.runNixOSTest {
   name = "stackbase-vm";
@@ -35,7 +49,12 @@ pkgs.testers.runNixOSTest {
           self.nixosModules.base
           self.nixosModules.appHost
           self.nixosModules.postgres
-        ];
+          self.nixosModules.backups
+        ]
+        # The SAME filter a project's infra/flake.nix calls for
+        # infra/conf.d/ -- tested here on a booted machine rather than only
+        # at eval time (tests/test_template.py covers the eval side).
+        ++ (self.lib.confdModules ./fixtures/confd);
 
         stackbase.project = "teststack";
         stackbase.domain = domain;
@@ -49,7 +68,17 @@ pkgs.testers.runNixOSTest {
           "${nodes.proxy.networking.primaryIPAddress}/32"
         ];
 
-        environment.systemPackages = [ pkgs.iproute2 ];
+        stackbase.backups.bucket = backupBucket;
+        stackbase.backups.recipientsFile = "/etc/stackbase-test/recipients.txt";
+        stackbase.backups.extraPaths = [ uploadsDir ];
+        # The timer must exist and be scheduled, but must never actually
+        # fire during the test -- every backup here is started explicitly.
+        stackbase.backups.onCalendar = "23:59";
+
+        environment.etc."stackbase-test/recipients.txt".source = "${testAgeIdentity}/recipients.txt";
+        environment.etc."stackbase-test/identity.txt".source = "${testAgeIdentity}/key.txt";
+
+        environment.systemPackages = [ pkgs.iproute2 pkgs.age pkgs.zstd pkgs.gnutar pkgs.rclone ];
 
         system.stateVersion = "26.05";
       };
@@ -157,5 +186,86 @@ pkgs.testers.runNixOSTest {
           assert cert_owner == "root:nginx 644", f"expected origin.crt to be root:nginx 644, got {cert_owner!r}"
 
           node.succeed("systemctl is-active nginx")
+
+      with subtest("infra/conf.d modules are imported on the node"):
+          marker = node.succeed("cat /etc/stackbase-confd-marker").strip()
+          assert marker == "hello from conf.d", f"unexpected conf.d marker: {marker!r}"
+          # The fixture directory also holds a notes.txt -- proof the filter
+          # takes *.nix only, since a non-module file would have failed the
+          # build, not just this assertion.
+
+      with subtest("the backup timer is scheduled"):
+          # Deliberately no assertion that it has NOT fired: a `Persistent`
+          # timer's behaviour on a machine with no timestamp file is not
+          # something this test should pin down. It cannot have produced
+          # anything either way -- there are no credentials on the node yet,
+          # so a spontaneous run would have exited 1 with the "no
+          # credentials" message.
+          node.succeed("systemctl is-active stackbase-backup.timer")
+          timers = node.succeed("systemctl list-timers --all --no-pager stackbase-backup.timer")
+          assert "stackbase-backup.timer" in timers, timers
+
+      with subtest("a backup run encrypts a real dump that decrypts to valid SQL"):
+          # RCLONE_CONFIG_BACKUP_TYPE=local turns `backup:<bucket>` into a
+          # plain directory path -- the whole pipeline (pg_dump | zstd | age
+          # | rclone rcat) runs exactly as it does against R2.
+          node.succeed("install -d -m 0755 ${uploadsDir}")
+          node.succeed("echo hello-uploads > ${uploadsDir}/note.txt")
+          node.succeed("install -m 0600 /dev/null /var/lib/stackbase/backup.env")
+          node.succeed(
+              "printf 'RCLONE_CONFIG_BACKUP_TYPE=local\\n' > /var/lib/stackbase/backup.env"
+          )
+          node.succeed(
+              "sudo -u postgres psql -d teststack -c "
+              "'create table backup_probe (id int primary key, note text)'"
+          )
+          node.succeed(
+              "sudo -u postgres psql -d teststack -c "
+              "\"insert into backup_probe values (1, 'probe-row')\""
+          )
+
+          node.succeed("systemctl start stackbase-backup.service")
+
+          dump = node.succeed("ls ${backupBucket}/db/*.sql.zst.age").strip().splitlines()[0]
+          assert dump.split("/")[-1].startswith("teststack_"), f"unexpected dump name: {dump!r}"
+
+          plain = node.succeed(
+              f"age -d -i /etc/stackbase-test/identity.txt {dump} | zstd -d"
+          )
+          assert "CREATE TABLE public.backup_probe" in plain, plain[:400]
+          assert "probe-row" in plain, plain[:400]
+
+      with subtest("an extra path is archived as its own encrypted tarball"):
+          archive = node.succeed("ls ${backupBucket}/files/*.tar.zst.age").strip().splitlines()[0]
+          assert archive.split("/")[-1].startswith("teststack-uploads_"), archive
+
+          listing = node.succeed(
+              f"age -d -i /etc/stackbase-test/identity.txt {archive} | zstd -d | tar -tf -"
+          )
+          assert "./note.txt" in listing, listing
+
+      with subtest("a backup with no credentials fails loudly instead of silently doing nothing"):
+          node.succeed("mv /var/lib/stackbase/backup.env /var/lib/stackbase/backup.env.away")
+          node.fail("systemctl start stackbase-backup.service")
+          # NOT named `log` -- the test script's own namespace already
+          # binds `log: AbstractLogger` (the driver's structured logger),
+          # and the VM check's Pyright-style type check on testScriptWithTypes
+          # refuses to build if a local reassigns it to a plain str.
+          unit_log = node.succeed("journalctl -u stackbase-backup -n 20 --no-pager")
+          assert "no credentials" in unit_log, unit_log[-400:]
+          node.succeed("mv /var/lib/stackbase/backup.env.away /var/lib/stackbase/backup.env")
+
+      with subtest("a backup with no recipients file refuses rather than writing something undecryptable"):
+          # /etc entries are symlinks into the store -- remove the link, and
+          # put it back by hand afterwards (the store path is stable).
+          node.succeed("rm -f /etc/stackbase-test/recipients.txt")
+          node.fail("systemctl start stackbase-backup.service")
+          unit_log = node.succeed("journalctl -u stackbase-backup -n 20 --no-pager")
+          assert "nobody could decrypt" in unit_log, unit_log[-400:]
+
+      with subtest("stackbase-backup-ls prints what landed in the bucket"):
+          node.succeed("ln -sf ${testAgeIdentity}/recipients.txt /etc/stackbase-test/recipients.txt")
+          listing = node.succeed("stackbase-backup-ls")
+          assert "db/teststack_" in listing, listing
     '';
 }
