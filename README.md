@@ -154,6 +154,31 @@ side effect of saving. Rotate the tokens too, since they have seen them.
 ./infra/up ssh a -- systemctl status nginx
 ```
 
+**Project-wide NixOS settings.** Anything every server should have goes in
+`infra/conf.d/<whatever>.nix` — one file or many, all of them imported on
+every node:
+
+```nix
+# infra/conf.d/monitoring.nix
+{ pkgs, ... }:
+{
+  environment.systemPackages = [ pkgs.htop ];
+}
+```
+
+`infra/nodes/<name>/extra.nix` stays what it always was: settings for **one**
+server. A `conf.d` file and an `extra.nix` that both set the same option
+conflict, the same way any two NixOS modules would — use `lib.mkForce` in
+`extra.nix` to win.
+
+**`up` pushes your working tree, not your last commit.** If `infra/` has an
+uncommitted or untracked `*.nix` file or a modified `stack.toml`, `./infra/up`
+stops and names them: a server built from something nobody else has would be
+silently reverted by the next teammate's run. Commit, or pass `--allow-dirty`
+when you are deliberately trying something out. The files stack-base writes
+itself (`stack.state.json`, `known_hosts`, `flake.lock`, `nodes/*/hardware-configuration.nix`,
+`keys/*.pub`, `*.age`) never trigger it.
+
 **Buying a server.** stack-base will never spend money by accident. It needs
 all of: `price_item` filled in, the `--allow-purchase` flag, a real terminal,
 and you typing the exact phrase it asks for:
@@ -517,6 +542,7 @@ Every failure is one line: what went wrong, then what to check.
 | Too many authentication failures / connection refused right after a deploy attempt | Your `ssh-agent` is probably offering more keys than the node's `MaxAuthTries` allows before the right one is tried, and fail2ban has banned you. Set `STACKBASE_SSH_IDENTITY=~/.ssh/id_ed25519` (or add an `IdentitiesOnly yes` `Host` block to `~/.ssh/config`) so only your real key is offered. To recover from an existing ban: wait 10 minutes, or unban yourself from hPanel's browser console with `fail2ban-client set sshd unbanip <your-ip>` |
 | `this server's default binary name` (during `deploy`) | Your crate's binary name doesn't match `<project>` with `-` → `_`. Add `[app] binary = "..."` to `stack.toml` (the message gives the exact value) and run `./infra/up` before deploying again |
 | Cargo.toml declares several `[[bin]]` entries and stack.toml has no `[app].binary` | Ambiguous — add `[app] binary = "..."` to `stack.toml`, choosing one of the listed candidates |
+| `infra/ has uncommitted changes that would be pushed` | Commit them, or re-run with `--allow-dirty` if you are deliberately testing |
 
 A failed run changes nothing further and can always simply be run again: it
 picks up exactly where it stopped.
@@ -637,6 +663,7 @@ config and used directly, so edits to stack-base take effect on the next run.
 | `known_hosts` | The servers' SSH fingerprints. Commit |
 | `nodes/<name>/` | Each server's own disk and boot settings, copied off the machine. Commit |
 | `nodes/<name>/extra.nix` | Optional, yours: anything specific to one server |
+| `conf.d/*.nix` | Optional, yours: NixOS settings applied to every server |
 | `flake.nix`, `flake.lock` | Which version of stack-base this project uses. Commit |
 
 `stack.state.json` contains the servers' real IPs — if this repository is

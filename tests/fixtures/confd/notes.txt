@@ -1,0 +1,1 @@
+Not a .nix file. conf.d must ignore it.

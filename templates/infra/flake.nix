@@ -19,6 +19,10 @@
 #     defaults and can override any of them -- set the mismatched
 #     boot.loader.*/networking.* option(s) there if the first rebuild fails
 #     with a boot.loader or fileSystems error (see the README).
+#   - ./conf.d/*.nix -- OPTIONAL, project-wide. Every .nix file in that
+#     directory is imported on EVERY node. Use it for anything the whole
+#     project needs (an extra package, a monitoring agent, a sysctl); use
+#     ./nodes/<name>/extra.nix for anything specific to one server.
 #
 # Only stack.toml is read here. stack.state.json records what stack-base has
 # observed and done (IP addresses, record ids, fingerprints), but none of that
@@ -94,7 +98,14 @@
               stackbase.deploy.keys = deployKeys;
               stackbase.app = appOptions;
             }
-          ] ++ (if builtins.pathExists extra then [ extra ] else [ ]);
+          ]
+          # Project-wide modules: every infra/conf.d/*.nix lands on EVERY
+          # node. Listed before the node's own extra.nix so list-valued
+          # options concatenate project-wide-first; overriding a value set
+          # here from extra.nix takes lib.mkForce, exactly as it would
+          # between any two modules.
+          ++ (stack-base.lib.confdModules ./conf.d)
+          ++ (if builtins.pathExists extra then [ extra ] else [ ]);
         };
     in
     {

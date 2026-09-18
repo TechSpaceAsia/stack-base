@@ -300,8 +300,18 @@ class ConvergedStackTests(unittest.TestCase):
             # A missing cloudflare-ips.nix skips that check silently (Finding
             # i) -- keeps this test's "nothing to do" output exact regardless
             # of what the real snapshot file currently contains.
-            with mock.patch(
-                "stackbase.reconcile._cloudflare_ips_path", return_value=Path(tmp) / "no-such-file.nix"
+            #
+            # check_infra_clean is mocked out here too: this test's infra_dir
+            # is a bare TemporaryDirectory, not a git checkout, so the real
+            # guard would print its "not inside a git repository" warning
+            # line and break the exact "nothing to do" assertion below --
+            # that guard is covered on its own in CheckInfraCleanTests and
+            # AllowDirtyTests, not here.
+            with (
+                mock.patch(
+                    "stackbase.reconcile._cloudflare_ips_path", return_value=Path(tmp) / "no-such-file.nix"
+                ),
+                mock.patch("stackbase.__main__.check_infra_clean"),
             ):
                 with _cli(server, identity) as (ssh_class, execute):
                     with contextlib.redirect_stdout(stdout):
@@ -949,6 +959,65 @@ class DeployKeyCLIWiringTests(unittest.TestCase):
                 main(["--infra-dir", str(infra_dir), "deploy-key", "show-pub"])
 
             show_mock.assert_called_once()
+
+
+class AllowDirtyTests(unittest.TestCase):
+    def test_up_checks_the_working_tree_by_default(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            with (
+                mock.patch("stackbase.__main__.check_infra_clean") as check_mock,
+                mock.patch("stackbase.__main__.load_config"),
+                mock.patch("stackbase.__main__.load_state"),
+                mock.patch("stackbase.__main__.check_recipients_superset"),
+                mock.patch("stackbase.__main__.load_secrets", return_value={"hostinger_token": "t"}),
+                mock.patch("stackbase.__main__.observe"),
+                mock.patch("stackbase.__main__.plan", return_value=[]),
+                mock.patch("stackbase.__main__.local_facts"),
+                mock.patch("stackbase.__main__.HostingerClient"),
+            ):
+                main(["--infra-dir", str(infra_dir), "up"])
+
+            check_mock.assert_called_once()
+
+    def test_allow_dirty_skips_the_check(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            with (
+                mock.patch("stackbase.__main__.check_infra_clean") as check_mock,
+                mock.patch("stackbase.__main__.load_config"),
+                mock.patch("stackbase.__main__.load_state"),
+                mock.patch("stackbase.__main__.check_recipients_superset"),
+                mock.patch("stackbase.__main__.load_secrets", return_value={"hostinger_token": "t"}),
+                mock.patch("stackbase.__main__.observe"),
+                mock.patch("stackbase.__main__.plan", return_value=[]),
+                mock.patch("stackbase.__main__.local_facts"),
+                mock.patch("stackbase.__main__.HostingerClient"),
+            ):
+                main(["--infra-dir", str(infra_dir), "up", "--allow-dirty"])
+
+            check_mock.assert_not_called()
+
+    def test_plan_never_checks_the_working_tree(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            infra_dir.mkdir()
+            with (
+                mock.patch("stackbase.__main__.check_infra_clean") as check_mock,
+                mock.patch("stackbase.__main__.load_config"),
+                mock.patch("stackbase.__main__.load_state"),
+                mock.patch("stackbase.__main__.check_recipients_superset"),
+                mock.patch("stackbase.__main__.load_secrets", return_value={"hostinger_token": "t"}),
+                mock.patch("stackbase.__main__.observe"),
+                mock.patch("stackbase.__main__.plan", return_value=[]),
+                mock.patch("stackbase.__main__.local_facts"),
+                mock.patch("stackbase.__main__.HostingerClient"),
+            ):
+                main(["--infra-dir", str(infra_dir), "up", "--plan"])
+
+            check_mock.assert_not_called()
 
 
 if __name__ == "__main__":

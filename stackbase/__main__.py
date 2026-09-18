@@ -33,6 +33,7 @@ from stackbase.reconcile import (
     Context,
     Step,
     apply,
+    check_infra_clean,
     local_facts,
     observe,
     plan,
@@ -62,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     up = commands.add_parser("up", help="make the servers match infra/stack.toml")
     up.add_argument("--plan", action="store_true", help="show what would happen, change nothing")
     up.add_argument("--allow-purchase", action="store_true", help="allow buying a server (still asks you to confirm)")
+    up.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="push infra/ even with uncommitted *.nix or stack.toml changes",
+    )
     up.add_argument("--debug", action="store_true", help="print the full traceback on failure")
 
     shell = commands.add_parser("ssh", help="open a shell on a node (or run one command there)")
@@ -230,8 +236,20 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> N
     # Before anything reaches the network: a deploy-recipients.txt that has
     # drifted behind age-recipients.txt means an admin who can read every
     # project secret can no longer decrypt the deploy key -- caught here,
-    # once, rather than at their next failed deploy.
+    # once, rather than at their next failed deploy. This one runs
+    # unconditionally (even under --plan) because it is a correctness check
+    # on the secrets setup itself, not on what would be pushed.
     check_recipients_superset(infra_dir)
+    # `--plan` changes nothing, so it never has to be clean. Otherwise:
+    # what gets pushed is the working tree, so refuse to push one nobody
+    # has committed unless the operator says so explicitly. Placed second
+    # (after the recipients check, before secrets are even loaded): both
+    # are cheap, local, no-network checks, so ordering doesn't affect
+    # speed -- but this one is about what `up` is about to DO (push a
+    # tree), so it reads naturally as the second half of "is it safe to
+    # proceed" right before secrets.update() commits to actually running.
+    if not args.plan and not args.allow_dirty:
+        check_infra_clean(infra_dir)
     secrets.update(load_secrets(infra_dir))
 
     hostinger = HostingerClient(_token(secrets, "hostinger_token", "Hostinger"))

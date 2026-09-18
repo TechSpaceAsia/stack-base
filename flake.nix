@@ -51,6 +51,25 @@
           ] ++ modules;
         };
 
+      # Every `<dir>/*.nix` as a module list, sorted by file name; a missing
+      # directory yields [ ]. A project's own infra/flake.nix calls this for
+      # infra/conf.d/ -- modules that apply to EVERY node, as opposed to
+      # infra/nodes/<name>/extra.nix, which applies to one. It lives here
+      # rather than inline in the template so the VM test can exercise the
+      # very same filter the template calls.
+      #
+      # `type == "regular"` on purpose: a subdirectory called "foo.nix"
+      # would otherwise be imported as a module and fail confusingly, and a
+      # dangling symlink would break evaluation for everyone.
+      lib.confdModules = dir:
+        if !builtins.pathExists dir then [ ]
+        else
+          let entries = builtins.readDir dir;
+          in map (name: dir + "/${name}")
+            (builtins.filter
+              (name: entries.${name} == "regular" && lib.hasSuffix ".nix" name)
+              (builtins.attrNames entries));
+
       checks.${system} = {
         vm = import ./tests/vm.nix { inherit self pkgs lib; };
         vm-deploy = import ./tests/vm-deploy.nix { inherit self pkgs lib; };

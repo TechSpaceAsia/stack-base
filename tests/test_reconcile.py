@@ -36,6 +36,7 @@ from stackbase.reconcile import (
     apply,
     compute_rev,
     firewall_name,
+    check_infra_clean,
     hostname_for,
     local_facts,
     observe,
@@ -2521,6 +2522,91 @@ class PushExcludesGlobTests(unittest.TestCase):
             after = compute_rev(infra_dir, stackbase_src="/fake/src")
 
             self.assertEqual(before, after)
+
+
+def _porcelain(*entries: str) -> str:
+    """git status --porcelain -z output: NUL-terminated `XY path` records."""
+    return "".join(entry + "\0" for entry in entries)
+
+
+class CheckInfraCleanTests(unittest.TestCase):
+    def _runner(self, stdout: str, returncode: int = 0) -> FakeRunner:
+        return FakeRunner(
+            default=subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+        )
+
+    def test_a_clean_tree_passes(self) -> None:
+        check_infra_clean(Path("/repo/infra"), runner=self._runner(""), emit=lambda _line: None)
+
+    def test_a_modified_stack_toml_is_refused(self) -> None:
+        runner = self._runner(_porcelain(" M infra/stack.toml"))
+
+        with self.assertRaises(StackError) as ctx:
+            check_infra_clean(Path("/repo/infra"), runner=runner, emit=lambda _line: None)
+
+        message = str(ctx.exception)
+        self.assertIn("stack.toml", message)
+        self.assertIn("--allow-dirty", message)
+
+    def test_an_untracked_confd_module_is_refused_and_named(self) -> None:
+        runner = self._runner(_porcelain("?? infra/conf.d/hello.nix"))
+
+        with self.assertRaises(StackError) as ctx:
+            check_infra_clean(Path("/repo/infra"), runner=runner, emit=lambda _line: None)
+
+        self.assertIn("conf.d/hello.nix", str(ctx.exception))
+
+    def test_the_files_stack_base_writes_itself_are_not_dirty(self) -> None:
+        runner = self._runner(
+            _porcelain(
+                " M infra/nodes/a/hardware-configuration.nix",
+                " M infra/flake.lock",
+                " M infra/stack.state.json",
+                " M infra/known_hosts",
+                "?? infra/keys/deploy.pub",
+                " M infra/secrets.age",
+                "?? infra/deploy.age",
+            )
+        )
+
+        check_infra_clean(Path("/repo/infra"), runner=runner, emit=lambda _line: None)
+
+    def test_changes_outside_infra_are_irrelevant(self) -> None:
+        runner = self._runner(_porcelain(" M src/main.rs", "?? Cargo.lock"))
+
+        check_infra_clean(Path("/repo/infra"), runner=runner, emit=lambda _line: None)
+
+    def test_a_rename_source_path_is_not_parsed_as_an_entry(self) -> None:
+        # `-z` emits a rename as `R  <new>` followed by a separate field
+        # holding the OLD path. Parsing that second field as a record would
+        # read its first two characters as a status code.
+        runner = self._runner(_porcelain("R  infra/conf.d/new.nix", "infra/conf.d/old.nix"))
+
+        with self.assertRaises(StackError) as ctx:
+            check_infra_clean(Path("/repo/infra"), runner=runner, emit=lambda _line: None)
+
+        message = str(ctx.exception)
+        self.assertIn("conf.d/new.nix", message)
+        self.assertNotIn("old.nix", message)
+
+    def test_not_a_git_repository_warns_once_and_proceeds(self) -> None:
+        emitted: list[str] = []
+
+        check_infra_clean(Path("/repo/infra"), runner=self._runner("", returncode=128), emit=emitted.append)
+
+        self.assertEqual(len(emitted), 1)
+        self.assertIn("git repository", emitted[0])
+
+    def test_a_missing_git_binary_warns_once_and_proceeds(self) -> None:
+        def raise_missing(_argv, **_kwargs):
+            raise FileNotFoundError("git")
+
+        emitted: list[str] = []
+
+        check_infra_clean(Path("/repo/infra"), runner=raise_missing, emit=emitted.append)
+
+        self.assertEqual(len(emitted), 1)
+        self.assertIn("git", emitted[0])
 
 
 if __name__ == "__main__":

@@ -61,6 +61,16 @@ _EXTRA_NIX_OVERRIDES_GRUB_DEVICE = """\
 """
 
 
+_CONFD_HELLO = (_REPO_ROOT / "tests" / "fixtures" / "confd" / "hello.nix").read_text(encoding="utf-8")
+
+_CONFD_SECOND = """\
+{ ... }:
+{
+  environment.etc."stackbase-confd-second".text = "second\\n";
+}
+"""
+
+
 def _instantiate_template(directory: Path) -> None:
     """Lay out `directory` the way a real project's infra/ looks after setup."""
     shutil.copy(_TEMPLATE_DIR / "flake.nix", directory / "flake.nix")
@@ -252,6 +262,71 @@ class TemplateFlakeEvaluatesTests(unittest.TestCase):
             )
 
             self.assertEqual(_nix_eval(directory)["grubDevice"], "/dev/sdz")
+
+
+@unittest.skipIf(_NIX is None, "nix is not installed")
+class ConfdTests(unittest.TestCase):
+    """infra/conf.d/*.nix applies to EVERY node; infra/nodes/<n>/extra.nix to one."""
+
+    def _eval(self, directory: Path) -> dict:
+        apply_fn = (
+            "node: {"
+            " marker = node.config.environment.etc ? \"stackbase-confd-marker\";"
+            " second = node.config.environment.etc ? \"stackbase-confd-second\";"
+            " }"
+        )
+        result = subprocess.run(
+            [
+                _NIX or "nix", "eval", "--json",
+                f"path:{directory}#nixosConfigurations.a",
+                "--apply", apply_fn,
+                "--override-input", "stack-base", f"path:{_REPO_ROOT}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise AssertionError(f"nix eval failed:\n{result.stderr}")
+        return json.loads(result.stdout)
+
+    def test_no_confd_directory_still_evaluates(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+
+            self.assertFalse(self._eval(directory)["marker"])
+
+    def test_every_nix_file_in_confd_is_imported(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+            (directory / "conf.d").mkdir()
+            (directory / "conf.d" / "hello.nix").write_text(_CONFD_HELLO, encoding="utf-8")
+            (directory / "conf.d" / "second.nix").write_text(_CONFD_SECOND, encoding="utf-8")
+
+            facts = self._eval(directory)
+
+            self.assertTrue(facts["marker"])
+            self.assertTrue(facts["second"])
+
+    def test_a_non_nix_file_in_confd_is_ignored(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+            (directory / "conf.d").mkdir()
+            (directory / "conf.d" / "notes.txt").write_text("not nix\n", encoding="utf-8")
+            (directory / "conf.d" / "README.md").write_text("# not nix\n", encoding="utf-8")
+
+            self.assertFalse(self._eval(directory)["marker"])
+
+    def test_an_empty_confd_directory_is_fine(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+            (directory / "conf.d").mkdir()
+
+            self.assertFalse(self._eval(directory)["marker"])
 
 
 @unittest.skipIf(_NIX is None, "nix is not installed")

@@ -29,6 +29,7 @@ import re
 import socket
 import subprocess
 import sys
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -438,6 +439,108 @@ def _captured_nodes(nodes_dir: Path) -> frozenset[str]:
     return frozenset(
         child.name for child in nodes_dir.iterdir() if (child / "hardware-configuration.nix").exists()
     )
+
+
+# --------------------------------------------------------------------------
+# The working-tree guard
+# --------------------------------------------------------------------------
+
+# Paths under infra/ that stack-base WRITES ITSELF during a run. A
+# modification to any of these is expected mid-run (CAPTURE_HARDWARE,
+# _fetch_lock_file, save_state, pin_host_key, deploy-key init), never an
+# operator's half-finished edit -- matched with fnmatch, relative to the
+# infra directory.
+TOOL_WRITTEN_PATHS = (
+    "nodes/*/hardware-configuration.nix",
+    "flake.lock",
+    "stack.state.json",
+    "known_hosts",
+    "keys/*.pub",
+    "*.age",
+)
+
+_DIRTY_SUFFIX = ".nix"
+_DIRTY_NAMES = ("stack.toml",)
+
+
+def check_infra_clean(
+    infra_dir: Path,
+    *,
+    runner: Any = subprocess.run,
+    emit: Callable[[str], None] = print,
+) -> None:
+    """Refuse to push a working tree nobody has committed.
+
+    What `up` puts on a server is the working tree, not HEAD: `_push_config`
+    rsyncs `infra/` as it is on disk. That is convenient while iterating and
+    dangerous afterwards -- an uncommitted `conf.d/*.nix` or a locally-edited
+    `stack.toml` produces a server nobody else can reproduce, and the next
+    teammate's `up` silently reverts it.
+
+    Only files that change what a node BUILDS are considered: `*.nix`
+    anywhere under infra/, and `stack.toml`. Everything stack-base writes
+    itself (`TOOL_WRITTEN_PATHS`) is exempt, because a run legitimately
+    modifies those while it is in flight.
+
+    Not a git checkout at all (or no git installed) -- warn once and
+    proceed: stack-base works fine without version control, it just cannot
+    make this particular promise.
+    """
+    repo_dir = infra_dir.parent
+    try:
+        result = runner(
+            ["git", "-C", str(repo_dir), "status", "--porcelain", "-z", "--", str(infra_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        emit("! git was not found -- skipping the check for uncommitted changes under infra/")
+        return
+
+    if result.returncode != 0:
+        emit("! infra/ is not inside a git repository -- skipping the check for uncommitted changes")
+        return
+
+    offenders = sorted(_dirty_infra_paths(result.stdout or "", repo_dir=repo_dir, infra_dir=infra_dir))
+    if not offenders:
+        return
+
+    raise StackError(
+        f"infra/ has uncommitted changes that would be pushed to the servers: {', '.join(offenders)}",
+        "what `up` pushes is your WORKING TREE, not the last commit -- commit them first so the "
+        "next person's run reproduces this server, or re-run with --allow-dirty",
+    )
+
+
+def _dirty_infra_paths(porcelain_z: str, *, repo_dir: Path, infra_dir: Path) -> set[str]:
+    """Paths from `git status --porcelain -z` that stack-base did not write itself.
+
+    `-z` output is NUL-separated `XY <path>` records with NO quoting or
+    escaping (unlike the default, where a path with a space or a non-ASCII
+    byte comes back quoted). A rename or copy record (`R`/`C`) is followed
+    by ONE extra field holding the source path -- consumed here, so its
+    first two characters are never mistaken for a status code.
+    """
+    fields = deque(field for field in porcelain_z.split("\0") if field)
+    dirty: set[str] = set()
+    while fields:
+        record = fields.popleft()
+        status, path = record[:2], record[3:]
+        if status[:1] in ("R", "C") and fields:
+            fields.popleft()  # the rename/copy SOURCE path
+        if not path:
+            continue
+        name = path.rsplit("/", 1)[-1]
+        if not (name.endswith(_DIRTY_SUFFIX) or name in _DIRTY_NAMES):
+            continue
+        try:
+            relative = (repo_dir / path).relative_to(infra_dir).as_posix()
+        except ValueError:
+            continue  # not under infra/ after all
+        if not any(fnmatch.fnmatch(relative, pattern) for pattern in TOOL_WRITTEN_PATHS):
+            dirty.add(relative)
+    return dirty
 
 
 # --------------------------------------------------------------------------
