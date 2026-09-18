@@ -507,6 +507,30 @@ class WorkflowActionPinningTests(unittest.TestCase):
             self.assertTrue(comment.strip(), f"line {number}: '{ref}' has a SHA but no '# vX.Y.Z' comment")
 
 
+class WorkflowRunnerTests(unittest.TestCase):
+    def test_it_runs_on_the_self_hosted_x86_64_linux_runner(self) -> None:
+        match = re.search(r"^\s*runs-on:\s*(.+)$", _WORKFLOW_TEXT, re.MULTILINE)
+
+        self.assertIsNotNone(match, "expected a runs-on: line")
+        self.assertEqual(match.group(1).strip(), "[self-hosted, x86_64-linux]")
+
+    def test_there_is_exactly_one_job_and_one_runner(self) -> None:
+        self.assertEqual(len(re.findall(r"^\s*runs-on:", _WORKFLOW_TEXT, re.MULTILINE)), 1)
+
+    def test_nothing_installs_a_c_toolchain_at_job_time(self) -> None:
+        # The runner is a NixOS machine that already carries the cross
+        # compiler -- no package manager call belongs in this workflow at
+        # all, not even in a comment that a reader might copy.
+        self.assertNotIn("apt-get", _WORKFLOW_TEXT)
+        self.assertNotIn("musl-tools", _WORKFLOW_TEXT)
+
+    def test_it_still_adds_the_musl_rust_target(self) -> None:
+        self.assertIn("rustup target add x86_64-unknown-linux-musl", _WORKFLOW_TEXT)
+
+    def test_a_comment_says_where_the_runner_lives(self) -> None:
+        self.assertIn("nixos-ollama", _WORKFLOW_TEXT)
+
+
 class WorkflowKeyHandlingTests(unittest.TestCase):
     def test_the_key_is_written_under_runner_temp_with_umask_077(self) -> None:
         self.assertIn("RUNNER_TEMP", _WORKFLOW_TEXT)

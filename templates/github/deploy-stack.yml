@@ -39,7 +39,23 @@ env:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    # A self-hosted runner, not ubuntu-latest: minutes on it are free (it
+    # is our own machine), and it is a NixOS box that already carries the
+    # musl cross compiler and tailwindcss -- so no C toolchain is
+    # installed at job time at all. `./infra/up deploy` wires
+    # $CC_x86_64_unknown_linux_musl / the cargo linker variable to
+    # x86_64-unknown-linux-musl-gcc by itself when it finds it on PATH
+    # (stackbase/release.py).
+    #
+    # The runner lives on nixos-ollama; its registration and toolchain are
+    # host-level config in platform-base, not in this repository. Both
+    # labels must match what that runner registers with. A project that
+    # copies this template but has no such runner registered will see
+    # every deploy job queue forever with no error -- GitHub does not fail
+    # a job for want of a matching runner, it just never schedules it. If
+    # you don't have this runner, see the README section on deploying from
+    # GitHub Actions for the ubuntu-latest fallback.
+    runs-on: [self-hosted, x86_64-linux]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -52,10 +68,10 @@ jobs:
             exit 1
           fi
 
-      - name: Install Rust toolchain (x86_64 musl)
-        run: |
-          rustup target add x86_64-unknown-linux-musl
-          sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install the musl Rust target
+        # The cross COMPILER is part of the runner's own NixOS config; only
+        # the Rust target itself is per-job (and a no-op once cached).
+        run: rustup target add x86_64-unknown-linux-musl
 
       - name: Cache the cargo registry
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0

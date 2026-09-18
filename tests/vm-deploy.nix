@@ -330,6 +330,17 @@ pkgs.testers.runNixOSTest {
           out = node.succeed("stack-deploy colors").strip()
           assert out == "active=none idle=blue", f"unexpected colors output: {out!r}"
 
+      with subtest("before any deploy: status is clean output, with nothing on stderr (F)"):
+          # `read_active` returns the sentinel "none", which used to be fed
+          # straight to color_dir() inside a command substitution -- that
+          # died with "✗ invalid color: none" on stderr while the outer
+          # echo still printed the right line. A no-release-yet node is a
+          # normal state, not an error.
+          out = node.succeed("stack-deploy status 2>/tmp/status.err").strip()
+          err = node.succeed("cat /tmp/status.err")
+          assert out == "active=none (-)  idle=blue (-)", f"unexpected status output: {out!r}"
+          assert err == "", f"status wrote to stderr before any deploy: {err!r}"
+
       with subtest("first deploy (via --tarball) goes live on blue"):
           sha = make_tarball("v1.0.0")
           node.succeed(f"${fastHealth} stack-deploy deploy v1.0.0 --tarball /tmp/v1.0.0.tar.gz --sha256 {sha}")

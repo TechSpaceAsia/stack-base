@@ -390,6 +390,13 @@ door can optionally also be driven by GitHub Actions on every tag push,
 so a release ships as soon as you `git push --tags`, with no laptop
 involved.
 
+The workflow runs on a **self-hosted** runner (`runs-on: [self-hosted,
+x86_64-linux]`), which is a NixOS machine we own: minutes are free, and it
+already carries the musl cross compiler and `tailwindcss`, so the workflow
+installs nothing but the Rust target. If you do not have that runner, change
+`runs-on` to `ubuntu-latest` and add `sudo apt-get install -y musl-tools`
+back to the toolchain step.
+
 **What `./infra/up ci-setup` does:** pushes the project's own deploy key
 (above) straight into a **repository-level** GitHub Actions secret
 (`STACK_DEPLOY_KEY`) — repo-level, not organization-level, because this

@@ -151,6 +151,16 @@ linked_version() {
 }
 
 current_version_or_dash() {
+  # "none" is a legitimate color here -- read_active returns it when no
+  # release has ever been deployed -- and it has no directory, so it must
+  # never reach color_dir(), whose die() would print "invalid color: none"
+  # to stderr from inside this command substitution while the caller
+  # happily printed the rest of its line (F).
+  if [ "$1" = none ]; then
+    echo "-"
+    return 0
+  fi
+
   local v
   v="$(linked_version "$1")"
   if [ -n "$v" ]; then
