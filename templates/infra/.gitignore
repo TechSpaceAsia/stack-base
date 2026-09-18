@@ -1,11 +1,28 @@
 # Nix leaves a `result` symlink behind after a local build. Nothing else in
-# this directory is generated, and nothing in it is secret: secrets.age is
-# encrypted (commit it), and stack.state.json, known_hosts, flake.lock and
-# nodes/ are all records the whole team needs -- commit them too.
+# this directory is generated, and nothing in it is secret: secrets.age and
+# deploy.age are encrypted (commit them), and stack.state.json, known_hosts,
+# flake.lock, keys/ and nodes/ are all records the whole team needs --
+# commit those too.
 result
 
 # secrets.py's save_secrets() writes through a same-directory temp file
 # before its atomic rename -- a crash mid-save can leave one of these
-# behind. Encrypted, like secrets.age itself, but still a stray write-ahead
-# artefact that must never be committed.
-secrets.age.*.tmp
+# behind, for either secrets.age or deploy.age. Encrypted, like the real
+# files, but still a stray write-ahead artefact that must never be
+# committed.
+*.age.*.tmp
+
+# Belt and braces for key material that has no business in this directory
+# in the first place. stack-base itself never writes any of these: a file
+# matching one of them is something a person put there by hand (a
+# decrypted bundle, a private key copied off a server, a certificate's
+# key), and the one thing worse than having it on disk is committing it.
+#
+# None of these can match a file that must be committed: the encrypted
+# bundles are `*.age` (not `*.age.tmp`), and public keys are `keys/*.pub`.
+secrets/
+*.key
+id_ed25519*
+id_rsa*
+*.pem
+*.age.tmp

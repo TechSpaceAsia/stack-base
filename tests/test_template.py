@@ -924,14 +924,106 @@ class TemplateFilesTests(unittest.TestCase):
 
         self.assertEqual(read_recipients(_TEMPLATE_DIR / "deploy-recipients.txt"), [])
 
-    def test_the_gitignore_only_hides_build_output(self) -> None:
+    def test_the_gitignore_hides_build_output_and_stray_key_material(self) -> None:
         entries = [
             line.strip()
             for line in (_TEMPLATE_DIR / ".gitignore").read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.startswith("#")
         ]
 
-        self.assertEqual(entries, ["result", "secrets.age.*.tmp"])
+        self.assertEqual(
+            entries,
+            [
+                "result",
+                "*.age.*.tmp",
+                "secrets/",
+                "*.key",
+                "id_ed25519*",
+                "id_rsa*",
+                "*.pem",
+                "*.age.tmp",
+            ],
+        )
+
+    def test_the_gitignore_never_hides_a_file_that_must_be_committed(self) -> None:
+        """secrets.age, deploy.age and keys/*.pub are the whole point of the repo."""
+        import fnmatch
+
+        patterns = [
+            line.strip()
+            for line in (_TEMPLATE_DIR / ".gitignore").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        must_commit = [
+            "secrets.age",
+            "deploy.age",
+            "keys/matt.pub",
+            "keys/deploy.pub",
+            "age-recipients.txt",
+            "deploy-recipients.txt",
+            "stack.toml",
+            "stack.state.json",
+            "known_hosts",
+            "flake.lock",
+            "conf.d/hello.nix",
+        ]
+
+        for path in must_commit:
+            for pattern in patterns:
+                self.assertFalse(
+                    fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path.rsplit("/", 1)[-1], pattern),
+                    f"{path} must be committable, but .gitignore's '{pattern}' hides it",
+                )
+
+    def test_the_version_is_the_one_being_released(self) -> None:
+        import stackbase
+
+        self.assertEqual(stackbase.__version__, "0.1.0")
+
+    def test_a_github_pinned_lock_resolves_to_the_public_repository(self) -> None:
+        """The `up` wrapper must turn a github-type flake.lock node into the
+        real clone URL. Network is never touched -- this only exercises the
+        pure resolution step (Brief G).
+        """
+        import importlib.machinery
+        import importlib.util
+
+        # `templates/infra/up` has no .py extension, so
+        # spec_from_file_location cannot pick a loader for it -- name the
+        # source loader explicitly. Importing it only defines functions
+        # (everything else is behind `if __name__ == "__main__"`).
+        loader = importlib.machinery.SourceFileLoader("template_up", str(_TEMPLATE_DIR / "up"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+
+        with TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "flake.lock"
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "nodes": {
+                            "root": {"inputs": {"stack-base": "stack-base"}},
+                            "stack-base": {
+                                "locked": {
+                                    "type": "github",
+                                    "owner": "TechSpaceAsia",
+                                    "repo": "stack-base",
+                                    "rev": "a" * 40,
+                                }
+                            },
+                        },
+                        "root": "root",
+                        "version": 7,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            url, rev = module.locked_stack_base(lock_path)
+
+        self.assertEqual(url, "https://github.com/TechSpaceAsia/stack-base.git")
+        self.assertEqual(rev, "a" * 40)
 
     def test_the_example_stack_toml_parses_and_covers_the_schema(self) -> None:
         import tomllib

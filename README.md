@@ -395,7 +395,11 @@ x86_64-linux]`), which is a NixOS machine we own: minutes are free, and it
 already carries the musl cross compiler and `tailwindcss`, so the workflow
 installs nothing but the Rust target. If you do not have that runner, change
 `runs-on` to `ubuntu-latest` and add `sudo apt-get install -y musl-tools`
-back to the toolchain step.
+back to the toolchain step. If you push a tag without doing either, the
+deploy job just queues forever with no error — GitHub does not fail a job
+for want of a matching runner, it simply never schedules it — so a tag that
+never deploys and never fails is a sign to check `runs-on`, not to wait
+longer.
 
 **What `./infra/up ci-setup` does:** pushes the project's own deploy key
 (above) straight into a **repository-level** GitHub Actions secret
@@ -592,13 +596,6 @@ store, which is world-readable.
 Each node backs up **its own** database (see "What a replica is TODAY"), so
 a two-node project produces two independent sets of objects.
 
-To restore, fetch an object with any rclone/S3 client and reverse the
-pipeline on a machine that holds one of the recipient identities:
-
-```bash
-age -d -i ~/.config/age/keys.txt backup.sql.zst.age | zstd -d | psql acme
-```
-
 **A bucket listing is not a success report.** Each object is streamed
 straight to the bucket as it is produced, so a run that dies part-way
 through — the database goes away mid-dump, the node runs out of network —
@@ -615,6 +612,72 @@ good one in a listing. Two things follow:
   object rather than handing `psql` half a database — so a restore that
   starts is a restore you can trust. Restore the previous timestamp if one
   fails.
+
+### Restore
+
+A backup is an `age`-encrypted, `zstd`-compressed stream. Restoring needs
+your age identity — the one thing that never existed on the server.
+
+```bash
+# 1. Fetch the object. From the node (it already has the credentials):
+./infra/up ssh a -- stackbase-backup-ls          # find the name you want
+./infra/up ssh a -- rclone copyto \
+  "backup:<bucket>/db/<project>_20260918T030000Z.sql.zst.age" /tmp/restore.sql.zst.age
+# ...then copy it to your machine, or run rclone yourself with the same
+# RCLONE_CONFIG_BACKUP_* variables.
+
+# 2. Decrypt, decompress, and load. The database, into a FRESH database
+#    first -- never straight over a live one:
+age -d -i ~/.age/key.txt restore.sql.zst.age | zstd -d > restore.sql
+sudo -u postgres createdb <project>_restored
+sudo -u postgres psql <project>_restored < restore.sql
+
+# 3. The files variant:
+age -d -i ~/.age/key.txt uploads_20260918T030000Z.tar.zst.age \
+  | zstd -d \
+  | tar -C /var/lib/<project>/uploads -xf -
+```
+
+If your identity is a YubiKey, `age-plugin-yubikey` must be on your PATH for
+step 2 — the same requirement the node has for writing the backup.
+
+**Test this before you need it.** A backup nobody has ever restored is a
+hypothesis, not a backup.
+
+## Things to watch
+
+Three ways to hurt yourself that no amount of code can prevent.
+
+**1. Never decrypt a secret to disk by hand.** stack-base never writes a
+plaintext secret anywhere except RAM (`/dev/shm`, wiped on the way out) —
+not to `/tmp`, not to the repository, not for a second. The moment you run
+something like `age -d -i ~/.age/key.txt infra/secrets.age > secrets.json`,
+every token, the TLS private key and the whole of `app_env` are sitting in
+the project directory, an editor swapfile away from a commit and a `rm`
+away from being recoverable off the disk anyway. Use the commands instead:
+
+```bash
+./infra/up secrets keys          # what's in there
+./infra/up secrets edit app_env  # change one value, in RAM
+./infra/up deploy-key show-pub   # the public half, which is not a secret
+```
+
+**2. `conf.d` files have the full power of NixOS.** Anything in
+`infra/conf.d/*.nix` (or `infra/nodes/<name>/extra.nix`) is a NixOS module
+with the same authority as stack-base's own: it can `lib.mkForce` its way
+past the sshd hardening, re-open the firewall, disable fail2ban or add a
+user. That is deliberate — an escape hatch that needed permission would not
+be an escape hatch — but it means these files deserve a real code review,
+the same as any change to stack-base itself. A repo-wide quality checker is
+the intended second line of defence; today, review is the only one.
+
+**3. What you push is your working tree.** `./infra/up` rsyncs `infra/` as
+it exists on your disk, not as it exists in the last commit. `up` refuses
+when an uncommitted `*.nix` or `stack.toml` would go out (`--allow-dirty`
+overrides it), but that check only covers files that change what a node
+builds — and it cannot help at all in a checkout that is not a git
+repository. If a server is behaving unlike anything in `git log`, check
+`git status` before you check anything else.
 
 ## When it fails
 
