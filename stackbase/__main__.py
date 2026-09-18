@@ -23,7 +23,7 @@ import traceback
 from pathlib import Path
 from typing import Callable
 
-from stackbase.backups import run_backup_now
+from stackbase.backups import check_backup_credentials, run_backup_now
 from stackbase.ci import ci_setup
 from stackbase.cloudflare import CloudflareClient
 from stackbase.config import load_config, load_state
@@ -273,6 +273,13 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> N
 
     stackbase_src = os.environ.get("STACKBASE_SRC") or None
     local = local_facts(infra_dir, secrets, stackbase_src=stackbase_src)
+    # stack.toml's bucket is what turns the node's nightly timer ON;
+    # secrets.age's three r2_* keys are what make it able to run. Nothing
+    # else compares them, so an incomplete pair is silent here and loud at
+    # 03:00 -- say so now, next to the other pre-flight warnings. Emitted
+    # under `--plan` too: it is a statement about the configuration, not
+    # about what this particular run is going to push.
+    check_backup_credentials(cfg.backups.bucket, local.backup_env_sha, emit=_emit_masked(secrets))
     observed = observe(cfg, state, hostinger, cloudflare, local=local)
     for warning in observed.cloudflare_ip_warnings:
         print(redact(f"! {warning}", redaction_values(secrets)))
@@ -340,14 +347,17 @@ def _ssh(args: argparse.Namespace, infra_dir: Path) -> None:
 
 
 def _emit_plain(line: str) -> None:
-    """The print path for output that is emitted BEFORE anything is decrypted.
+    """The print path for output emitted by a command that holds no secret.
 
-    `ci-setup`, `deploy-key` and `secrets` hand their own
-    `register_secret` to the functions that hold a value, and print their
-    own already-safe lines through here. Still routed through `redact()`
-    with an empty value list -- a no-op -- so every printed line goes
-    through the same masking path as the rest of the CLI. Anything that can
-    hold a secret for the duration of a command uses `_emit_masked` instead.
+    What is left here is `up`'s dirty-tree check, `deploy-key show-pub` (a
+    public half) and the `secrets` subcommands, which hand their own
+    `register_secret` to the functions that hold a value and print only
+    already-safe lines of their own. Still routed through `redact()` with an
+    empty value list -- a no-op -- so every printed line goes through the
+    same masking path as the rest of the CLI. Anything that can hold a
+    secret for the duration of a command (`deploy`, `rollback`, `status`,
+    `backup-now`, `up`, and the two commands that generate or push the
+    project deploy key) uses `_emit_masked` instead.
     """
     print(redact(line, []))
 
@@ -434,20 +444,28 @@ def _secret_register_counter(secrets: dict[str, str]) -> Callable[[str], None]:
 
 
 def _ci_setup(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+    # `_emit_masked`, not `_emit_plain`: from the moment `register_secret`
+    # fires, this command HOLDS the project's private deploy key. Nothing it
+    # prints today can carry it, so this is belt-and-braces -- but the same
+    # dict is what masks the error paths, and a future line that quotes a
+    # generated key would otherwise print it in full.
     ci_setup(
         infra_dir,
         rotate=args.rotate,
-        emit=_emit_plain,
+        emit=_emit_masked(secrets),
         register_secret=_secret_register_counter(secrets),
     )
 
 
 def _deploy_key(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
     if args.deploy_key_command == "init":
+        # Masked for the same reason as `ci-setup` above: this is the
+        # command that GENERATES the private deploy key. `show-pub` below
+        # stays plain -- it only ever holds a public half.
         deploy_key_init(
             infra_dir,
             rotate=args.rotate,
-            emit=_emit_plain,
+            emit=_emit_masked(secrets),
             register_secret=_secret_register_counter(secrets),
         )
     elif args.deploy_key_command == "show-pub":

@@ -10,6 +10,16 @@ name: Deploy (stack-base)
 # nginx/TLS, and cannot see this project's own secrets (infra/secrets.age
 # never leaves the operator's machine; this workflow never decrypts it).
 #
+# Nothing is decrypted here, including infra/deploy.age -- which IS in the
+# checkout, because `ci-setup` tells you to commit it. That file is the same
+# key, encrypted to the team's age recipients, and the runner holds no age
+# identity for it. The workflow therefore writes the plaintext key it was
+# handed to a file and exports $STACKBASE_SSH_IDENTITY, which is resolution
+# path 1 of `release.deploy_identity` ("an explicit operator choice always
+# wins, and nothing is decrypted") -- it takes precedence over the
+# deploy.age path, so the deploy never asks for an age identity the runner
+# does not have. See the README's "Deploying from GitHub Actions" section.
+#
 # `./infra/up deploy` itself builds the static-musl binary, builds the CSS
 # bundle, packages a deterministic tarball, then uploads and switches it on
 # every node -- replicas first, primary last -- stopping at the first
@@ -87,7 +97,7 @@ jobs:
           key: cargo-registry-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-registry-
 
-      - name: Load the CI deploy key into an ssh-agent
+      - name: Write the CI deploy key and point $STACKBASE_SSH_IDENTITY at it
         env:
           # The ONLY secret this workflow references. Kept in `env:`, never
           # interpolated directly into a `run:` script line -- GitHub Actions
@@ -98,27 +108,27 @@ jobs:
           # a template expression.
           STACK_DEPLOY_KEY: ${{ secrets.STACK_DEPLOY_KEY }}
         run: |
-          eval "$(ssh-agent -s)"
-          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
-          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
           umask 077
           key_file="$RUNNER_TEMP/deploy_key"
+          # 0600 from the moment it exists, never chmod'ed afterwards: ssh
+          # refuses a group/world-readable private key, and a window at a
+          # laxer mode is exactly what this avoids. $RUNNER_TEMP is wiped by
+          # the runner between jobs; the cleanup step below removes the file
+          # explicitly anyway, pass or fail.
           install -m 600 /dev/null "$key_file"
           printf '%s\n' "$STACK_DEPLOY_KEY" > "$key_file"
-          # I4: exactly ONE key ever goes into this agent, so the door's
-          # MaxAuthTries/fail2ban surface (stackbase/ssh.py's
-          # STACKBASE_SSH_IDENTITY exists for a laptop's multi-key agent,
-          # not needed here) is a non-issue for this workflow.
-          ssh-add "$key_file"
-          rm -f "$key_file"
+          # Resolution path 1 of release.deploy_identity: an explicit
+          # identity wins over infra/deploy.age (which is in this checkout
+          # but cannot be decrypted here -- no age identity on the runner)
+          # and nothing is decrypted. stackbase/ssh.py reads this variable
+          # and offers exactly this one key, with `-o IdentitiesOnly=yes`,
+          # so the door's MaxAuthTries/fail2ban surface is a non-issue --
+          # no SSH agent is involved at any point.
+          echo "STACKBASE_SSH_IDENTITY=$key_file" >> "$GITHUB_ENV"
 
       - name: Deploy
         run: ./infra/up deploy "$GITHUB_REF_NAME"
 
-      - name: Stop the ssh-agent and remove any leftover key material
+      - name: Remove the deploy key
         if: always()
-        run: |
-          rm -f "$RUNNER_TEMP/deploy_key"
-          if [ -n "${SSH_AGENT_PID:-}" ]; then
-            kill "$SSH_AGENT_PID" 2>/dev/null || true
-          fi
+        run: rm -f "$RUNNER_TEMP/deploy_key"

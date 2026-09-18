@@ -11,6 +11,7 @@ from stackbase.backups import (
     BACKUP_ENV_PATH,
     backup_env_content,
     backup_env_digest,
+    check_backup_credentials,
     run_backup_now,
 )
 from stackbase.errors import StackError
@@ -261,6 +262,48 @@ class RunBackupNowTests(unittest.TestCase):
 
             self.assertIn("run `up` first", str(ctx.exception))
             self.assertEqual(popen.calls, [])
+
+
+class CheckBackupCredentialsTests(unittest.TestCase):
+    """The pre-flight warning `up` prints when stack.toml's bucket turns the
+    node's nightly timer on but secrets.age cannot make it work. Two
+    independent gates (nixos/backups.nix's `enable`, and this module's
+    all-or-nothing r2_* set) that nothing else compares."""
+
+    def _warnings(self, bucket: str | None, backup_env_sha: str | None) -> list[str]:
+        emitted: list[str] = []
+        check_backup_credentials(bucket, backup_env_sha, emit=emitted.append)
+        return emitted
+
+    def test_a_bucket_with_no_credentials_warns_and_names_all_three_keys(self) -> None:
+        lines = self._warnings("acme-backups", None)
+
+        self.assertEqual(len(lines), 1)
+        line = lines[0]
+        self.assertIn("acme-backups", line)
+        self.assertIn(BACKUP_ENV_PATH, line)
+        for key in ("r2_access_key_id", "r2_secret_access_key", "r2_endpoint"):
+            self.assertIn(key, line)
+
+    def test_an_incomplete_credential_set_warns_the_same_way(self) -> None:
+        # backup_env_content() is all-or-nothing, so two of the three keys
+        # render as None -- the same `backup_env_sha is None` this sees.
+        partial = backup_env_content({"r2_access_key_id": "AKIA", "r2_endpoint": "https://r2.example.com"})
+
+        self.assertIsNone(partial)
+        self.assertEqual(len(self._warnings("acme-backups", None)), 1)
+
+    def test_a_bucket_with_a_complete_set_is_silent(self) -> None:
+        content = backup_env_content(_FULL_SECRETS)
+
+        self.assertIsNotNone(content)
+        self.assertEqual(self._warnings("acme-backups", backup_env_digest(content or "")), [])
+
+    def test_no_bucket_is_silent_even_with_no_credentials(self) -> None:
+        # Backups are simply off -- nothing is installed on the node, so
+        # there is nothing to warn about.
+        self.assertEqual(self._warnings(None, None), [])
+        self.assertEqual(self._warnings("", None), [])
 
 
 if __name__ == "__main__":

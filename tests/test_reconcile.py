@@ -1521,7 +1521,7 @@ class PushConfigTests(unittest.TestCase):
             apply([Step(Action.PUSH_CONFIG, "a")], ctx, allow_purchase=False)
 
             rsync = next(call for call in ctx.runner.calls if call["argv"][0] == "rsync")
-            self.assertIn("--exclude=secrets.age*", rsync["argv"])
+            self.assertIn("--exclude=*.age*", rsync["argv"])
             self.assertNotIn("--exclude=keys", rsync["argv"])
             self.assertNotIn("--exclude=keys/", rsync["argv"])
             self.assertTrue(rsync["argv"][-1].endswith(":/etc/nixos/stack"))
@@ -2734,9 +2734,9 @@ class LocalFactsTests(unittest.TestCase):
 
 
 class PushExcludesGlobTests(unittest.TestCase):
-    """M6: PUSH_EXCLUDES' "secrets.age*" must exclude secrets.age ITSELF
-    (an exact name, still matched by the glob) as well as secrets.py's own
-    "secrets.age.<pid>.tmp" write-ahead temp file -- from both the rsync
+    """M6: PUSH_EXCLUDES' "*.age*" must exclude every age bundle ITSELF (an
+    exact name, still matched by the glob) as well as secrets.py's own
+    "<name>.age.<pid>.tmp" write-ahead temp file -- from both the rsync
     push (Ssh.rsync_to's --exclude, proven under PushConfigTests above) and
     the tree digest that feeds compute_rev, checked here directly against
     tree_files()."""
@@ -2752,6 +2752,26 @@ class PushExcludesGlobTests(unittest.TestCase):
             self.assertNotIn("secrets.age", names)
             self.assertNotIn("secrets.age.12345.tmp", names)
             self.assertIn("stack.toml", names)
+
+    def test_deploy_age_is_excluded_but_both_recipients_files_still_travel(self) -> None:
+        """The deploy key's ciphertext opens the deploy door on EVERY node of
+        the project, so a node must never hold a copy: rooting one node would
+        otherwise hand over the door to all of them. The two *recipients*
+        files are public keys and carry no ".age" substring, so the glob
+        leaves them alone -- nixos/backups.nix reads age-recipients.txt off
+        /etc/nixos/stack to encrypt each nightly backup."""
+        with Infra() as infra_dir:
+            (infra_dir / "deploy.age").write_text("ciphertext", encoding="utf-8")
+            (infra_dir / "deploy.age.4321.tmp").write_text("stale", encoding="utf-8")
+            (infra_dir / "age-recipients.txt").write_text("age1aaa\n", encoding="utf-8")
+            (infra_dir / "deploy-recipients.txt").write_text("age1bbb\n", encoding="utf-8")
+
+            names = {p.name for p in tree_files(infra_dir, PUSH_EXCLUDES)}
+
+            self.assertNotIn("deploy.age", names)
+            self.assertNotIn("deploy.age.4321.tmp", names)
+            self.assertIn("age-recipients.txt", names)
+            self.assertIn("deploy-recipients.txt", names)
 
     def test_compute_rev_is_unaffected_by_a_stale_secrets_age_tmp_file(self) -> None:
         with Infra() as infra_dir:

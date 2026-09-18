@@ -536,11 +536,31 @@ class WorkflowKeyHandlingTests(unittest.TestCase):
         self.assertIn("RUNNER_TEMP", _WORKFLOW_TEXT)
         self.assertIn("umask 077", _WORKFLOW_TEXT)
 
-    def test_the_key_file_is_removed_at_least_once_after_being_written(self) -> None:
-        self.assertIn('rm -f "$key_file"', _WORKFLOW_TEXT)
+    def test_the_key_file_path_is_exported_as_the_stackbase_ssh_identity(self) -> None:
+        """Resolution path 1 of release.deploy_identity, not an ssh-agent.
 
-    def test_an_always_cleanup_step_exists(self) -> None:
+        The runner holds no age identity, and both `ci-setup` and the README
+        tell you to commit infra/deploy.age -- so deploy_identity would pick
+        path 2 and hard-fail ("cannot decrypt it") before any agent was ever
+        consulted. Exporting an explicit identity is what keeps path 1 in
+        front of it, and is why this workflow decrypts nothing.
+        """
+        self.assertIn('echo "STACKBASE_SSH_IDENTITY=$key_file" >> "$GITHUB_ENV"', _WORKFLOW_TEXT)
+
+    def test_no_ssh_agent_is_used(self) -> None:
+        # An agent would only ever be consulted on resolution path 3, which
+        # this workflow can never reach. Keeping one around reads like the
+        # mechanism the deploy actually uses, and is not.
+        self.assertNotIn("ssh-add", _WORKFLOW_TEXT)
+        self.assertNotIn("ssh-agent", _WORKFLOW_TEXT)
+        self.assertNotIn("SSH_AUTH_SOCK", _WORKFLOW_TEXT)
+
+    def test_an_always_cleanup_step_removes_the_key_file(self) -> None:
         self.assertIn("if: always()", _WORKFLOW_TEXT)
+        # The key now has to survive the whole job, so this step is the ONLY
+        # thing that deletes it -- and it must still do so on a failed deploy.
+        cleanup = _WORKFLOW_TEXT.split("if: always()", 1)[1]
+        self.assertIn('rm -f "$RUNNER_TEMP/deploy_key"', cleanup)
 
     def test_the_deploy_step_invokes_infra_up_deploy_with_the_tag_ref(self) -> None:
         self.assertIn("./infra/up deploy", _WORKFLOW_TEXT)

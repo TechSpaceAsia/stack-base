@@ -57,20 +57,36 @@ REMOTE_CONFIG_DIR = "/etc/nixos/stack"
 REMOTE_SRC_DIR = "/etc/nixos/stack-base"
 REMOTE_CERT_DIR = "/var/lib/stackbase"
 
-# Everything under infra/ is pushed to the node except these. `secrets.age`
-# must never leave the operator's machine; `keys/*.pub` MUST be pushed -- the
-# node's flake reads them to build its admin accounts. `known_hosts` is the
-# operator's own trust store, not node configuration (pushing it would also
-# make every newly pinned node look like a config change to every other one).
+# Everything under infra/ is pushed to the node except these. `keys/*.pub`
+# MUST be pushed -- the node's flake reads them to build its admin accounts.
+# `known_hosts` is the operator's own trust store, not node configuration
+# (pushing it would also make every newly pinned node look like a config
+# change to every other one).
 #
-# "secrets.age*" (M6, a glob, not just the exact name): secrets.py's own
+# "*.age*" -- EVERY age-encrypted bundle, not a list of the two that exist
+# today (secrets.age and deploy.age). Neither may leave the operator's
+# machine: secrets.age holds the API tokens and the origin-cert key, and
+# deploy.age holds the one SSH key that opens the deploy door on EVERY node
+# of the project. Shipping that ciphertext to each node would mean a root
+# compromise of any single node yielded the door to all of them -- the exact
+# opposite of the "the deploy door and nothing else" blast radius the split
+# recipients list exists to create. A third bundle added later is excluded by
+# this pattern on the day it is created, with nothing to remember.
+#
+# It is a glob rather than exact names for a second reason (M6): secrets.py's
 # save_secrets() writes through a same-directory temp file
-# "secrets.age.<pid>.tmp" before the atomic rename -- a crash mid-save could
+# "<name>.age.<pid>.tmp" before the atomic rename -- a crash mid-save could
 # leave one of those behind, and it must never reach the node or feed the
 # tree digest either. `tree_files`/`_tree_digest` below match every entry
 # here with `fnmatch`, not exact string equality, so a glob pattern excludes
 # what it looks like it excludes.
-PUSH_EXCLUDES = ("secrets.age*", ".git", "__pycache__", "known_hosts", "result")
+#
+# Nothing on the node side reads an `.age` file out of /etc/nixos/stack: the
+# only age input a node has is `age-recipients.txt` (nixos/backups.nix
+# encrypts each backup TO those public keys), and that name contains no
+# ".age" substring, so this pattern does not touch it -- nor
+# `deploy-recipients.txt`.
+PUSH_EXCLUDES = ("*.age*", ".git", "__pycache__", "known_hosts", "result")
 
 # In dev mode the local stack-base checkout is pushed too, minus its own
 # working clutter.
@@ -399,9 +415,10 @@ def tree_files(root: Path, excludes: Iterable[str]) -> list[Path]:
     Each `excludes` entry is matched with `fnmatch` (M6), not exact string
     equality -- every entry today is a plain literal name (no glob
     metacharacters), for which `fnmatch` behaves identically to exact
-    equality, except for `PUSH_EXCLUDES`' "secrets.age*", which is
-    deliberately a glob so it also catches `secrets.py`'s own
-    "secrets.age.<pid>.tmp" write-ahead temp file.
+    equality, except for `PUSH_EXCLUDES`' "*.age*", which is deliberately a
+    glob so it catches every age bundle (`secrets.age`, `deploy.age`, and any
+    future third one) plus `secrets.py`'s own "<name>.age.<pid>.tmp"
+    write-ahead temp file.
     """
     patterns = list(excludes)
     found: list[Path] = []

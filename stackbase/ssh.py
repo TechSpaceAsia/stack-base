@@ -374,7 +374,10 @@ class Ssh:
         `delete=True` (the default) passes `--delete`, so `remote_dir`
         converges to exactly `local_dir`'s contents. `exclude` patterns are
         passed through as `--exclude=<pattern>` (the reconciler uses this to
-        keep `secrets.age`/`keys/` off the wire).
+        keep every `*.age*` bundle -- `secrets.age`, `deploy.age`, and any
+        temp file a crashed save left beside either -- off the wire; see
+        `reconcile.PUSH_EXCLUDES`. `keys/*.pub` is deliberately NOT excluded:
+        the node's own flake reads it to build the admin accounts).
 
         `local_dir` is resolved to an absolute path before being handed to
         rsync -- a relative, dash-leading path (e.g. "-rf") would otherwise

@@ -123,6 +123,41 @@ def backup_env_digest(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+# Only for the warning below: nixos/backups.nix's own `on_calendar` default.
+# A project that overrode it fails at its own hour instead, which changes
+# nothing about what the operator has to do.
+_NIGHTLY_TIME = "03:00 UTC"
+
+
+def check_backup_credentials(bucket: str | None, backup_env_sha: str | None, *, emit: Callable[[str], None]) -> None:
+    """Warn when a bucket is named but no credentials will be pushed.
+
+    The two halves of "backups are on" are decided in two different places
+    and nothing else compares them: `nixos/backups.nix` turns the timer on
+    because stack.toml named a bucket, while the ENSURE_BACKUP_ENV step
+    pushes credentials only when all three `r2_*` keys are in secrets.age
+    (`backup_env_content` is all-or-nothing on purpose). Name the bucket and
+    forget the keys -- or set two of the three -- and the node ends up with
+    an installed timer that fails at 03:00 every night with "no credentials
+    in /var/lib/stackbase/backup.env", while `up` itself says nothing at all.
+
+    A warning, not a `StackError`: an operator mid-setup (bucket created,
+    R2 token not issued yet) must still be able to run `up` for everything
+    else. The line names all three keys because the failure mode that gets
+    reported is usually "I set the ones I had".
+    """
+    if not bucket or backup_env_sha is not None:
+        return
+    keys = ", ".join(key for key, _variable in _R2_KEYS)
+    emit(
+        f"! [backups] bucket = \"{bucket}\" is set but infra/secrets.age has no complete set of "
+        f"R2 credentials, so nothing is pushed -- the nightly backup timer is still installed on "
+        f"every node and will fail at {_NIGHTLY_TIME} with \"no credentials in {BACKUP_ENV_PATH}\". "
+        f"Set all three of {keys} (`./infra/up secrets set <key>`) and run `up` again, or remove "
+        "`bucket` from stack.toml's [backups] table to leave backups off."
+    )
+
+
 def run_backup_now(
     infra_dir: Path,
     *,

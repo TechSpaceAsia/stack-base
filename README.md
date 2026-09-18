@@ -401,6 +401,16 @@ for want of a matching runner, it simply never schedules it — so a tag that
 never deploys and never fails is a sign to check `runs-on`, not to wait
 longer.
 
+**CI decrypts nothing.** The workflow writes the `STACK_DEPLOY_KEY` secret
+to a file under `$RUNNER_TEMP` and exports `$STACKBASE_SSH_IDENTITY` — that
+is step **1** of "Which key a deploy offers" above, and it wins over
+`infra/deploy.age`. It has to: `infra/deploy.age` *is* in the checkout (you
+committed it), but the runner holds no age identity to open it, so without
+the explicit identity the deploy would stop at step 2 with "this project has
+a deploy key … but this machine cannot decrypt it". The key file is removed
+by an `if: always()` step, pass or fail. This is also what makes the
+`ubuntu-latest` fallback work — nothing about it needs `age` at all.
+
 **What `./infra/up ci-setup` does:** pushes the project's own deploy key
 (above) straight into a **repository-level** GitHub Actions secret
 (`STACK_DEPLOY_KEY`) — repo-level, not organization-level, because this
@@ -565,9 +575,20 @@ printf '%s' "$R2_ENDPOINT"          | ./infra/up secrets set r2_endpoint
 ./infra/up
 ```
 
-All three credentials or none: with an incomplete set, `./infra/up` pushes
-nothing and the nightly job stays off, rather than failing quietly at 03:00
-every night.
+**All three credentials or none.** With an incomplete set, `./infra/up`
+pushes nothing at all — a half-filled credentials file would be worse than
+none. But the *timer* is switched on by the `bucket` in `stack.toml`, not by
+the credentials, so naming a bucket without setting all three keys leaves
+every node with a nightly job that fails at 03:00 with `no credentials in
+/var/lib/stackbase/backup.env`. `./infra/up` warns about exactly that
+combination on every run:
+
+```
+! [backups] bucket = "..." is set but infra/secrets.age has no complete set of R2 credentials, ...
+```
+
+Finish the three `secrets set` commands, or drop `bucket` from the
+`[backups]` table to leave backups off.
 
 What happens at 03:00 UTC on each node:
 
@@ -593,8 +614,36 @@ store, which is world-readable.
 ./infra/up backup-now --node a
 ```
 
-Each node backs up **its own** database (see "What a replica is TODAY"), so
-a two-node project produces two independent sets of objects.
+**Multi-node projects need one bucket per node.** Each node backs up **its
+own** database (see "What a replica is TODAY"), but every node names its
+objects `db/<project>_<stamp>.sql.zst.age` from a timestamp taken in the
+first milliseconds of the run — and every node shares one `on_calendar`
+with no randomised delay. Two nodes therefore normally produce the *same*
+object name at the same minute, and the second upload silently overwrites
+the first. Only one node's backup survives, and which one is a race.
+
+Give each node its own destination in `infra/nodes/<name>/extra.nix`, which
+is loaded after the project-wide settings and so needs `lib.mkForce` to
+override one of them:
+
+```nix
+# infra/nodes/b/extra.nix
+{ lib, ... }:
+{
+  stackbase.backups.bucket = lib.mkForce "my-project-backups-b";
+}
+```
+
+Or back up the primary only — `enable` is a plain default here, so this one
+needs no `lib.mkForce`:
+
+```nix
+# infra/nodes/b/extra.nix
+{ ... }:
+{
+  stackbase.backups.enable = false;
+}
+```
 
 **A bucket listing is not a success report.** Each object is streamed
 straight to the bucket as it is produced, so a run that dies part-way
