@@ -393,11 +393,18 @@ so a release ships as soon as you `git push --tags`, with no laptop
 involved.
 
 The workflow runs on a **self-hosted** runner (`runs-on: [self-hosted,
-x86_64-linux]`), which is a NixOS machine we own: minutes are free, and it
-already carries the musl cross compiler and `tailwindcss`, so the workflow
-installs nothing but the Rust target. If you do not have that runner, change
-`runs-on` to `ubuntu-latest` and add `sudo apt-get install -y musl-tools`
-back to the toolchain step. If you push a tag without doing either, the
+production]`), which is a NixOS machine we own: minutes are free, and the
+`production` runner carries the musl cross compiler, `tailwindcss`, `python3`
+and `rsync`, so the workflow installs nothing but the Rust target. That runner
+is configured in platform-base (`services.github-runners.techspace-production`
+in `nixos/nixos-ollama.nix`); it is reserved for tag deploys and does not take
+pull-request CI, so a release never waits behind a test run. It ships only the
+node24 action runtime, so the template uses node24 actions and no
+`actions/cache` step: `$CARGO_HOME` persists in the runner's state directory
+between jobs, and the runner's built-in `hashFiles()` needs a node20 it does
+not have. If you do not have that runner, change `runs-on` to
+`ubuntu-latest` and add `sudo apt-get install -y musl-tools` back to the
+toolchain step. If you push a tag without doing either, the
 deploy job just queues forever with no error — GitHub does not fail a job
 for want of a matching runner, it simply never schedules it — so a tag that
 never deploys and never fails is a sign to check `runs-on`, not to wait

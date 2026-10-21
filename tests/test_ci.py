@@ -508,11 +508,18 @@ class WorkflowActionPinningTests(unittest.TestCase):
 
 
 class WorkflowRunnerTests(unittest.TestCase):
-    def test_it_runs_on_the_self_hosted_x86_64_linux_runner(self) -> None:
+    def test_it_runs_on_the_self_hosted_production_runner(self) -> None:
+        # `production`, and NOT `x86_64-linux`: the release runner is reserved
+        # for tag deploys so they never queue behind pull-request CI.
         match = re.search(r"^\s*runs-on:\s*(.+)$", _WORKFLOW_TEXT, re.MULTILINE)
 
         self.assertIsNotNone(match, "expected a runs-on: line")
-        self.assertEqual(match.group(1).strip(), "[self-hosted, x86_64-linux]")
+        self.assertEqual(match.group(1).strip(), "[self-hosted, production]")
+
+    def test_it_never_uses_the_runner_builtin_hashfiles(self) -> None:
+        # The self-hosted runners ship only the node24 runtime; the runner's
+        # built-in hashFiles() is hard-wired to node20 and fails there.
+        self.assertNotIn("hashFiles(", _WORKFLOW_TEXT)
 
     def test_there_is_exactly_one_job_and_one_runner(self) -> None:
         self.assertEqual(len(re.findall(r"^\s*runs-on:", _WORKFLOW_TEXT, re.MULTILINE)), 1)

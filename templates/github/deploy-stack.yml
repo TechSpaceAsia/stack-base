@@ -50,24 +50,29 @@ env:
 jobs:
   deploy:
     # A self-hosted runner, not ubuntu-latest: minutes on it are free (it
-    # is our own machine), and it is a NixOS box that already carries the
-    # musl cross compiler and tailwindcss -- so no C toolchain is
-    # installed at job time at all. `./infra/up deploy` wires
-    # $CC_x86_64_unknown_linux_musl / the cargo linker variable to
-    # x86_64-unknown-linux-musl-gcc by itself when it finds it on PATH
-    # (stackbase/release.py).
+    # is our own machine), and it is a NixOS box that carries the musl
+    # cross compiler and tailwindcss -- so no C toolchain is installed at
+    # job time at all. `./infra/up deploy` wires $CC_x86_64_unknown_linux_musl
+    # / the cargo linker variable to x86_64-unknown-linux-musl-gcc by itself
+    # when it finds it on PATH (stackbase/release.py).
     #
+    # The `production` label picks the release runner, which is reserved
+    # for tag-driven deploys: it does not carry the `x86_64-linux` label
+    # that pull-request CI asks for, so a release never queues behind CI.
     # The runner lives on nixos-ollama; its registration and toolchain are
-    # host-level config in platform-base, not in this repository. Both
-    # labels must match what that runner registers with. A project that
-    # copies this template but has no such runner registered will see
-    # every deploy job queue forever with no error -- GitHub does not fail
-    # a job for want of a matching runner, it just never schedules it. If
-    # you don't have this runner, see the README section on deploying from
-    # GitHub Actions for the ubuntu-latest fallback.
-    runs-on: [self-hosted, x86_64-linux]
+    # host-level config in platform-base (`services.github-runners
+    # .techspace-production` in nixos/nixos-ollama.nix), not in this
+    # repository. Both labels must match what that runner registers with.
+    # A project that copies this template but has no such runner
+    # registered will see every deploy job queue forever with no error --
+    # GitHub does not fail a job for want of a matching runner, it just
+    # never schedules it. If you don't have this runner, see the README
+    # section on deploying from GitHub Actions for the ubuntu-latest
+    # fallback.
+    runs-on: [self-hosted, production]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # node24 actions throughout: the runner ships only the node24 runtime.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Verify the tag matches Cargo.toml's version
         run: |
@@ -83,19 +88,17 @@ jobs:
         # the Rust target itself is per-job (and a no-op once cached).
         run: rustup target add x86_64-unknown-linux-musl
 
-      - name: Cache the cargo registry
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          # Deliberately NOT `target/`: `./infra/up deploy` builds inside its
-          # own throwaway `git worktree` (release.py's `release_worktree`, a
-          # fresh temp directory every run), so a build-output cache keyed to
-          # THIS checkout's own `target/` would never actually be reused --
-          # only the registry/git dependency download cache helps here.
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-
+      # No actions/cache step. On the self-hosted runner $CARGO_HOME lives in
+      # the runner's own state directory and persists between jobs, so the
+      # registry/git download cache is already warm, and the throwaway
+      # `git worktree` that `./infra/up deploy` builds in (release.py's
+      # `release_worktree`) means a `target/` cache keyed to this checkout
+      # would never be reused anyway. (The runner's built-in hashFiles
+      # expression function is also hard-wired to a node20 runtime the
+      # runner does not ship, so a cache key built on it fails there.) On
+      # the ubuntu-latest fallback, add actions/cache for ~/.cargo/registry
+      # and ~/.cargo/git back, keyed on a sha256sum of Cargo.lock from a
+      # shell step.
 
       - name: Write the CI deploy key and point $STACKBASE_SSH_IDENTITY at it
         env:
