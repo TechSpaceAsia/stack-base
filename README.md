@@ -22,6 +22,12 @@ sudo apt install python3 git openssh-client rsync age openssl
 brew install python3 git openssh rsync age openssl
 ```
 
+On a Mac, the commands that handle a plaintext secret for a moment
+(`deploy-key init`, `ci-setup`, `secrets edit`, `deploy`) attach a small RAM
+disk of their own with `hdiutil`/`diskutil`, use it, and detach it when
+done -- macOS has no `/dev/shm`. No root is needed and a volume called
+`stackbase-<pid>` appears on the desktop for a few seconds; that is it.
+
 You also need:
 
 - **A Hostinger API token** (hPanel → account → API). It buys and manages the
@@ -707,7 +713,8 @@ hypothesis, not a backup.
 Three ways to hurt yourself that no amount of code can prevent.
 
 **1. Never decrypt a secret to disk by hand.** stack-base never writes a
-plaintext secret anywhere except RAM (`/dev/shm`, wiped on the way out) —
+plaintext secret anywhere except RAM (`/dev/shm` on Linux, a short-lived RAM
+disk on macOS, wiped on the way out) —
 not to `/tmp`, not to the repository, not for a second. The moment you run
 something like `age -d -i ~/.age/key.txt infra/secrets.age > secrets.json`,
 every token, the TLS private key and the whole of `app_env` are sitting in
