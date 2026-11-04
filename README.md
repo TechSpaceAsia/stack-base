@@ -410,18 +410,29 @@ node24 action runtime, so the template uses node24 actions and no
 `actions/cache` step: `$CARGO_HOME` persists in the runner's state directory
 between jobs, and the runner's built-in `hashFiles()` needs a node20 it does
 not have. If you do not have that runner, change `runs-on` to
-`ubuntu-latest` and add `sudo apt-get install -y musl-tools` back to the
-toolchain step. If you push a tag without doing either, the
-deploy job just queues forever with no error — GitHub does not fail a job
-for want of a matching runner, it simply never schedules it — so a tag that
-never deploys and never fails is a sign to check `runs-on`, not to wait
-longer.
+`ubuntu-latest` and add the install step below right after checkout. If you
+push a tag without doing either, the deploy job just queues forever with no
+error — GitHub does not fail a job for want of a matching runner, it simply
+never schedules it — so a tag that never deploys and never fails is a sign to
+check `runs-on`, not to wait longer.
 
-Right after checkout, the workflow checks that the runner has `python3`, `rsync`,
-`tailwindcss`, the musl cross compiler, `rustup`, `git` and `ssh` on its `PATH`,
-and fails listing whatever is missing. A runner without them (the `ubuntu-latest`
-fallback has no `tailwindcss` or `rustup`, for instance) stops there in seconds
-rather than partway through the deploy.
+```yaml
+      - name: Install the deploy tools (ubuntu-latest only)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools rsync
+          # musl-tools ships `musl-gcc`; stack-base looks for the NixOS name.
+          sudo ln -sf "$(command -v musl-gcc)" /usr/local/bin/x86_64-unknown-linux-musl-gcc
+          # The standalone Tailwind binary, put on PATH (the preflight needs it there).
+          curl -fsSL -o "$RUNNER_TEMP/tailwindcss" https://github.com/tailwindlabs/tailwindcss/releases/latest/download/tailwindcss-linux-x64
+          sudo install -m 755 "$RUNNER_TEMP/tailwindcss" /usr/local/bin/tailwindcss
+```
+
+Right after checkout, the workflow runs a preflight that checks the runner has
+`python3`, `rsync`, `tailwindcss`, `x86_64-unknown-linux-musl-gcc`, `rustup`,
+`git` and `ssh` on its `PATH`, and fails naming whatever is still missing. The
+install step above must run before it, which is why it sits right after
+checkout; on a runner that has all of them, the preflight passes unchanged.
 
 **CI decrypts nothing.** The workflow writes the `STACK_DEPLOY_KEY` secret
 to a file under `$RUNNER_TEMP` and exports `$STACKBASE_SSH_IDENTITY` — that
@@ -430,8 +441,7 @@ is step **1** of "Which key a deploy offers" above, and it wins over
 committed it), but the runner holds no age identity to open it, so without
 the explicit identity the deploy would stop at step 2 with "this project has
 a deploy key … but this machine cannot decrypt it". The key file is removed
-by an `if: always()` step, pass or fail. This is also what makes the
-`ubuntu-latest` fallback work — nothing about it needs `age` at all.
+by an `if: always()` step, pass or fail. Neither runner needs `age`.
 
 **What `./infra/up ci-setup` does:** pushes the project's own deploy key
 (above) straight into a **repository-level** GitHub Actions secret
