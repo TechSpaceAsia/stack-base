@@ -255,7 +255,13 @@ class Local:
     logs_env_sha: str | None = None
 
 
-def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str | None = None) -> Local:
+def local_facts(
+    infra_dir: Path,
+    secrets: dict[str, str],
+    *,
+    stackbase_src: str | None = None,
+    env: Environment | None = None,
+) -> Local:
     """Gather everything `plan()` needs that lives on the operator's disk.
 
     `desired_rev` is the fingerprint a node records once it has successfully
@@ -265,11 +271,14 @@ def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str 
     # this module, so importing it at the top would be a cycle -- the same
     # trick `apply()` already uses for `stackbase.steps`.
     from stackbase.backups import backup_env_content, backup_env_digest
-    from stackbase.logs import logs_env_content, logs_env_digest
+    from stackbase.logs import logs_enabled, logs_env_content, logs_env_digest
 
     app_env_raw = secrets.get("app_env")
     backup_env = backup_env_content(secrets)
-    logs_env = logs_env_content(secrets)
+    # Only an environment that ships logs has its logs_* secrets validated
+    # and rendered: a project without [logs] is untouched by whatever odd
+    # value such a key might hold.
+    logs_env = logs_env_content(secrets) if env is not None and logs_enabled(env.logs) else None
     return Local(
         desired_rev=compute_rev(infra_dir, stackbase_src=stackbase_src),
         has_origin_cert=bool(secrets.get("origin_cert")) and bool(secrets.get("origin_key")),

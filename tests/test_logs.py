@@ -119,9 +119,20 @@ class LogsEnvPlanTests(unittest.TestCase):
 
     def test_local_facts_digests_the_logs_credentials(self) -> None:
         with Infra() as infra_dir:
-            self.assertIsNone(local_facts(infra_dir, {"hostinger_token": "h"}).logs_env_sha)
-            sha = local_facts(infra_dir, _LOGS_SECRETS).logs_env_sha
+            self.assertIsNone(local_facts(infra_dir, {"hostinger_token": "h"}, env=_env(_ON)).logs_env_sha)
+            sha = local_facts(infra_dir, _LOGS_SECRETS, env=_env(_ON)).logs_env_sha
         self.assertEqual(sha, logs_env_digest(logs_env_content(_LOGS_SECRETS) or ""))
+
+    def test_without_logs_odd_logs_secrets_are_neither_validated_nor_rendered(self) -> None:
+        """A project with no [logs] (or opted out) must not be broken by a
+        stray logs_* value that would fail the allowlist."""
+        odd = {**_LOGS_SECRETS, "logs_secret_access_key": "a$(id) b"}
+        with Infra() as infra_dir:
+            for env in (_env(LogsConfig()), _env(LogsConfig(enabled=False, bucket="acme-logs")), None):
+                with self.subTest(env=env and env.logs):
+                    self.assertIsNone(local_facts(infra_dir, odd, env=env).logs_env_sha)
+            with self.assertRaises(StackError):
+                local_facts(infra_dir, odd, env=_env(_ON))
 
     def test_no_logs_table_plans_nothing_even_with_credentials(self) -> None:
         """A project without [logs] plans exactly what it planned before."""

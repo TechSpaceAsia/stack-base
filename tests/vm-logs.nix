@@ -148,9 +148,32 @@ pkgs.testers.runNixOSTest {
         # Let Vector read them and fail at least one upload, so they sit in
         # its disk buffer rather than only in the journal...
         time.sleep(${toString (batchSeconds * 3)})
-        # The disk buffer, not just the journal, holds them: there is data
-        # under data_dir's buffer for the R2 sink before the restart.
+        # The disk buffer, not the journal, must be what brings them back:
+        # there is data under data_dir's buffer for the R2 sink, and the
+        # journald source's checkpoint (<data_dir>/<source id>/checkpoint.txt
+        # in Vector 0.55) is already past every probe -- so a re-read of the
+        # journal after the restart would not include a single one of them.
         node.succeed("find /var/lib/vector/buffer -type f -size +1k | grep -q .")
+        checkpoint = "/var/lib/vector/journal/checkpoint.txt"
+        node.succeed(f"test -s {checkpoint}")
+        print("journald checkpoint: " + node.succeed(f"cat {checkpoint}").strip())
+        # A real cursor in this journal, so the --after-cursor count below
+        # cannot be 0 merely because journalctl rejected the cursor.
+        node.succeed(f"journalctl --no-pager -n 1 --cursor=\"$(cat {checkpoint})\" >/dev/null")
+        logged = node.succeed(f"journalctl -t outage -o cat --no-pager | grep -c '^{tag}-' || true").strip()
+        assert logged == "1000", f"journal has {logged} of the probes before the restart"
+        after = node.succeed(
+            f"journalctl -t outage -o cat --no-pager --after-cursor=\"$(cat {checkpoint})\" "
+            f"| grep -c '^{tag}-' || true"
+        ).strip()
+        print(f"probes in the journal after the checkpoint: {after}")
+        assert after == "0", f"{after} probes are still ahead of the checkpoint"
+        # And remove them from the journal altogether, so nothing but the
+        # buffer could possibly deliver them.
+        node.succeed("journalctl --rotate && journalctl --vacuum-time=1s")
+        gone = node.succeed(f"journalctl -t outage -o cat --no-pager | grep -c '^{tag}-' || true").strip()
+        print(f"probes left in the journal after vacuum: {gone}")
+        assert gone == "0", f"{gone} probes survived the vacuum"
         # ...then restart it while the bucket is still unreachable: whatever
         # was buffered must survive the restart.
         node.succeed("systemctl restart vector.service")

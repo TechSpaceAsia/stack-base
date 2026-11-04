@@ -7,10 +7,19 @@
 # What survives losing the server is what reached the bucket, so the R2
 # sink's batch timeout (`batchSeconds`, 15 s) is the loss window. Nothing
 # else is lost to an R2 outage shorter than the local journal's 7 days
-# (base.nix): Vector's journald checkpoint only moves once an event is in
-# the disk buffer, and the buffer blocks (rather than drops) when full, so
-# the journal itself is the overflow. Delivery is at-least-once -- every
-# event keeps its journal `cursor` so duplicates can be removed.
+# (base.nix) -- provided the journal does not hit its SystemMaxUse=2G /
+# SystemKeepFree=4G caps first, which a very chatty node can: journald then
+# drops its oldest files, even ones Vector has not read yet. Vector's
+# journald checkpoint only moves once an event is in the disk buffer, and
+# the buffer blocks (rather than drops) when full, so the journal itself is
+# the overflow. One more small window: the disk buffer acknowledges on
+# write, not fsync, and journald syncs every 5 s, so a power cut can take
+# the last few seconds. Delivery is at-least-once -- every event keeps its
+# journal `cursor` so duplicates can be removed.
+#
+# After a restart Vector may log one "Invalid record from journald ...
+# text=-- cursor: s=..." error. It is benign: that is journalctl's own
+# --show-cursor trailer line, which Vector reads but is not an entry.
 #
 # Credentials come from /var/lib/stackbase/logs.env (written by
 # `./infra/up`'s ENSURE_LOGS_ENV step from the environment's logs_* secrets
@@ -133,9 +142,11 @@ let
 
   # The nixpkgs module's own build-time `vector validate` cannot see
   # ${LOGS_ENDPOINT} and fails on it, so it is turned off and replaced by
-  # this one, which supplies a dummy endpoint. A typo in any option name
-  # still fails the build, never the server.
-  configFile = (pkgs.formats.toml { }).generate "vector.toml" settings;
+  # this one, which supplies a dummy endpoint. It validates the MERGED
+  # services.vector.settings -- the exact file the unit runs, including
+  # anything infra/conf.d added -- so a typo in any option name still fails
+  # the build, never the server.
+  configFile = (pkgs.formats.toml { }).generate "vector.toml" config.services.vector.settings;
   validated = pkgs.runCommand "stackbase-vector-validate" { nativeBuildInputs = [ config.services.vector.package ]; } ''
     LOGS_ENDPOINT=https://validate.invalid vector validate --no-environment ${configFile}
     touch "$out"

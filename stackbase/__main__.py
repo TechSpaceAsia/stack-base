@@ -348,7 +348,7 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env_
         print(redact(warning, redaction_values(secrets)))
 
     stackbase_src = os.environ.get("STACKBASE_SRC") or None
-    local = local_facts(infra_dir, secrets, stackbase_src=stackbase_src)
+    local = local_facts(infra_dir, secrets, stackbase_src=stackbase_src, env=env)
     # stack.toml's bucket is what turns the node's nightly timer ON;
     # secrets.age's three r2_* keys are what make it able to run. Nothing
     # else compares them, so an incomplete pair is silent here and loud at

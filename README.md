@@ -940,7 +940,12 @@ and the journal keeps 7:
 survives restarts, and only moves its journal bookmark once an entry is in
 that buffer. When the buffer is full it waits, and the journal itself holds
 the rest — so an R2 outage of up to **7 days** (the local journal's
-retention) loses nothing, and Vector catches up on its own afterwards.
+retention) loses nothing, and Vector catches up on its own afterwards. That
+holds as long as the journal stays inside its size caps (`SystemMaxUse=2G`,
+`SystemKeepFree=4G`): a very chatty server can reach them sooner, and
+journald then drops its oldest files, read by Vector or not. A sudden power
+cut can also take the last few seconds, because journald syncs to disk every
+5 seconds and Vector's buffer does not wait for an fsync.
 Delivery is **at least once**: after a restart or a retry the same entry
 can be uploaded twice. Every entry carries its journal `cursor`, which is
 unique — dedupe on it (as the `jq` line above does). A full local disk
@@ -1066,6 +1071,7 @@ Every failure is one line: what went wrong, then what to check.
 | `the backup unit failed on node a` | `./infra/up ssh a -- journalctl -u stackbase-backup -n 50` — the usual causes are wrong R2 credentials or a bucket that does not exist |
 | `… turns logs on but names no [logs] bucket` | Set `bucket` in `[logs]` (or `logs.bucket` in that environment), or `enabled = false` to leave logs off — see [Logs](#logs) |
 | `[logs] bucket = "…" is set but … has no complete set of logs credentials` | Set `logs_access_key_id`, `logs_secret_access_key` and `r2_endpoint` as in [Logs](#logs) |
+| `Invalid record from journald, discarding … text=-- cursor: s=…` in `journalctl -u vector` | Harmless: right after a restart Vector reads journalctl's own cursor trailer line, which is not a log entry. Nothing is lost |
 | Nothing new in the logs bucket | `./infra/up ssh a -- systemctl status vector` and `-- journalctl -u vector -n 50`; the usual causes are a wrong token or a bucket that does not exist |
 | `this project has no backup bucket` | Add `[backups] bucket = "..."` to `stack.toml` and run `./infra/up` |
 
