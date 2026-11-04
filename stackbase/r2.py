@@ -57,6 +57,8 @@ class R2Account:
         self._token = token
         self._account_id = account_id
         self._base_url = base_url.rstrip("/")
+        # Buckets this client created itself: they cannot hold foreign rules.
+        self._created: set[str] = set()
 
     def _path(self, bucket: str, suffix: str = "") -> str:
         if not _BUCKET_RE.match(bucket):
@@ -113,15 +115,16 @@ class R2Account:
     def create_bucket(self, name: str) -> None:
         self._path(name)  # validates the name
         self._call("POST", f"/accounts/{self._account_id}/r2/buckets", json_body={"name": name})
+        self._created.add(name)
 
     def get_lifecycle(self, name: str) -> list[dict]:
-        return _rules(self._call("GET", self._path(name, "/lifecycle")), name, "lifecycle")
+        return _rules(self._call("GET", self._path(name, "/lifecycle")), name, "lifecycle", fresh=name in self._created)
 
     def put_lifecycle(self, name: str, rules: list[dict]) -> None:
         self._put_rules(self._path(name, "/lifecycle"), rules)
 
     def get_lock(self, name: str) -> list[dict]:
-        return _rules(self._call("GET", self._path(name, "/lock")), name, "lock")
+        return _rules(self._call("GET", self._path(name, "/lock")), name, "lock", fresh=name in self._created)
 
     def put_lock(self, name: str, rules: list[dict]) -> None:
         self._put_rules(self._path(name, "/lock"), rules)
@@ -148,7 +151,7 @@ def _is_missing_bucket(body: str) -> bool:
     return isinstance(errors, list) and any(isinstance(e, dict) and e.get("code") == 10006 for e in errors)
 
 
-def _rules(parsed: dict[str, Any], bucket: str, what: str) -> list[dict]:
+def _rules(parsed: dict[str, Any], bucket: str, what: str, *, fresh: bool = False) -> list[dict]:
     """The rule list from a GET. Only an explicit `"rules": []` means "no rules".
 
     Both PUTs replace the whole list, so a GET we cannot read must never be
@@ -158,6 +161,10 @@ def _rules(parsed: dict[str, Any], bucket: str, what: str) -> list[dict]:
     bucket omits it; the live API is believed to return `"rules": []`.)
     """
     result = parsed.get("result")
+    if fresh and isinstance(result, dict) and "rules" not in result:
+        # A bucket this run just created cannot hold foreign rules, so an
+        # answer with no `rules` key (`result: {}`) means none yet.
+        return []
     rules = result.get("rules") if isinstance(result, dict) else None
     if not isinstance(rules, list) or not all(isinstance(r, dict) for r in rules):
         raise StackError(

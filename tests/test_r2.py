@@ -191,6 +191,26 @@ class UnreadableRulesTests(unittest.TestCase):
             ensure_lock_rule(R2Account("tok", _ACCT, base_url=server.url), "acme-b", files_lock_rule(30))
             self.assertEqual([r["id"] for r in server.requests[1]["body"]["rules"]], ["stackbase-files"])
 
+    def test_just_created_bucket_treats_empty_result_as_no_rules(self) -> None:
+        with FakeServer() as server:
+            server.script("POST", _B, 200, _fx("r2_bucket_create.json"))
+            server.script("GET", f"{_B}/acme-b/lock", 200, {"success": True, "errors": [], "result": {}})
+            server.script("PUT", f"{_B}/acme-b/lock", 200, _fx("r2_put_ok.json"))
+            acct = R2Account("tok", _ACCT, base_url=server.url)
+            acct.create_bucket("acme-b")
+            ensure_lock_rule(acct, "acme-b", files_lock_rule(30))
+            self.assertEqual([r["id"] for r in server.requests[2]["body"]["rules"]], ["stackbase-files"])
+
+    def test_just_created_bucket_still_refuses_null_result(self) -> None:
+        with FakeServer() as server:
+            server.script("POST", _B, 200, _fx("r2_bucket_create.json"))
+            server.script("GET", f"{_B}/acme-b/lock", 200, {"success": True, "errors": [], "result": None})
+            acct = R2Account("tok", _ACCT, base_url=server.url)
+            acct.create_bucket("acme-b")
+            with self.assertRaises(StackError):
+                ensure_lock_rule(acct, "acme-b", files_lock_rule(30))
+            self.assertEqual([r["method"] for r in server.requests], ["POST", "GET"])
+
     def test_404_with_other_error_code_is_not_absent(self) -> None:
         with FakeServer() as server:
             server.script("GET", f"{_B}/acme-b", 404, {"success": False, "errors": [{"code": 7003, "message": "no route"}]})
