@@ -113,10 +113,23 @@
       # default when stack.toml does not set it. An environment's own
       # backups.* keys (bucket, retention_days) are merged over the shared
       # table; stackbase/config.py already refused any other key there.
-      backupsOptions = env:
-        let backupsConfig = (stack.backups or { }) // (environments.${env}.backups or { });
+      #
+      # An environment whose OWN table says `enabled = false` (and names no
+      # bucket) opts out cleanly: the bucket it would inherit from the shared
+      # table is dropped, mirroring stackbase/config.py's rule. An explicit
+      # `enabled = false` in the merged result always turns the module off.
+      mergeSection = shared: own:
+        let merged = shared // own;
         in
-        (if backupsConfig ? bucket then { bucket = backupsConfig.bucket; } else { })
+        if (own.enabled or true) == false && !(own ? bucket)
+        then builtins.removeAttrs merged [ "bucket" ]
+        else merged;
+
+      backupsOptions = env:
+        let backupsConfig = mergeSection (stack.backups or { }) (environments.${env}.backups or { });
+        in
+        (if backupsConfig ? enabled then { enable = backupsConfig.enabled; } else { })
+        // (if backupsConfig ? bucket then { bucket = backupsConfig.bucket; } else { })
         // (if backupsConfig ? retention_days then { retentionDays = backupsConfig.retention_days; } else { })
         // (if backupsConfig ? extra_paths then { extraPaths = backupsConfig.extra_paths; } else { })
         // (if backupsConfig ? on_calendar then { onCalendar = backupsConfig.on_calendar; } else { });
@@ -126,7 +139,7 @@
       # `enabled = false` turns it off even with one. retention_days is the
       # bucket's lifecycle rule, which `./infra/up` sets -- not a node option.
       logsOptions = env:
-        let logsConfig = (stack.logs or { }) // (environments.${env}.logs or { });
+        let logsConfig = mergeSection (stack.logs or { }) (environments.${env}.logs or { });
         in
         (if logsConfig ? bucket then { bucket = logsConfig.bucket; } else { })
         // (if logsConfig ? enabled then { enable = logsConfig.enabled; } else { });

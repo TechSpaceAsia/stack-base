@@ -442,6 +442,33 @@ class TemplateEnvironmentsTests(unittest.TestCase):
                 self.assertTrue(facts["logsEnable"])
                 self.assertTrue(facts["vectorEnable"])
 
+    def test_environment_opt_out_beats_the_shared_buckets(self) -> None:
+        """staging sets backups.enabled / logs.enabled = false and no bucket
+        of its own: it must evaluate to backups off and logs off despite the
+        shared buckets, while production keeps both."""
+        facts_fn = _ENV_FACTS[:-2] + " backupsEnable = node.config.stackbase.backups.enable; }"
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_envs_template(directory)
+            toml = (directory / "stack.toml").read_text(encoding="utf-8")
+            for line in ('backups.bucket = "acme-backups-staging"', 'logs.bucket = "acme-logs-staging"'):
+                self.assertIn(line, toml)
+            toml = toml.replace('backups.bucket = "acme-backups-staging"', "backups.enabled = false")
+            toml = toml.replace('logs.bucket = "acme-logs-staging"', "logs.enabled = false")
+            (directory / "stack.toml").write_text(toml, encoding="utf-8")
+
+            staging = _nix_eval_attr(directory, 'nixosConfigurations."staging-a"', facts_fn)
+            production = _nix_eval_attr(directory, 'nixosConfigurations."production-a"', facts_fn)
+
+            self.assertFalse(staging["backupsEnable"])
+            self.assertEqual(staging["backupsBucket"], "")
+            self.assertFalse(staging["logsEnable"])
+            self.assertFalse(staging["vectorEnable"])
+            self.assertTrue(production["backupsEnable"])
+            self.assertEqual(production["backupsBucket"], "acme-backups")
+            self.assertTrue(production["logsEnable"])
+            self.assertEqual(production["logsBucket"], "acme-logs")
+
     def test_logs_enabled_false_turns_vector_off_even_with_a_bucket(self) -> None:
         with TemporaryDirectory() as tmp:
             directory = Path(tmp)
