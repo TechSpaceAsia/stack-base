@@ -35,6 +35,7 @@ from stackbase.secrets import (
     check_recipients_superset,
     deploy_file,
     deploy_pub_name,
+    deploy_pub_path,
     secrets_file,
     load_secrets,
     read_recipients,
@@ -393,7 +394,9 @@ def deploy_key_show_pub(
     infra_dir: Path, *, emit: Callable[[str], None] = print, env: str | None = None
 ) -> None:
     """Print the deploy key's PUBLIC half -- never touches deploy.age."""
-    pub_path = infra_dir / "keys" / deploy_pub_name(env)
+    # Through load_config, so a project with environments refuses a missing
+    # or unknown env here too instead of reading the legacy keys/deploy.pub.
+    pub_path = deploy_pub_path(infra_dir, load_config(infra_dir).env(env))
     if not pub_path.is_file():
         env_flag = f"--env {env} " if env else ""
         raise StackError(

@@ -50,7 +50,6 @@ from stackbase.reconcile import (
 )
 from stackbase.release import run_deploy, run_rollback, run_status
 from stackbase.secrets import (
-    SECRETS_FILE,
     SecretsFile,
     check_recipients_superset,
     deploy_file,
@@ -66,10 +65,28 @@ _DEFAULT_INFRA_DIR = "./infra"
 _ENV_HELP = "the environment to act on -- required once stack.toml has [environments]"
 
 
-def _add_env(parser: argparse.ArgumentParser) -> None:
+# Where each `--env` lands: the global one in `env`, one after a command in
+# `env_cmd`, one after a nested command (`secrets set`, `deploy-key init`)
+# in `env_sub`. Separate dests, so `main()` sees every value given and can
+# refuse two different ones instead of letting the last silently win.
+_ENV_DESTS = ("env", "env_cmd", "env_sub")
+
+
+def _add_env(parser: argparse.ArgumentParser, dest: str) -> None:
     """`--env` after the subcommand as well as before it. SUPPRESS keeps a
-    subcommand that was not given the flag from resetting the global one."""
-    parser.add_argument("--env", default=argparse.SUPPRESS, metavar="NAME", help=_ENV_HELP)
+    subcommand that was not given the flag from setting its dest at all."""
+    parser.add_argument("--env", dest=dest, default=argparse.SUPPRESS, metavar="NAME", help=_ENV_HELP)
+
+
+def _env_arg(args: argparse.Namespace) -> str | None:
+    """The one `--env` value given, wherever it was given; two different ones are refused."""
+    given = [value for dest in _ENV_DESTS if (value := getattr(args, dest, None)) is not None]
+    if len(set(given)) > 1:
+        raise StackError(
+            f"--env was given more than once with different values: {', '.join(given)}",
+            "pass --env once -- a command acts on exactly one environment",
+        )
+    return given[0] if given else None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -161,11 +178,10 @@ def build_parser() -> argparse.ArgumentParser:
     secrets_edit_p.add_argument("key", help="the secret's name")
     secrets_edit_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
 
-    for leaf in (
-        up, shell, deploy, rollback, status, backup_now_p, ci_setup_p, deploy_key_p, deploy_key_init_p,
-        deploy_key_show_p, secrets_p, secrets_keys_p, secrets_set_p, secrets_unset_p, secrets_edit_p,
-    ):
-        _add_env(leaf)
+    for command in (up, shell, deploy, rollback, status, backup_now_p, ci_setup_p, deploy_key_p, secrets_p):
+        _add_env(command, "env_cmd")
+    for leaf in (deploy_key_init_p, deploy_key_show_p, secrets_keys_p, secrets_set_p, secrets_unset_p, secrets_edit_p):
+        _add_env(leaf, "env_sub")
 
     return parser
 
@@ -182,7 +198,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         # Every command acts on one environment, so the selection is checked
         # here, once, before any of them reads a secret or opens a socket.
-        env = _selected_env(infra_dir, args.env)
+        env = _selected_env(infra_dir, _env_arg(args))
         if args.command == "up":
             _up(args, infra_dir, secrets, env)
         elif args.command == "ssh":
@@ -250,7 +266,10 @@ def _selected_env(infra_dir: Path, name: str | None) -> str | None:
 
 
 def _secrets_file_for(infra_dir: Path, env: str | None) -> SecretsFile:
-    return secrets_file(load_config(infra_dir).env(env)) if env else SECRETS_FILE
+    # Through load_config even without --env, never a bare fallback to
+    # secrets.age: whatever `_selected_env` concluded, `StackConfig.env` is
+    # the one place that decides which file an environment's secrets live in.
+    return secrets_file(load_config(infra_dir).env(env))
 
 
 def _print_traceback(debug: bool, secrets: dict[str, str]) -> None:

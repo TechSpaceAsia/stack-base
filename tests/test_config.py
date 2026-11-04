@@ -792,6 +792,51 @@ class EnvironmentsTests(unittest.TestCase):
                     load_config(infra_dir)
                 self.assertIn("environment name", str(caught.exception))
 
+    def test_two_environments_cannot_share_a_vps_or_a_domain(self) -> None:
+        shared_vps = _TWO_ENVS.replace(
+            '[environments.staging.nodes.a]\nrole = "primary"\n', '[environments.staging.nodes.a]\nrole = "primary"\nvps_id = 42\n'
+        ).replace(
+            '[environments.production.nodes.a]\nrole = "primary"\n',
+            '[environments.production.nodes.a]\nrole = "primary"\nvps_id = 42\n',
+        )
+        shared_domain = _TWO_ENVS.replace('domain = "staging.acme.example.com"', 'domain = "ACME.example.com"')
+        for toml, named in ((shared_vps, "42"), (shared_domain, "acme.example.com")):
+            with self.subTest(named=named), TempInfraDir() as infra_dir:
+                self.assertNotEqual(toml, _TWO_ENVS)
+                _envs_project(infra_dir, toml)
+
+                with self.assertRaises(StackError) as caught:
+                    load_config(infra_dir)
+
+                message = caught.exception.message
+                self.assertIn("'staging'", message)
+                self.assertIn("'production'", message)
+                self.assertIn(named, message.lower())
+
+    def test_a_vps_id_used_twice_within_one_environment_is_not_this_check(self) -> None:
+        # Distinct ids across environments load fine.
+        toml = _TWO_ENVS.replace(
+            '[environments.staging.nodes.a]\nrole = "primary"\n', '[environments.staging.nodes.a]\nrole = "primary"\nvps_id = 1\n'
+        ).replace(
+            '[environments.production.nodes.a]\nrole = "primary"\n',
+            '[environments.production.nodes.a]\nrole = "primary"\nvps_id = 2\n',
+        )
+        with TempInfraDir() as infra_dir:
+            _envs_project(infra_dir, toml)
+            self.assertEqual(load_config(infra_dir).env("production").nodes["a"].vps_id, 2)
+
+    def test_an_empty_or_non_table_environments_key_is_an_error(self) -> None:
+        legacy_body = VALID_TOML.split("[nodes.a]")[0]
+        for value in ("environments = {}\n", 'environments = "staging"\n', "environments = []\n"):
+            with self.subTest(value=value), TempInfraDir() as infra_dir:
+                write_toml(infra_dir, legacy_body.replace('domain = "acme.example.com"\n', "") + value)
+                write_key(infra_dir, "matt", VALID_ED25519_KEY)
+
+                with self.assertRaises(StackError) as caught:
+                    load_config(infra_dir)
+
+                self.assertIn("[environments]", str(caught.exception))
+
     def test_env_selection_errors(self) -> None:
         with TempInfraDir() as infra_dir:
             _envs_project(infra_dir)

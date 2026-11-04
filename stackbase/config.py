@@ -435,7 +435,38 @@ def _parse_environments(raw: Any, shared: Environment, toml_path: Path) -> dict[
             files=_merge(shared.files, _parse_files(table, toml_path, table=f"{label}.files"),
                          table.get("files")),
         )
+    _reject_shared_servers(environments, toml_path)
     return environments
+
+
+def _reject_shared_servers(environments: dict[str, Environment], toml_path: Path) -> None:
+    """Two environments must never share a server or a domain.
+
+    The same vps_id in staging and production would mean `--env staging up`
+    reinstalls, rebuilds and deploys onto a production machine; the same
+    domain would point production's DNS record (and its origin certificate)
+    at whichever environment ran last. Either is a typo with production as
+    the casualty, so it is caught here, before any command can act on it.
+    """
+    domains: dict[str, str] = {}
+    vps_ids: dict[int, str] = {}
+    for name, env in environments.items():
+        other = domains.setdefault(env.domain.lower(), name)
+        if other != name:
+            raise StackError(
+                f"environments '{other}' and '{name}' in {toml_path} both use the domain {env.domain}",
+                "give each environment its own domain, e.g. staging.<domain> for staging",
+            )
+        for node in env.nodes.values():
+            if node.vps_id is None:
+                continue
+            other = vps_ids.setdefault(node.vps_id, name)
+            if other != name:
+                raise StackError(
+                    f"environments '{other}' and '{name}' in {toml_path} both use vps_id {node.vps_id}",
+                    "each environment needs its own servers -- fix the vps_id in one of them, or remove it "
+                    "there to let stack-base buy that environment its own",
+                )
 
 
 def _merge(shared: Any, override: Any, raw: dict[str, Any] | None) -> Any:

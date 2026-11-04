@@ -22,10 +22,14 @@ entry -- see the README.
 
 With environments, each one has its own deploy key and its own secret:
 `ci-setup --env staging` pushes `deploy.staging.age` into
-`STACK_DEPLOY_KEY_STAGING`, `--env production` pushes `deploy.production.age`
-into `STACK_DEPLOY_KEY_PRODUCTION`. The workflow template deploys staging on
-a tag push and production only from a manual run gated by the GitHub
-Environment `production`, whose creation ci-setup explains.
+`STACK_DEPLOY_KEY_STAGING`. Production is the exception: it is never
+deployed from CI, so `ci-setup --env production` refuses. On GitHub Free a
+private repository has no Environments, environment secrets or required
+reviewers, so nothing inside GitHub could gate a production deploy, and a
+repo secret is readable by any workflow on any pushed branch or tag. A
+release is promoted to production from an operator's own machine instead
+(`./infra/up --env production deploy <tag>`), and the age identity that
+opens `deploy.production.age` is the gate.
 """
 
 from __future__ import annotations
@@ -49,9 +53,7 @@ from stackbase.secrets_cli import deploy_key_init
 
 SECRET_NAME = "STACK_DEPLOY_KEY"
 
-# The GitHub Environment the template's production job runs in. Required
-# reviewers on it are what stops a production deploy from happening without
-# a human's say-so.
+# The environment ci-setup refuses: production deploys are not run from CI.
 PRODUCTION_ENVIRONMENT = "production"
 
 
@@ -134,7 +136,8 @@ def ci_setup(
     """Push the project's deploy key into the repo-level GitHub Actions secret.
 
     `env` selects the environment: its own deploy key, pushed into its own
-    secret (`ci_secret_name`).
+    secret (`ci_secret_name`). An environment named `production` is
+    refused before anything else happens: see the module docstring.
 
     There is ONE project deploy key (`infra/deploy.age`, public half
     `infra/keys/deploy.pub`), used by CI and by humans alike -- ci-setup no
@@ -152,7 +155,16 @@ def ci_setup(
     a key is generated. The private key is registered for redaction before
     the one call that could conceivably echo it back.
     """
-    file = deploy_file(load_config(infra_dir).env(env)) if env else DEPLOY_FILE
+    if env == PRODUCTION_ENVIRONMENT:
+        raise StackError(
+            "production deploys are not run from CI, so ci-setup does not push production's deploy key",
+            "CI deploys staging; once staging looks right, promote that same tag from your own machine "
+            "(your age identity is what unlocks deploy.production.age): "
+            'TAG=v1.2.3; ./infra/up --env production deploy "$TAG"',
+        )
+    # Through load_config even for env=None: a project with environments
+    # then refuses here too, instead of quietly using the legacy deploy.age.
+    file = deploy_file(load_config(infra_dir).env(env))
     deploy_path = infra_dir / file.name
     secret_name = ci_secret_name(env)
     env_flag = f" --env {env}" if env else ""
@@ -224,15 +236,11 @@ def ci_setup(
     if not env:
         # The template deploys `--env staging` on a tag and `--env production`
         # by hand; a project without [environments] runs the staging job only.
-        emit("     (the workflow is for staging + production: without [environments], drop `--env staging`")
-        emit("     from its staging job and delete its production job)")
-    if env == PRODUCTION_ENVIRONMENT:
-        emit(f"  4. create the GitHub Environment '{PRODUCTION_ENVIRONMENT}' the production job runs in, and")
-        emit("     give it required reviewers so nobody promotes a release alone:")
-        emit(f"     gh api -X PUT repos/{repo_slug}/environments/{PRODUCTION_ENVIRONMENT}")
-        emit(f"     then add the required reviewers in https://github.com/{repo_slug}/settings/environments")
-        emit("     A production deploy is then: Actions -> Deploy (stack-base) -> Run workflow, with the")
-        emit("     tag staging already runs.")
+        emit("     (the workflow deploys `--env staging`: without [environments], drop `--env staging`")
+        emit("     from its deploy step)")
+    if env:
+        emit("  Production is never deployed from CI: once staging looks right, promote the same tag")
+        emit('  from your own machine: TAG=v1.2.3; ./infra/up --env production deploy "$TAG"')
     if rotate:
         # The GitHub secret was already replaced above, immediately -- not
         # step 2. Until step 1 is committed AND step 2 has installed the new

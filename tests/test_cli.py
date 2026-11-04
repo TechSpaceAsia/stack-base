@@ -871,6 +871,18 @@ class SshCommandTests(unittest.TestCase):
             self.assertIn("known nodes: a", stderr.getvalue())
 
 
+def _legacy_infra(root: Path) -> Path:
+    """A valid single-environment infra/ (the secrets commands read stack.toml
+    to pick their file -- `secrets.age` here)."""
+    infra_dir = root / "infra"
+    (infra_dir / "keys").mkdir(parents=True)
+    (infra_dir / "stack.toml").write_text(_STACK_TOML, encoding="utf-8")
+    (infra_dir / "keys" / "matt.pub").write_text(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForCliTests matt@laptop\n", encoding="utf-8"
+    )
+    return infra_dir
+
+
 class CiSetupAndSecretsWiringTests(unittest.TestCase):
     """`ci-setup` and `secrets ...` reach the right module function with the
     right arguments -- the argument-parsing/dispatch wiring in __main__.py,
@@ -900,8 +912,7 @@ class CiSetupAndSecretsWiringTests(unittest.TestCase):
 
     def test_secrets_keys_prints_each_name_on_its_own_line(self) -> None:
         with TemporaryDirectory() as tmp:
-            infra_dir = Path(tmp) / "infra"
-            infra_dir.mkdir()
+            infra_dir = _legacy_infra(Path(tmp))
             stdout = io.StringIO()
 
             with mock.patch("stackbase.__main__.list_key_names", return_value=["a_key", "b_key"]):
@@ -912,18 +923,17 @@ class CiSetupAndSecretsWiringTests(unittest.TestCase):
 
     def test_secrets_set_dispatches_with_the_key_argument(self) -> None:
         with TemporaryDirectory() as tmp:
-            infra_dir = Path(tmp) / "infra"
-            infra_dir.mkdir()
+            infra_dir = _legacy_infra(Path(tmp))
 
             with mock.patch("stackbase.__main__.set_key") as set_key_mock:
                 main(["--infra-dir", str(infra_dir), "secrets", "set", "cloudflare_token"])
 
             self.assertEqual(set_key_mock.call_args.args, (infra_dir, "cloudflare_token"))
+            self.assertEqual(set_key_mock.call_args.kwargs["file"].name, "secrets.age")
 
     def test_secrets_unset_dispatches_with_the_key_argument(self) -> None:
         with TemporaryDirectory() as tmp:
-            infra_dir = Path(tmp) / "infra"
-            infra_dir.mkdir()
+            infra_dir = _legacy_infra(Path(tmp))
 
             with mock.patch("stackbase.__main__.unset_key") as unset_key_mock:
                 main(["--infra-dir", str(infra_dir), "secrets", "unset", "cloudflare_token"])
@@ -932,8 +942,7 @@ class CiSetupAndSecretsWiringTests(unittest.TestCase):
 
     def test_secrets_edit_dispatches_with_the_key_argument(self) -> None:
         with TemporaryDirectory() as tmp:
-            infra_dir = Path(tmp) / "infra"
-            infra_dir.mkdir()
+            infra_dir = _legacy_infra(Path(tmp))
 
             with mock.patch("stackbase.__main__.edit_key") as edit_key_mock:
                 main(["--infra-dir", str(infra_dir), "secrets", "edit", "app_env"])
@@ -1161,6 +1170,30 @@ class EnvironmentFlagTests(unittest.TestCase):
 
                     self.assertIn("'prod'", output)
                     self.assertIn("staging, production", output)
+
+    def test_conflicting_env_flags_are_refused(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = _envs_infra(Path(tmp))
+            for argv in (
+                ["--env", "staging", "deploy", "v1.0.0", "--env", "production"],
+                ["--env", "production", "up", "--plan", "--env", "staging"],
+                ["secrets", "--env", "staging", "keys", "--env", "production"],
+                ["deploy-key", "--env", "production", "show-pub", "--env", "staging"],
+            ):
+                with self.subTest(argv=argv):
+                    output = _run_failing(["--infra-dir", str(infra_dir), *argv])
+
+                    self.assertIn("--env was given more than once", output)
+                    self.assertIn("staging", output)
+                    self.assertIn("production", output)
+
+    def test_the_same_env_given_twice_is_fine(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = _envs_infra(Path(tmp))
+            with mock.patch("stackbase.__main__.run_status") as status_mock:
+                main(["--infra-dir", str(infra_dir), "--env", "staging", "status", "--env", "staging"])
+
+            self.assertEqual(status_mock.call_args.kwargs["env"], "staging")
 
     def test_env_on_a_project_without_environments_is_refused(self) -> None:
         with TemporaryDirectory() as tmp:

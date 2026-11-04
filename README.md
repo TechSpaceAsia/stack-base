@@ -288,7 +288,8 @@ role = "primary"
   (`./infra/up --env staging up --plan`, `./infra/up deploy v1.4.2 --env staging`);
   for `ssh`, put it before the node name (`./infra/up ssh --env staging a`).
   `--plan` prints `would do in staging:` so a plan is never mistaken for the
-  other environment's.
+  other environment's. Two different `--env` values on one command line
+  (`./infra/up --env staging deploy v1.4.2 --env production`) are refused.
 - **Files per environment:**
 
   | | single environment | environment `<env>` |
@@ -300,10 +301,19 @@ role = "primary"
   | deploy recipients | `deploy-recipients.txt` | `deploy-recipients.<env>.txt` if present, else `deploy-recipients.txt` |
   | hardware | `nodes/<node>/` | `nodes/<env>-<node>/` |
 
-  Staging never holds production's secrets, and a staging deploy key cannot
-  deploy production: each environment's servers trust only their own key.
-  Give production its own `age-recipients.production.txt` to keep its
-  secrets away from people who only work on staging.
+  A staging deploy key cannot deploy production: each environment's servers
+  trust only their own key. Keeping production's *secrets* away from
+  staging people is a separate step, and only holds when production has
+  both its own `age-recipients.production.txt` and its own
+  `deploy-recipients.production.txt`. Without them, production's files fall
+  back to the shared recipient lists, and anyone on those lists can decrypt
+  both environments. The Hostinger and Cloudflare tokens are also
+  account-wide: whoever holds a staging `hostinger_token` or
+  `cloudflare_token` can reach production's servers and DNS through the API,
+  whichever file the token sits in. Use separate accounts, or tokens scoped
+  per account, if that matters.
+- **Two environments never share a server or a domain:** the same `vps_id`
+  or `domain` in two environments is refused when stack.toml is read.
 - **Names:** a server is `<env>-<node>` (e.g. `staging-a`) as its NixOS
   hostname and flake attribute, and `<node>.<env domain>`
   (`a.staging.acme.example.com`) in Hostinger. Each environment has its own
@@ -325,18 +335,24 @@ role = "primary"
   After that, `./infra/up --env "$ENV" secrets set <key>` manages that
   environment's secrets one key at a time, as in "Managing secrets".
 
-- **Promoting a tag to production:** deploy a tag to staging, check it, then
-  deploy the very same tag to production:
+- **Releasing: tag → staging → check → promote.** Pushing a `v*` tag
+  deploys it to staging. With the GitHub Actions workflow (below) that
+  happens in CI; without it, run `./infra/up --env staging deploy <tag>`
+  yourself. Check staging. Then promote the very same tag to production
+  **from your own machine**:
 
   ```bash
-  VERSION=v1.4.2
-  ./infra/up --env staging deploy "$VERSION"
-  ./infra/up --env production deploy "$VERSION"
+  TAG=v1.4.2
+  ./infra/up --env production deploy "$TAG"
   ```
 
-  With the GitHub Actions workflow (below), the tag push does the staging
-  half; production is **Actions → Deploy (stack-base) → Run workflow** with
-  the tag, behind the GitHub Environment `production`.
+  Production is never deployed from CI, and `ci-setup --env production`
+  refuses. On GitHub Free, a private repository has no Environments,
+  environment secrets or required reviewers, so nothing inside GitHub could
+  make a human approve a CI production deploy. A repo secret is also
+  readable by any workflow on any pushed branch or tag. So the production
+  deploy key never leaves `deploy.production.age`, and the gate is the age
+  identity that can open that file: only someone holding it can promote.
 
 A `stack.toml` without `[environments]` is one implicit environment: the
 files, hostnames, plans and commands above stay exactly what they were, and
@@ -588,27 +604,15 @@ Because it's the SAME key everywhere, rotating it also replaces what you
 and any build host deploy with — there is no "laptop deploys are
 unaffected" any more (Task 2 removed the separate `ci-deploy` key).
 
-**With staging and production** the workflow has two jobs. A `v*` tag push
-runs the `staging` job, which deploys that tag with
-`./infra/up --env staging deploy` and the `STACK_DEPLOY_KEY_STAGING` secret.
-The `production` job runs only from **Run workflow** (`workflow_dispatch`),
-takes the tag as its input, checks that tag out and deploys the same release
-with `--env production` and `STACK_DEPLOY_KEY_PRODUCTION`. It runs in the
-GitHub Environment `production`, so required reviewers on that environment
-must approve every production deploy:
-
-```bash
-./infra/up --env staging ci-setup       # writes STACK_DEPLOY_KEY_STAGING
-./infra/up --env production ci-setup    # writes STACK_DEPLOY_KEY_PRODUCTION
-OWNER_REPO=<owner>/<repo>
-gh api -X PUT "repos/$OWNER_REPO/environments/production"
-```
-
-then add the required reviewers under the repository's Settings →
-Environments → production. `ci-setup --env production` prints the same
-steps. A project without `[environments]` keeps the single
-`STACK_DEPLOY_KEY`: drop `--env staging` from the workflow's staging job and
-delete its production job.
+**With staging and production**, the workflow deploys **staging only**: a
+`v*` tag push runs `./infra/up --env staging deploy` with the
+`STACK_DEPLOY_KEY_STAGING` repo secret (`./infra/up --env staging ci-setup`
+writes it). There is no production job and no production secret.
+`ci-setup --env production` refuses. Promote a tag that staging runs from
+your own machine with `./infra/up --env production deploy "$TAG"` (see
+"Staging and production" for why). A project without `[environments]`
+keeps the single `STACK_DEPLOY_KEY`; drop `--env staging` from the
+workflow's deploy step.
 
 **Turn it off** (CI only — this does not remove the deploy key itself,
 since it's also your own):

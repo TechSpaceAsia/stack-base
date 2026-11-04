@@ -10,14 +10,14 @@ name: Deploy (stack-base)
 # nginx/TLS, and cannot see this project's own secrets (infra/secrets.*.age
 # never leave the operator's machine; this workflow never decrypts them).
 #
-# Two environments, one release:
-#   - a `v*` tag push deploys that tag to STAGING (`STACK_DEPLOY_KEY_STAGING`);
-#   - production is a manual "Run workflow" (workflow_dispatch) that takes a
-#     tag and deploys that SAME tag to PRODUCTION (`STACK_DEPLOY_KEY_PRODUCTION`).
-#     The production job runs in the GitHub Environment `production`, so
-#     required reviewers on it gate every production deploy. Each environment
-#     has its own deploy key, so the staging job could not reach production
-#     even if it tried.
+# Staging only. A `v*` tag push deploys that tag to STAGING with the
+# `STACK_DEPLOY_KEY_STAGING` repo secret. Production is NEVER deployed from
+# here: on GitHub Free a private repo has no Environments, environment
+# secrets or required reviewers, so nothing in GitHub could gate it, and a
+# repo secret is readable by any workflow on any pushed branch or tag. Once
+# staging looks right, an operator promotes the same tag from their own
+# machine -- `./infra/up --env production deploy <tag>` -- and the age
+# identity that opens infra/deploy.production.age is the gate.
 #
 # Nothing is decrypted here, including infra/deploy.<env>.age -- which IS in the
 # checkout, because `ci-setup` tells you to commit it. That file is the same
@@ -40,22 +40,15 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "The release tag to promote to production (already on staging), e.g. v1.4.2"
-        required: true
-        type: string
 
 permissions:
   contents: read
 
 concurrency:
   # One deploy at a time per repo: a second tag pushed while the first is
-  # still running queues behind it instead of racing it, and a production
-  # promotion waits for a staging deploy in flight (and vice versa). The
-  # engine itself also holds a per-node flock (exit 3, "another deploy is
-  # already in progress") as a second, independent guard -- see
+  # still running queues behind it instead of racing it. The engine itself
+  # also holds a per-node flock (exit 3, "another deploy is already in
+  # progress") as a second, independent guard -- see
   # nixos/deploy/stack-deploy.sh.
   group: deploy-stack
   cancel-in-progress: false
@@ -65,8 +58,7 @@ env:
 
 jobs:
   staging:
-    # A tag push deploys staging, and only staging.
-    if: github.event_name == 'push'
+    # A tag push deploys staging, and only staging -- see the header.
     # A self-hosted runner, not ubuntu-latest: minutes on it are free (it
     # is our own machine), and it is a NixOS box that carries the musl
     # cross compiler and tailwindcss -- so no C toolchain is installed at
@@ -113,6 +105,11 @@ jobs:
       - name: Verify the tag matches Cargo.toml's version
         run: |
           CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          # A tag, never a branch that happens to be named like one.
+          if ! git show-ref --verify --quiet "refs/tags/$GITHUB_REF_NAME"; then
+            echo "ERROR: $GITHUB_REF_NAME is not a tag in this repository"
+            exit 1
+          fi
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
             echo "ERROR: tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VERSION"
@@ -167,73 +164,6 @@ jobs:
 
       - name: Deploy to staging
         run: ./infra/up --env staging deploy "$GITHUB_REF_NAME"
-
-      - name: Remove the deploy key
-        if: always()
-        run: rm -f "$RUNNER_TEMP/deploy_key"
-
-  production:
-    # Promote a tag that staging already runs: Actions -> "Deploy
-    # (stack-base)" -> Run workflow, with the tag. Same runner and steps as
-    # the staging job above (see its comments); what differs is the tag
-    # source, the key, and the GitHub Environment, whose required reviewers
-    # must approve before this job starts.
-    if: github.event_name == 'workflow_dispatch'
-    environment: production
-    runs-on: [self-hosted, production]
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          # The tag itself, so production builds exactly what staging got.
-          ref: ${{ inputs.tag }}
-
-      - name: Check the runner has stack-base's tools
-        run: |
-          missing=()
-          for t in python3 rsync tailwindcss x86_64-unknown-linux-musl-gcc rustup git ssh; do
-            if ! command -v "$t" >/dev/null 2>&1; then
-              missing+=("$t")
-            fi
-          done
-          if [ "${#missing[@]}" -gt 0 ]; then
-            echo "::error::this runner is missing: ${missing[*]} — use the production runner or add them to its extraPackages"
-            exit 1
-          fi
-
-      - name: Verify the tag matches Cargo.toml's version
-        env:
-          # The input reaches the shell only as an environment variable --
-          # never interpolated into a script, where it would be an injection.
-          TAG: ${{ inputs.tag }}
-        run: |
-          case "$TAG" in
-            v[0-9]*) ;;
-            *) echo "ERROR: '$TAG' is not a release tag (vMAJOR.MINOR.PATCH)"; exit 1 ;;
-          esac
-          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if [ "$CARGO_VERSION" != "${TAG#v}" ]; then
-            echo "ERROR: tag $TAG does not match Cargo.toml version $CARGO_VERSION"
-            exit 1
-          fi
-
-      - name: Install the musl Rust target
-        run: rustup target add x86_64-unknown-linux-musl
-
-      - name: Write the CI deploy key and point $STACKBASE_SSH_IDENTITY at it
-        env:
-          # Production's own key, readable only by this job.
-          STACK_DEPLOY_KEY: ${{ secrets.STACK_DEPLOY_KEY_PRODUCTION }}
-        run: |
-          umask 077
-          key_file="$RUNNER_TEMP/deploy_key"
-          install -m 600 /dev/null "$key_file"
-          printf '%s\n' "$STACK_DEPLOY_KEY" > "$key_file"
-          echo "STACKBASE_SSH_IDENTITY=$key_file" >> "$GITHUB_ENV"
-
-      - name: Deploy to production
-        env:
-          TAG: ${{ inputs.tag }}
-        run: ./infra/up --env production deploy "$TAG"
 
       - name: Remove the deploy key
         if: always()

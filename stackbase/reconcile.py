@@ -1228,7 +1228,11 @@ class Context:
 
     @property
     def environment(self) -> Environment:
-        assert self.env is not None  # set by __post_init__
+        if self.env is None:  # __post_init__ always sets it; only a later `ctx.env = None` gets here
+            raise StackError(
+                "the run's environment was cleared after it started",
+                "this is a bug in stack-base -- please report it",
+            )
         return self.env
 
     @property
