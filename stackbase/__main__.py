@@ -30,6 +30,7 @@ from typing import Callable
 
 from stackbase.backups import check_backup_credentials, run_backup_now
 from stackbase.logs import check_logs_credentials
+from stackbase.mesh import connector_token
 from stackbase.ci import ci_setup
 from stackbase.cloudflare import CloudflareClient
 from stackbase.r2 import r2_account_for
@@ -38,6 +39,7 @@ from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
 from stackbase.reconcile import (
     SSH_USER,
+    Action,
     Context,
     Step,
     apply,
@@ -361,10 +363,16 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env_
     check_logs_credentials(env, local.logs_env_sha)
     # None (and no R2 request at all) unless [logs]/[files] names a bucket.
     r2 = r2_account_for(env, secrets)
-    observed = observe(cfg, state, hostinger, cloudflare, local=local, env=env, r2=r2)
+    observed = observe(
+        cfg, state, hostinger, cloudflare, local=local, env=env, r2=r2,
+        ssh_factory=lambda ip: Ssh(infra_dir, ip, user=SSH_USER),
+    )
     for warning in observed.cloudflare_ip_warnings:
         print(redact(f"! {warning}", redaction_values(secrets)))
     steps = plan(cfg, state, observed, env=env)
+    if any(step.action is Action.ENSURE_MESH for step in steps):
+        # Before anything is rebuilt: the token is the last thing a node needs.
+        connector_token(secrets, env_secrets.name, "" if env.implicit else f" --env {env.name}")
 
     if args.plan:
         _print_plan(steps, secrets, env)

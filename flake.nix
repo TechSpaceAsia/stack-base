@@ -24,6 +24,8 @@
         self.nixosModules.backups
         # Same shape: off until stack.toml's [logs] table names a bucket.
         self.nixosModules.logs
+        # Same shape: off until stack.toml's [mesh] table says enabled = true.
+        self.nixosModules.mesh
       ];
     in
     {
@@ -34,6 +36,7 @@
       nixosModules.deploy = import ./nixos/deploy.nix;
       nixosModules.backups = import ./nixos/backups.nix;
       nixosModules.logs = import ./nixos/logs.nix;
+      nixosModules.mesh = import ./nixos/mesh.nix;
       nixosModules.default = { imports = baseModules; };
 
       # `provider` selects the module that reproduces one hosting provider's

@@ -156,6 +156,18 @@ class FilesConfig:
 
 
 @dataclass(frozen=True)
+class MeshConfig:
+    """The optional `[mesh]` table: join Cloudflare Mesh.
+
+    Shared by every environment on purpose (a `mesh` key inside an
+    `[environments.<env>]` table is refused like any other shared setting):
+    staging and production must reach their servers the same way.
+    """
+
+    enabled: bool = False
+
+
+@dataclass(frozen=True)
 class Environment:
     """One environment: its own servers, domain, state, secrets and buckets.
 
@@ -206,6 +218,7 @@ class StackConfig:
     logs: LogsConfig = field(default_factory=LogsConfig)
     alerts: AlertsConfig = field(default_factory=AlertsConfig)
     files: FilesConfig = field(default_factory=FilesConfig)
+    mesh: MeshConfig = field(default_factory=MeshConfig)
     environments: dict[str, Environment] = field(default_factory=dict)
     implicit_env: bool = True
 
@@ -308,6 +321,7 @@ def load_config(infra_dir: Path) -> StackConfig:
     logs = _parse_logs(data, toml_path)
     alerts = _parse_alerts(data, toml_path)
     files = _parse_files(data, toml_path)
+    mesh = _parse_mesh(data, toml_path)
 
     environments: dict[str, Environment] = {}
     if environments_raw is not None:
@@ -335,6 +349,7 @@ def load_config(infra_dir: Path) -> StackConfig:
         logs=logs,
         alerts=alerts,
         files=files,
+        mesh=mesh,
         environments=environments,
         implicit_env=environments_raw is None,
     )
@@ -814,6 +829,13 @@ def _parse_files(data: dict[str, Any], toml_path: Path, *, table: str = "files")
         bucket=_optional_bucket(raw, toml_path, table),
         lock_days=_optional_int(raw, "lock_days", toml_path, table),
     )
+
+
+def _parse_mesh(data: dict[str, Any], toml_path: Path) -> MeshConfig:
+    raw = _section(data, "mesh", MeshConfig, toml_path, "mesh")
+    if raw is None:
+        return MeshConfig()
+    return MeshConfig(enabled=bool(_optional_section_bool(raw, "enabled", toml_path, "mesh")))
 
 
 def _load_admin_keys(admins: list[str], infra_dir: Path) -> dict[str, str]:

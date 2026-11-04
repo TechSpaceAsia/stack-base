@@ -35,8 +35,9 @@ import re
 import socket
 import subprocess
 import sys
+import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -130,6 +131,7 @@ class Action(Enum):
     ENSURE_APP_ENV = "ensure_app_env"
     ENSURE_BACKUP_ENV = "ensure_backup_env"
     ENSURE_LOGS_ENV = "ensure_logs_env"
+    ENSURE_MESH = "ensure_mesh"
     UPSERT_DNS = "upsert_dns"
     ENSURE_R2_BUCKET = "ensure_r2_bucket"
     ENSURE_R2_LIFECYCLE = "ensure_r2_lifecycle"
@@ -154,6 +156,7 @@ _DOING: dict[Action, str] = {
     Action.ENSURE_APP_ENV: "updating the application's environment file",
     Action.ENSURE_BACKUP_ENV: "updating the backup credentials on the server",
     Action.ENSURE_LOGS_ENV: "updating the log shipping credentials on the server",
+    Action.ENSURE_MESH: "joining Cloudflare Mesh",
     Action.UPSERT_DNS: "pointing the domain at the server in Cloudflare",
     Action.ENSURE_R2_BUCKET: "creating the R2 bucket",
     Action.ENSURE_R2_LIFECYCLE: "setting the retention rule",
@@ -662,6 +665,9 @@ class ObservedNode:
     # discovered on Hostinger by hostname -- see `_find_adoptable_vms`. This
     # is what tells `plan()` to emit ADOPT instead of PURCHASE.
     adopted: bool = False
+    # What `warp-cli status` said over root SSH: True Connected, False not,
+    # None never asked (Mesh is off, or the node has no pinned address yet).
+    mesh_connected: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -823,8 +829,13 @@ def observe(
     local: Local,
     env: Environment | None = None,
     r2: R2Account | None = None,
+    ssh_factory: Callable[[str], Ssh] | None = None,
 ) -> Observed:
     """Read the current state of the world. GET requests only.
+
+    With `[mesh]` on and an `ssh_factory`, each node already pinned in
+    known_hosts is also asked (read-only, over root SSH) whether it is on
+    Mesh. With `[mesh]` off no SSH call is made at all.
 
     `local` carries the facts that come from the operator's own disk (see
     `local_facts`); it is passed in rather than gathered here so that
@@ -852,6 +863,12 @@ def observe(
     nodes: dict[str, ObservedNode] = {}
     for name, node in env.nodes.items():
         nodes[name] = _observe_node(node, state.nodes.get(name), hostinger, adopt_vps_id=adoptable.get(name))
+        if cfg.mesh.enabled and ssh_factory is not None:
+            ip = (state.nodes.get(name) or NodeState()).ipv4
+            if ip and ip in local.pinned_hosts:
+                from stackbase.mesh import observe_mesh
+
+                nodes[name] = replace(nodes[name], mesh_connected=observe_mesh(ssh_factory(ip)))
 
     public_key_ids = _observe_public_keys(cfg, hostinger)
     firewall = _find_named(hostinger.list_firewalls(), firewall_name(cfg, env))
@@ -1103,6 +1120,14 @@ def plan(cfg: StackConfig, state: StackState, observed: Observed, *, env: Enviro
         # remove nothing.
         if _needs_backup_env(state, observed, name):
             steps.append(Step(Action.ENSURE_BACKUP_ENV, name))
+        # Last for the node: warp-cli exists only once the rebuild has made
+        # the mesh module active. A reinstall (SETUP) wiped any earlier
+        # enrolment, whatever the pre-run observation saw.
+        if cfg.mesh.enabled and (
+            (observed.nodes.get(name) or ObservedNode()).mesh_connected is not True
+            or any(s.action is Action.SETUP and s.node == name for s in steps)
+        ):
+            steps.append(Step(Action.ENSURE_MESH, name))
 
     if has_cloudflare and not _dns_converged(state, observed):
         steps.append(Step(Action.UPSERT_DNS, primary_node(cfg, env)))
@@ -1277,6 +1302,8 @@ class Context:
     r2: R2Account | None = None
     runner: Any = subprocess.run
     popen: Any = subprocess.Popen
+    # Waits between polls (Mesh connecting); tests replace it so none sleep.
+    sleep: Callable[[float], None] = time.sleep
     connector: Any = socket.create_connection
     out: Callable[[str], None] = print
     isatty: Callable[[], bool] = field(default=lambda: sys.stdin.isatty())

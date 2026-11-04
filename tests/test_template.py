@@ -453,6 +453,42 @@ class TemplateEnvironmentsTests(unittest.TestCase):
             self.assertFalse(facts["logsEnable"])
             self.assertFalse(facts["vectorEnable"])
 
+    def test_mesh_enabled_turns_on_the_warp_connector(self) -> None:
+        """[mesh] enabled = true -> headless cloudflare-warp, firewall closed,
+        and only that one unfree package admitted."""
+        facts_fn = (
+            "node: { enable = node.config.services.cloudflare-warp.enable;"
+            " openFirewall = node.config.services.cloudflare-warp.openFirewall;"
+            " unit = node.config.systemd.services ? cloudflare-warp;"
+            " warp = node.config.nixpkgs.config.allowUnfreePredicate { pname = \"cloudflare-warp\"; };"
+            " other = node.config.nixpkgs.config.allowUnfreePredicate { pname = \"vscode\"; }; }"
+        )
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+            (directory / "stack.toml").write_text(
+                _SAMPLE_STACK_TOML + "\n[mesh]\nenabled = true\n", encoding="utf-8"
+            )
+
+            facts = _nix_eval_attr(directory, "nixosConfigurations.a", facts_fn)
+
+            self.assertTrue(facts["enable"])
+            self.assertFalse(facts["openFirewall"])
+            self.assertTrue(facts["unit"])
+            self.assertTrue(facts["warp"])
+            self.assertFalse(facts["other"])
+
+    def test_no_mesh_table_leaves_the_warp_connector_off(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+
+            facts = _nix_eval_attr(
+                directory, "nixosConfigurations.a", "node: node.config.services.cloudflare-warp.enable"
+            )
+
+            self.assertFalse(facts)
+
     def test_a_legacy_project_has_an_empty_environment(self) -> None:
         with TemporaryDirectory() as tmp:
             directory = Path(tmp)

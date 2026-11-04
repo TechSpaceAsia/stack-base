@@ -972,6 +972,56 @@ curl -s http://127.0.0.1:9598/metrics | rg 'vector_component_sent_events_total|v
 has been unreachable for a while; `vector_component_sent_events_total` for
 `r2` should keep rising. Both endpoints listen on 127.0.0.1 only.
 
+## Mesh
+
+With `[mesh]` on, every server joins [Cloudflare Mesh](https://developers.cloudflare.com/cloudflare-one/):
+it runs a headless `cloudflare-warp` connector (firewall not opened, the
+connector dials out), so you can reach it over Mesh. SSH over Mesh is the only
+use stack-base supports. `[mesh]` is shared by every environment, and a
+project without it is untouched.
+
+```toml
+# infra/stack.toml
+[mesh]
+enabled = true
+```
+
+**Setting it up**, once per environment:
+
+1. In the Cloudflare dashboard, create a Mesh node for the environment and copy
+   its connector token. A token is a credential: it goes straight into the
+   secrets, never into the repository or a chat.
+2. Give the node an **include-only** device profile using the **MASQUE**
+   protocol, so that only Mesh destinations use the tunnel and the server's
+   other traffic keeps its normal path.
+3. Store the token, and run `up`:
+
+```bash
+MESH_TOKEN=<paste the node's connector token here>
+printf '%s' "$MESH_TOKEN" | ./infra/up --env "$ENV" secrets set mesh_connector_token
+./infra/up --env "$ENV"
+```
+
+(Drop `--env "$ENV"` in a project without environments.) Secrets are per
+environment, so each environment has its own `mesh_connector_token`. `up`
+installs the connector with the rebuild, then enrols each node **once** with
+that token, connects it, waits up to 60 seconds for `Connected`, and prints the
+node's Mesh IPv6 address. A node that already reports Connected is left alone,
+so rotating the token later does not re-enrol it. Without the token, `up` stops
+before touching anything and names the key.
+
+The token reaches the server on the SSH connection's stdin and is never in a
+local command line or log. `warp-cli connector new` only accepts it as an
+argument, so on the server it is visible to root in that one short-lived
+process.
+
+**Verify** (on the server, `./infra/up ssh a`):
+
+```bash
+warp-cli --accept-tos status          # Status update: Connected
+ip -6 addr show CloudflareWARP        # the node's Mesh address
+```
+
 ## R2 buckets (logs and files)
 
 When an environment's `[logs]` or `[files]` table names a `bucket`, `./infra/up`

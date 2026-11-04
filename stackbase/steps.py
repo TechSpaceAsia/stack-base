@@ -28,6 +28,16 @@ from typing import Callable
 from stackbase.backups import backup_env_content, backup_env_digest
 from stackbase.logs import LOGS_UNIT, logs_env_content, logs_env_digest
 from stackbase.config import save_state
+from stackbase.mesh import (
+    CONNECT_CMD,
+    CONNECT_POLL_SECONDS,
+    CONNECT_WAIT_SECONDS,
+    ENROL_CMD,
+    IP_CMD,
+    connector_token,
+    mesh_ipv6,
+    observe_mesh,
+)
 from stackbase.errors import StackError
 from stackbase.reconcile import (
     PUSH_EXCLUDES,
@@ -932,6 +942,51 @@ def _ensure_logs_env(ctx: Context, step: Step) -> str:
 
 
 # --------------------------------------------------------------------------
+# Cloudflare Mesh: enrol a node with the environment's connector token
+# --------------------------------------------------------------------------
+
+
+def _ensure_mesh(ctx: Context, step: Step) -> str:
+    """Enrol the node on Mesh, connect, and wait up to 60 s for Connected.
+
+    The token goes over ssh's stdin (see stackbase/mesh.py for the one
+    place it is briefly an argument on the node itself). A failed `connector
+    new` is not fatal on its own: a node enrolled by an earlier run that is
+    merely disconnected rejects it, and `connect` is what it needs. If it
+    then never connects, the failure's stderr tail is the hint.
+    """
+    node = _node(step)
+    env = ctx.environment
+    token = connector_token(
+        ctx.secrets, ctx.secrets_file.name, "" if env.implicit else f" --env {env.name}"
+    )
+
+    ssh = ctx.ssh(node)
+    enrol = ssh.run(ENROL_CMD, check=False, input=token + "\n")
+    ssh.run(CONNECT_CMD)
+
+    waited = 0
+    while not observe_mesh(ssh):
+        if waited >= CONNECT_WAIT_SECONDS:
+            reason = ""
+            if enrol.returncode != 0:
+                tail = enrol.stderr if isinstance(enrol.stderr, str) else ""
+                reason = f"enrolling failed first: {tail.strip()[-300:] or 'no output'}. "
+            raise StackError(
+                f"node {node} did not join Cloudflare Mesh within {CONNECT_WAIT_SECONDS} seconds",
+                f"{reason}check the token is a current node token and the device profile is the "
+                'include-only MASQUE one (README "Mesh" section), then run `up` again; on the '
+                "server, `warp-cli --accept-tos status` says why",
+            )
+        ctx.sleep(CONNECT_POLL_SECONDS)
+        waited += CONNECT_POLL_SECONDS
+
+    address = mesh_ipv6(ssh.run(IP_CMD, check=False).stdout or "")
+    where = f" (Mesh address {address})" if address else ""
+    return f"node {node}: joined Cloudflare Mesh{where}"
+
+
+# --------------------------------------------------------------------------
 # Cloudflare R2: buckets, the logs retention rule, the files lock
 # --------------------------------------------------------------------------
 
@@ -1038,6 +1093,7 @@ _EXECUTORS: dict[Action, Callable[[Context, Step], str]] = {
     Action.ENSURE_APP_ENV: _ensure_app_env,
     Action.ENSURE_BACKUP_ENV: _ensure_backup_env,
     Action.ENSURE_LOGS_ENV: _ensure_logs_env,
+    Action.ENSURE_MESH: _ensure_mesh,
     Action.ENSURE_R2_BUCKET: _ensure_r2_bucket,
     Action.ENSURE_R2_LIFECYCLE: _ensure_r2_lifecycle,
     Action.ENSURE_R2_LOCK: _ensure_r2_lock,

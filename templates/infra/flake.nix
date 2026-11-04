@@ -149,6 +149,8 @@
               stackbase.app = appOptions;
               stackbase.backups = backupsOptions env;
               stackbase.logs = logsOptions env;
+              # [mesh] is shared by every environment; absent means off.
+              stackbase.mesh.enable = (stack.mesh or { }).enabled or false;
             }
           ]
           # Project-wide modules: every infra/conf.d/*.nix lands on EVERY
