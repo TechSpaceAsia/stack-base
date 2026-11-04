@@ -119,6 +119,7 @@ Then commit what it wrote back: `infra/stack.state.json`,
 |---|---|
 | registering the team's SSH keys | Tells Hostinger about everyone's public key |
 | buying / installing | Buys a server (only if you said so) and installs NixOS on it |
+| waiting for Hostinger to finish processing the payment | Stops the run when a purchase is still being paid for; re-run later (see [If a purchase says payment is processing](#if-a-purchase-says-payment-is-processing)) |
 | waiting for the server | Waits for it to boot and get an IP address |
 | applying the firewall | Closes everything except SSH (22) and HTTPS (443) |
 | remembering the fingerprint | Records the server's SSH identity so a swap can't go unnoticed |
@@ -760,6 +761,7 @@ Every failure is one line: what went wrong, then what to check.
 | `multiple A records found for …` | Two records fight over the name. Delete the wrong one in the Cloudflare dashboard; stack-base won't guess |
 | `no Hostinger data center named …` | The message lists the valid names — put one in `stack.toml` |
 | `node(s) a have no vps_id…` | Either set `vps_id`, or re-run with `--allow-purchase` |
+| `purchase for node … is still processing` | Hostinger accepted the order but has not provisioned it yet — see [If a purchase says payment is processing](#if-a-purchase-says-payment-is-processing) |
 | `buying a server needs a price_item` | Copy the plan's catalog id from Hostinger into `price_item` |
 | `the new configuration failed to build` | The build output is above the error. Fix `infra/`, run again — nothing was made permanent |
 | `You must set the option boot.loader…` or a `fileSystems` error | The provider module's defaults don't match this node's disk/network — see "First run on a new provider image" below |
@@ -778,6 +780,28 @@ Every failure is one line: what went wrong, then what to check.
 
 A failed run changes nothing further and can always simply be run again: it
 picks up exactly where it stopped.
+
+## If a purchase says payment is processing
+
+Sometimes Hostinger answers a purchase with "accepted, payment still
+processing" instead of handing back a server. stack-base then records the
+order's subscription id in `infra/stack.state.json` (as
+`pending_subscription_id`) and stops with:
+
+```
+error: purchase for node 'a' (subscription <id>) is still processing — re-run ./infra/up in a few minutes
+```
+
+Nothing is lost and nothing is bought twice: while that id is recorded,
+stack-base will not purchase for the node again. Wait a few minutes and run
+`./infra/up` again. Once the server appears in your Hostinger account, it is
+recognised by its subscription id (not its name — a fresh server is called
+something like `srv123456.hstgr.cloud`), adopted, and set up the usual way,
+which also gives it the proper hostname. The id is then cleared from the state
+file.
+
+If it never appears, find the server in hPanel and put its id in `stack.toml`
+as `vps_id` for that node; stack-base uses that from then on.
 
 ## First run on a new provider image
 

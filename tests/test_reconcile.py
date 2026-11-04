@@ -24,7 +24,15 @@ from typing import Any
 from unittest import mock
 
 from stackbase.cloudflare import CloudflareClient
-from stackbase.config import CloudflareState, HostingerState, Node, NodeState, StackConfig, StackState
+from stackbase.config import (
+    CloudflareState,
+    HostingerState,
+    Node,
+    NodeState,
+    StackConfig,
+    StackState,
+    load_state,
+)
 from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
 from stackbase.reconcile import (
@@ -998,6 +1006,128 @@ class AdoptionTests(unittest.TestCase):
             self.assertEqual(ctx.state.nodes["a"].vps_id, 4321)
             self.assertTrue(any("adopting it instead of buying another" in line for line in lines))
             self.assertTrue(any("4321" in line and hostname in line for line in lines))
+
+
+class PendingPurchaseTests(unittest.TestCase):
+    """A 202 purchase is remembered by subscription id and adopted by it."""
+
+    _SUB = "Azz353Uhl1xC54pR0"
+
+    def _pending_state(self) -> StackState:
+        return StackState(nodes={"a": NodeState(pending_subscription_id=self._SUB)})
+
+    def _vm(self, *, hostname: str, subscription_id, vps_id: int = 2081685) -> dict:
+        return {
+            "id": vps_id,
+            "hostname": hostname,
+            "subscription_id": subscription_id,
+            "state": "initial",
+            "actions_lock": "unlocked",
+            "firewall_group_id": None,
+            "ipv4": [{"id": 1, "address": _IPV4}],
+            "ipv6": None,
+        }
+
+    def _script_observe(self, server: FakeServer, vms: list[dict]) -> None:
+        server.script("GET", "/api/vps/v1/virtual-machines", 200, vms)
+        for vm in vms:
+            server.script("GET", f"/api/vps/v1/virtual-machines/{vm['id']}", 200, vm)
+        server.script("GET", "/api/vps/v1/public-keys?page=1", 200, {"data": [], "meta": _meta(0)})
+        server.script("GET", "/api/vps/v1/firewall?page=1", 200, {"data": [], "meta": _meta(0)})
+        server.script("GET", f"/zones?name={_DOMAIN}&page=1", 200, _cf([{"id": "zone1", "name": _DOMAIN}], result_info=_page()))
+        server.script("GET", f"/zones/zone1/dns_records?type=A&name={_DOMAIN}&page=1", 200, _cf([], result_info=_page()))
+
+    def test_pending_marker_persisted_after_202(self) -> None:
+        with Infra() as infra_dir, FakeServer() as server:
+            server.script("GET", "/api/vps/v1/templates", 200, [{"id": 1130, "name": "NixOS 26.05"}])
+            server.script("GET", "/api/vps/v1/data-centers", 200, [{"id": 21, "name": "kul"}])
+            server.script(
+                "POST",
+                "/api/vps/v1/virtual-machines",
+                202,
+                {"id": 2957086, "subscription_id": self._SUB, "status": "payment_initiated"},
+            )
+            state = StackState(hostinger=HostingerState(ssh_key_ids={"matt": 11, "kim": 12}))
+            cfg = _config(nodes={"a": Node(name="a", role="primary", vps_id=None)})
+            observed = Observed(local=_local(), nodes={"a": ObservedNode()}, public_key_ids={}, zone_id="zone1")
+            ctx, _ = _context(infra_dir, cfg=cfg, state=state, observed=observed, server=server)
+
+            with self.assertRaises(StackError) as caught:
+                apply([Step(Action.PURCHASE, "a")], ctx, allow_purchase=True, confirm=lambda _p: "buy KVM 1 x1")
+
+            self.assertIn("still processing", str(caught.exception))
+            self.assertIsNone(ctx.state.nodes["a"].vps_id)
+            self.assertEqual(ctx.state.nodes["a"].pending_subscription_id, self._SUB)
+            # On disk too: the marker is what stops the next run buying again.
+            self.assertEqual(load_state(infra_dir).nodes["a"].pending_subscription_id, self._SUB)
+
+    def test_adopts_by_subscription_id_ignoring_hostname(self) -> None:
+        cfg = _config(nodes={"a": Node(name="a", role="primary", vps_id=None)})
+        state = self._pending_state()
+        with FakeServer() as server:
+            self._script_observe(
+                server,
+                [
+                    self._vm(hostname="srv2081685.hstgr.cloud", subscription_id=self._SUB),
+                    # Same name we would have chosen, but someone else's subscription: must not match.
+                    self._vm(hostname=hostname_for(cfg, "a"), subscription_id="other", vps_id=7),
+                ],
+            )
+            hostinger = HostingerClient("htok", base_url=server.url)
+            cloudflare = CloudflareClient("ctok", base_url=server.url)
+
+            observed = observe(cfg, state, hostinger, cloudflare, local=_local())
+
+            self.assertEqual(observed.nodes["a"].vps_id, 2081685)
+            self.assertTrue(observed.nodes["a"].adopted)
+            actions = [s.action for s in plan(cfg, state, observed)]
+            self.assertIn(Action.ADOPT, actions)
+            self.assertNotIn(Action.PURCHASE, actions)
+            self.assertNotIn(Action.WAIT_PURCHASE, actions)
+
+    def test_pending_without_matching_vm_never_purchases(self) -> None:
+        cfg = _config(nodes={"a": Node(name="a", role="primary", vps_id=None)})
+        state = self._pending_state()
+        with FakeServer() as server:
+            # A VM under the expected hostname exists, but its subscription differs.
+            self._script_observe(server, [self._vm(hostname=hostname_for(cfg, "a"), subscription_id="other")])
+            hostinger = HostingerClient("htok", base_url=server.url)
+            cloudflare = CloudflareClient("ctok", base_url=server.url)
+
+            observed = observe(cfg, state, hostinger, cloudflare, local=_local())
+
+            self.assertFalse(observed.nodes["a"].adopted)
+            actions = [s.action for s in plan(cfg, state, observed)]
+            self.assertIn(Action.WAIT_PURCHASE, actions)
+            self.assertNotIn(Action.PURCHASE, actions)
+
+    def test_wait_purchase_apply_says_to_rerun_and_changes_nothing(self) -> None:
+        with Infra() as infra_dir:
+            state = self._pending_state()
+            ctx, _ = _context(infra_dir, state=state)
+
+            with self.assertRaises(StackError) as caught:
+                apply([Step(Action.WAIT_PURCHASE, "a")], ctx, allow_purchase=False)
+
+            text = str(caught.exception)
+            self.assertIn("purchase for node 'a' (subscription " + self._SUB + ") is still processing", text)
+            self.assertIn("re-run ./infra/up in a few minutes", text)
+            self.assertIn("find the VM in hPanel and set vps_id in stack.toml", text)
+            self.assertEqual(ctx.state.nodes["a"].pending_subscription_id, self._SUB)
+
+    def test_adopt_clears_pending_marker(self) -> None:
+        with Infra() as infra_dir:
+            observed = replace(
+                _observed_fresh(),
+                nodes={"a": ObservedNode(vps_id=2081685, state="initial", actions_lock="unlocked", adopted=True)},
+            )
+            ctx, _ = _context(infra_dir, state=self._pending_state(), observed=observed)
+
+            apply([Step(Action.ADOPT, "a")], ctx, allow_purchase=False)
+
+            self.assertEqual(ctx.state.nodes["a"].vps_id, 2081685)
+            self.assertIsNone(ctx.state.nodes["a"].pending_subscription_id)
+            self.assertIsNone(load_state(infra_dir).nodes["a"].pending_subscription_id)
 
 
 class CloudflareIpRangeWarningTests(unittest.TestCase):

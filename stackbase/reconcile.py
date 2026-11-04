@@ -108,6 +108,7 @@ class Action(Enum):
 
     PURCHASE = "purchase"
     ADOPT = "adopt"
+    WAIT_PURCHASE = "wait_purchase"
     SETUP = "setup"
     WAIT_RUNNING = "wait_running"
     ENSURE_KEYS = "ensure_keys"
@@ -127,6 +128,7 @@ class Action(Enum):
 _DOING: dict[Action, str] = {
     Action.PURCHASE: "buying and setting up a new virtual machine",
     Action.ADOPT: "adopting an existing virtual machine already found in Hostinger",
+    Action.WAIT_PURCHASE: "waiting for Hostinger to finish processing the payment",
     Action.SETUP: "installing NixOS on the virtual machine",
     Action.WAIT_RUNNING: "waiting for the server to come up",
     Action.ENSURE_KEYS: "registering the team's SSH keys with Hostinger",
@@ -756,7 +758,12 @@ def observe(
         for name, node in cfg.nodes.items()
         if node.vps_id is None and (state.nodes.get(name) is None or state.nodes[name].vps_id is None)
     ]
-    adoptable = _find_adoptable_vms(hostinger, cfg, unresolved_nodes) if unresolved_nodes else {}
+    pending = {
+        name: state.nodes[name].pending_subscription_id
+        for name in unresolved_nodes
+        if name in state.nodes and state.nodes[name].pending_subscription_id
+    }
+    adoptable = _find_adoptable_vms(hostinger, cfg, unresolved_nodes, pending) if unresolved_nodes else {}
 
     nodes: dict[str, ObservedNode] = {}
     for name, node in cfg.nodes.items():
@@ -792,7 +799,7 @@ def observe(
 
 
 def _find_adoptable_vms(
-    hostinger: HostingerClient, cfg: StackConfig, node_names: list[str]
+    hostinger: HostingerClient, cfg: StackConfig, node_names: list[str], pending: dict[str, str]
 ) -> dict[str, int]:
     """For nodes with no `vps_id` anywhere, look for an already-existing
     Hostinger VM whose hostname matches what stack-base would have named it
@@ -802,19 +809,40 @@ def _find_adoptable_vms(
     emit ADOPT instead of PURCHASE. More than one match is ambiguous --
     stack-base will not guess which one belongs to this project, and raises
     (this is still a GET-only read, not a write).
+
+    A node in `pending` (a 202 purchase, see `NodeState.pending_subscription_id`)
+    matches ONLY the VM whose `subscription_id` equals it, ignoring hostname:
+    Hostinger names a freshly provisioned VM `srv<N>.hstgr.cloud` until setup
+    runs, and a hostname match could grab someone else's server.
     """
-    wanted = {hostname_for(cfg, name): name for name in node_names}
-    if not wanted:
+    wanted = {hostname_for(cfg, name): name for name in node_names if name not in pending}
+    pending_by_sub = {sub: name for name, sub in pending.items() if name in node_names}
+    if not wanted and not pending_by_sub:
         return {}
 
     by_hostname: dict[str, list[int]] = {}
+    by_sub: dict[str, list[int]] = {}
     for vm in hostinger.list_vms():
         hostname = vm.get("hostname")
         vps_id = vm.get("id")
-        if isinstance(hostname, str) and isinstance(vps_id, int) and hostname in wanted:
+        subscription_id = vm.get("subscription_id")
+        if not isinstance(vps_id, int):
+            continue
+        if isinstance(hostname, str) and hostname in wanted:
             by_hostname.setdefault(hostname, []).append(vps_id)
+        if isinstance(subscription_id, str) and subscription_id in pending_by_sub:
+            by_sub.setdefault(subscription_id, []).append(vps_id)
 
     found: dict[str, int] = {}
+    for subscription_id, ids in by_sub.items():
+        name = pending_by_sub[subscription_id]
+        if len(ids) > 1:
+            raise StackError(
+                f"found {len(ids)} existing virtual machines for subscription '{subscription_id}' in Hostinger",
+                f"put the right one's id in stack.toml as vps_id for node '{name}' -- stack-base "
+                "will not guess which one to adopt",
+            )
+        found[name] = ids[0]
     for hostname, ids in by_hostname.items():
         name = wanted[hostname]
         if len(ids) > 1:
@@ -1019,6 +1047,11 @@ def _provisioning_steps(state: StackState, observed: Observed, name: str, node: 
                 # never happen without SETUP.
                 steps.append(Step(Action.SETUP, name))
                 setup_planned = True
+        elif node_state.pending_subscription_id:
+            # A 202 purchase is still processing: its VM has not shown up
+            # under that subscription yet. Buying again would double-charge,
+            # and nothing else for this node can run without a VM.
+            return [Step(Action.WAIT_PURCHASE, name)]
         else:
             steps.append(Step(Action.PURCHASE, name))
     elif seen.state == "initial":

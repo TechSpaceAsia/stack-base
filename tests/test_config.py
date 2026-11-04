@@ -567,6 +567,18 @@ class StateRoundTripTests(unittest.TestCase):
 
             self.assertIsNone(state.nodes["a"].app_env_sha)
 
+    def test_pending_subscription_id_round_trips_and_is_omitted_when_none(self) -> None:
+        with TempInfraDir() as infra_dir:
+            save_state(infra_dir, StackState(nodes={"a": NodeState(pending_subscription_id="Azz353Uhl1xC54pR0")}))
+            self.assertEqual(load_state(infra_dir).nodes["a"].pending_subscription_id, "Azz353Uhl1xC54pR0")
+
+            # Absent means None, and a node with no marker writes the same
+            # bytes it always did (single-environment state files unchanged).
+            save_state(infra_dir, StackState(nodes={"a": NodeState(vps_id=1)}))
+            raw = (infra_dir / "stack.state.json").read_text(encoding="utf-8")
+            self.assertNotIn("pending_subscription_id", raw)
+            self.assertIsNone(load_state(infra_dir).nodes["a"].pending_subscription_id)
+
     def test_node_state_backup_env_sha_defaults_to_none_for_older_state_files(self) -> None:
         """Same contract as app_env_sha above: a state file written before
         backups existed must load, with None meaning "never pushed"."""

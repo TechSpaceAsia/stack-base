@@ -469,6 +469,11 @@ class NodeState:
     # sha256 of the backup.env content (from secrets.age's r2_* keys) most
     # recently pushed to this node. None until the first push.
     backup_env_sha: str | None = None
+    # Set when a purchase answered HTTP 202 (payment still processing): the
+    # subscription id the VM-to-be will carry. While set, the node is never
+    # purchased again; it is adopted by this id once the VM shows up, and
+    # ADOPT clears it.
+    pending_subscription_id: str | None = None
 
 
 @dataclass
@@ -511,7 +516,13 @@ def load_state(infra_dir: Path) -> StackState:
 def save_state(infra_dir: Path, state: StackState) -> None:
     """Atomically write `state` to `<infra_dir>/stack.state.json`."""
     state_path = infra_dir / _STATE_FILENAME
-    text = json.dumps(asdict(state), indent=2, sort_keys=True) + "\n"
+    payload = asdict(state)
+    # An unset marker is omitted so a state file that never saw a 202 purchase
+    # is byte-identical to what earlier versions wrote.
+    for node in payload["nodes"].values():
+        if node.get("pending_subscription_id") is None:
+            node.pop("pending_subscription_id", None)
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
     # pid-suffixed, like ssh.py's known_hosts temp file: two concurrent runs
     # against the same infra/ (unusual, but not impossible) must not step on

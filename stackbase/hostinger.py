@@ -61,6 +61,7 @@ import re
 import secrets
 import string
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from stackbase.errors import StackError
@@ -119,6 +120,21 @@ def _redact_password(exc: ApiError, password: str) -> ApiError:
         status=exc.status,
         body=redact(exc.body, [password]),
     )
+
+
+@dataclass
+class PurchaseResult:
+    """What a purchase call produced.
+
+    HTTP 200: `vps_id` is set. HTTP 202 (payment still processing): there is
+    no VM yet, so `vps_id` is None and `subscription_id` is the only handle
+    Hostinger gives us -- the VM that eventually appears carries the same
+    `subscription_id`, which is how a later run adopts it.
+    """
+
+    vps_id: int | None
+    subscription_id: str | None
+    warnings: list[str] = field(default_factory=list)
 
 
 class HostingerClient:
@@ -296,8 +312,12 @@ class HostingerClient:
         hostname: str,
         public_key: tuple[str, str],
         public_key_ids: list[int] = (),
-    ) -> tuple[int, list[str]]:
-        """Purchase a new VM and set it up in one call. Returns `(vps_id, warnings)`.
+    ) -> PurchaseResult:
+        """Purchase a new VM and set it up in one call. Returns a `PurchaseResult`.
+
+        A 202 (payment processing) returns `vps_id=None` plus the
+        `subscription_id` from the body; a 202 without a usable
+        `subscription_id` is a `StackError`, as before.
 
         `retries=1`: this issues a real charge. A transient failure must
         raise rather than retry -- retrying a purchase risks buying twice.
@@ -339,6 +359,9 @@ class HostingerClient:
             raise exc from None
         vm = result.get("virtual_machine") if isinstance(result, dict) else None
         if not isinstance(vm, dict) or "id" not in vm:
+            subscription_id = result.get("subscription_id") if isinstance(result, dict) else None
+            if isinstance(subscription_id, str) and subscription_id.strip():
+                return PurchaseResult(vps_id=None, subscription_id=subscription_id.strip(), warnings=[])
             raise StackError(
                 "Hostinger did not return a virtual machine after purchase",
                 "the payment may still be processing (HTTP 202) -- "
@@ -347,7 +370,7 @@ class HostingerClient:
             )
         vps_id = vm["id"]
         warnings = self._attach_public_keys(vps_id, list(public_key_ids))
-        return vps_id, warnings
+        return PurchaseResult(vps_id=vps_id, subscription_id=None, warnings=warnings)
 
     # -- Waiting -------------------------------------------------------------
 

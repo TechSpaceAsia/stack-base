@@ -26,6 +26,7 @@ from collections import deque
 from typing import Callable
 
 from stackbase.backups import backup_env_content, backup_env_digest
+from stackbase.config import save_state
 from stackbase.errors import StackError
 from stackbase.reconcile import (
     PUSH_EXCLUDES,
@@ -85,7 +86,7 @@ def execute(ctx: Context, step: Step) -> str:
 def _purchase(ctx: Context, step: Step) -> str:
     node = _node(step)
     inline_key, extra_ids = _admin_keys(ctx)
-    vps_id, warnings = ctx.hostinger.purchase_vm(
+    result = ctx.hostinger.purchase_vm(
         price_item=ctx.cfg.price_item or "",
         template_id=ctx.hostinger.template_id("NixOS"),
         data_center_id=ctx.hostinger.data_center_id(ctx.cfg.datacenter),
@@ -93,9 +94,30 @@ def _purchase(ctx: Context, step: Step) -> str:
         public_key=inline_key,
         public_key_ids=extra_ids,
     )
-    _warn(ctx, warnings)
-    ctx.node_state(node).vps_id = vps_id
-    return f"node {node}: bought and installed virtual machine {vps_id}"
+    _warn(ctx, result.warnings)
+    if result.vps_id is None:
+        # HTTP 202: paid for, not provisioned yet. Persist the marker NOW --
+        # `apply` only saves after a step returns, and this one raises -- so
+        # the next run waits for this subscription instead of buying again.
+        ctx.node_state(node).pending_subscription_id = result.subscription_id
+        save_state(ctx.infra_dir, ctx.state)
+        raise _still_processing(node, result.subscription_id)
+    ctx.node_state(node).vps_id = result.vps_id
+    return f"node {node}: bought and installed virtual machine {result.vps_id}"
+
+
+def _still_processing(node: str, subscription_id: str | None) -> StackError:
+    return StackError(
+        f"purchase for node '{node}' (subscription {subscription_id}) is still processing",
+        "re-run ./infra/up in a few minutes; if it never appears, find the VM in hPanel "
+        "and set vps_id in stack.toml",
+    )
+
+
+def _wait_purchase(ctx: Context, step: Step) -> str:
+    """Stop the run while a 202 purchase has no VM yet; changes nothing."""
+    node = _node(step)
+    raise _still_processing(node, ctx.node_state(node).pending_subscription_id)
 
 
 def _adopt(ctx: Context, step: Step) -> str:
@@ -118,7 +140,10 @@ def _adopt(ctx: Context, step: Step) -> str:
     ctx.emit(
         f"! found an existing server {vps_id} named {hostname} -- adopting it instead of buying another"
     )
-    ctx.node_state(node).vps_id = vps_id
+    node_state = ctx.node_state(node)
+    node_state.vps_id = vps_id
+    # The pending purchase has landed; the marker has done its job.
+    node_state.pending_subscription_id = None
     return f"node {node}: adopted existing virtual machine {vps_id} ({hostname})"
 
 
@@ -890,6 +915,7 @@ def _vps_id(ctx: Context, node: str) -> int:
 _EXECUTORS: dict[Action, Callable[[Context, Step], str]] = {
     Action.PURCHASE: _purchase,
     Action.ADOPT: _adopt,
+    Action.WAIT_PURCHASE: _wait_purchase,
     Action.SETUP: _setup,
     Action.WAIT_RUNNING: _wait_running,
     Action.ENSURE_KEYS: _ensure_keys,
