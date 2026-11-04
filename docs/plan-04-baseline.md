@@ -178,6 +178,7 @@ Tests: `tests/test_config.py`, `tests/test_cli.py`, `tests/test_reconcile.py`, `
 
 **Interfaces:**
 - `@dataclass(frozen=True) Environment: name: str; domain: str; plan: str; price_item: str | None; nodes: dict[str, Node]; backups: BackupsConfig; logs: LogsConfig; alerts: AlertsConfig; files: FilesConfig`.
+- This task defines and parses all four section types, including validation, the shared-vs-override merge and the per-environment override whitelist: `BackupsConfig` (existing, + `enabled: bool | None`), `LogsConfig(enabled: bool | None, bucket: str | None, retention_days: int | None)`, `AlertsConfig(to: list[str])` and `FilesConfig(bucket: str | None, lock_days: int | None)`. Tasks 6, 8, 9 and 10 consume them; they do not redefine them.
 - `StackConfig` gains `environments: dict[str, Environment]` (insertion order kept) and `implicit_env: bool`. Legacy files yield exactly one environment, named `""` with `implicit_env=True`, built from the top-level keys.
 - `StackConfig.env(name: str | None) -> Environment` returns the selected environment. `None` is accepted only when `implicit_env`; otherwise it raises `StackError("this project has environments: staging, production", "add --env <name>")`. An unknown name → `StackError` listing the valid names.
 - `state_path(infra_dir, env: Environment) -> Path` → `stack.state.json` for the implicit environment, else `stack.state.<name>.json`. `load_state(infra_dir, env)` and `save_state(infra_dir, env, state)` take the environment.
@@ -234,7 +235,7 @@ Tests: `tests/test_config.py`, `tests/test_cli.py`, `tests/test_reconcile.py`, `
 
 ### Task 6: `nixos/logs.nix` — Vector to R2 (Brief D)
 
-**Files:** Create `nixos/logs.nix`, `stackbase/logs.py` (laptop side: `ENSURE_LOGS_ENV`, modelled on `stackbase/backups.py`) and `tests/vm-logs.nix` (registered in `flake.nix` checks). Modify the repo-root `flake.nix` (module list), `nixos/base.nix` (the journald block from Brief D replaces `SystemMaxUse=500M`), `templates/infra/flake.nix` (`[logs]` → `stackbase.logs.*`), `stackbase/config.py` (`LogsConfig: enabled: bool | None; bucket: str | None; retention_days: int | None`), `stackbase/reconcile.py`, `stackbase/steps.py`, `tests/test_config.py`, `tests/test_logs.py`, `tests/test_template.py` and `README.md`.
+**Files:** Create `nixos/logs.nix`, `stackbase/logs.py` (laptop side: `ENSURE_LOGS_ENV`, modelled on `stackbase/backups.py`) and `tests/vm-logs.nix` (registered in `flake.nix` checks). Modify the repo-root `flake.nix` (module list), `nixos/base.nix` (the journald block from Brief D replaces `SystemMaxUse=500M`), `templates/infra/flake.nix` (`[logs]` → `stackbase.logs.*`), `stackbase/reconcile.py`, `stackbase/steps.py`, `tests/test_config.py`, `tests/test_logs.py`, `tests/test_template.py` and `README.md`.
 
 **Interfaces:**
 - Options `stackbase.logs = { enable (bool); bucket (str); bufferBytes (ints.positive, 1073741824); batchSeconds (ints.positive, 600); localDays (ints.positive, 3) }`. Retention is not a node option; Task 5 owns it.
@@ -285,7 +286,7 @@ Tests: `tests/test_config.py`, `tests/test_cli.py`, `tests/test_reconcile.py`, `
 
 ### Task 8: `nixos/alerts.nix` — email on any failed service (Brief F)
 
-**Files:** Create `nixos/alerts.nix` and `stackbase/alerts.py` (the `ENSURE_ALERT_ENV` step + an `alert-test` command). Modify `stackbase/reconcile.py`, `stackbase/steps.py`, `stackbase/__main__.py`, `stackbase/config.py` (`AlertsConfig: to: list[str]`, each matching `^[^@\s]+@[^@\s]+\.[^@\s]+$`), `templates/infra/flake.nix`, `nixos/backups.nix` (write `/var/lib/stackbase-backup/last-success` on success), `tests/test_alerts.py`, `tests/vm-alerts.nix` and `README.md`.
+**Files:** Create `nixos/alerts.nix` and `stackbase/alerts.py` (the `ENSURE_ALERT_ENV` step + an `alert-test` command). Modify `stackbase/reconcile.py`, `stackbase/steps.py`, `stackbase/__main__.py`, `templates/infra/flake.nix`, `nixos/backups.nix` (write `/var/lib/stackbase-backup/last-success` on success), `tests/test_alerts.py`, `tests/vm-alerts.nix` and `README.md`.
 
 **Interfaces:**
 - Secrets keys `smtp_host`, `smtp_port`, `smtp_user`, `smtp_password` and `smtp_from` → `/var/lib/stackbase/alert.env` (0600), with an allowlist like `_R2_KEYS`.
@@ -310,7 +311,7 @@ Tests: `tests/test_config.py`, `tests/test_cli.py`, `tests/test_reconcile.py`, `
 
 ### Task 9: Files in R2 under a bucket lock (Brief J)
 
-**Files:** Create `stackbase/files.py` (renders the `STORAGE_*` block). Modify `stackbase/config.py` (`FilesConfig: bucket: str | None; lock_days: int | None`, range 1–3650), `stackbase/reconcile.py` (adds the files bucket to Task 5's ENSURE steps), `stackbase/release.py` / the app-env push (append the `STORAGE_*` lines, kept out of the `app_env` digest so changing them alone still re-pushes), `templates/infra/stack.toml.example`, `tests/test_files.py` and `README.md`.
+**Files:** Create `stackbase/files.py` (renders the `STORAGE_*` block). Modify `stackbase/config.py` (`FilesConfig.lock_days` range check 1–3650), `stackbase/reconcile.py` (adds the files bucket to Task 5's ENSURE steps), `stackbase/release.py` / the app-env push (append the `STORAGE_*` lines, kept out of the `app_env` digest so changing them alone still re-pushes), `templates/infra/stack.toml.example`, `tests/test_files.py` and `README.md`.
 
 **Interfaces:**
 - `storage_env_lines(env: Environment, secrets: dict[str, str]) -> list[str]`. It returns `[]` when `[files]` is absent, and raises a StackError naming the missing keys when `[files]` is set but the credentials are incomplete.
@@ -331,7 +332,7 @@ Tests: `tests/test_config.py`, `tests/test_cli.py`, `tests/test_reconcile.py`, `
 
 ### Task 10: Backups and logs on unless explicitly opted out; v0.2.0
 
-**Files:** Modify `stackbase/config.py` (`BackupsConfig.enabled: bool | None`, `LogsConfig.enabled`), `stackbase/reconcile.py` (plan-time check, per environment), `stackbase/__init__.py` + `templates/infra/flake.nix` (version → `0.2.0`, kept equal per the existing test), `templates/infra/stack.toml.example` (all new sections, commented), `tests/test_config.py`, `tests/test_reconcile.py` and `README.md` (an upgrade note for v0.2.0).
+**Files:** Modify `stackbase/reconcile.py` (plan-time check, per environment), `stackbase/__init__.py` + `templates/infra/flake.nix` (version → `0.2.0`, kept equal per the existing test), `templates/infra/stack.toml.example` (all new sections, commented), `tests/test_config.py`, `tests/test_reconcile.py` and `README.md` (an upgrade note for v0.2.0).
 
 - [ ] **Step 1: Tests:**
   - `test_up_refuses_without_backups_names_both_options`
