@@ -700,6 +700,96 @@ class EnvironmentOptOutTests(unittest.TestCase):
                 self._load(toml)
 
 
+_BUCKETED_ENVS = """\
+project = "acme"
+owner = "octocat"
+datacenter = "kul"
+plan = "KVM 1"
+admins = ["matt"]
+
+[backups]
+bucket = "acme-backups"
+
+[logs]
+bucket = "acme-logs"
+
+[files]
+bucket = "acme-files"
+
+[environments.staging]
+domain = "staging.acme.example.com"
+[environments.staging.nodes.a]
+role = "primary"
+
+[environments.production]
+domain = "acme.example.com"
+[environments.production.nodes.a]
+role = "primary"
+"""
+
+
+class SharedBucketTests(unittest.TestCase):
+    """Two environments on one bucket: staging's lifecycle rules, restores
+    and `--env staging` writes would land on production's data."""
+
+    def _load(self, toml: str):
+        with TempInfraDir() as infra_dir:
+            _envs_project(infra_dir, toml)
+            return load_config(infra_dir)
+
+    def _distinct(self, toml: str, *sections: str) -> str:
+        for section in sections:
+            toml = toml.replace(
+                '[environments.staging]\n', f'[environments.staging]\n{section}.bucket = "acme-{section}-stg"\n', 1
+            )
+        return toml
+
+    def test_a_shared_bucket_is_refused_per_section(self) -> None:
+        for section, bucket in (("backups", "acme-backups"), ("logs", "acme-logs"), ("files", "acme-files")):
+            # Give the OTHER sections distinct staging buckets so only one is shared.
+            others = [name for name in ("backups", "logs", "files") if name != section]
+            with self.subTest(section=section), self.assertRaises(StackError) as caught:
+                self._load(self._distinct(_BUCKETED_ENVS, *others))
+            text = f"{caught.exception.message} {caught.exception.hint}"
+            self.assertIn(f"[{section}]", text)
+            self.assertIn(bucket, text)
+            self.assertIn("'staging'", text)
+            self.assertIn("'production'", text)
+            self.assertIn(f"[environments.<env>.{section}]", text)
+
+    def test_distinct_prefixes_of_one_bucket_are_legal(self) -> None:
+        toml = _BUCKETED_ENVS.replace('bucket = "acme-backups"', 'bucket = "acme-backups/production"', 1)
+        toml = self._distinct(toml, "logs", "files").replace(
+            '[environments.staging]\n', '[environments.staging]\nbackups.bucket = "acme-backups/staging"\n', 1
+        )
+        config = self._load(toml)
+        self.assertEqual(config.env("staging").backups.bucket, "acme-backups/staging")
+        self.assertEqual(config.env("production").backups.bucket, "acme-backups/production")
+
+    def test_a_shared_bucket_used_by_one_environment_only_is_fine(self) -> None:
+        toml = _BUCKETED_ENVS.replace(
+            '[environments.staging]\n', '[environments.staging]\nbackups.enabled = false\nlogs.enabled = false\n', 1
+        )
+        toml = toml.replace('[files]\nbucket = "acme-files"\n', '[files]\nbucket = "acme-files"\n', 1)
+        toml = toml.replace(
+            '[environments.staging]\n', '[environments.staging]\nfiles.bucket = "acme-files-stg"\n', 1
+        )
+        config = self._load(toml)
+        self.assertIsNone(config.env("staging").backups.bucket)
+        self.assertEqual(config.env("production").backups.bucket, "acme-backups")
+
+    def test_the_readme_staging_and_production_example_loads(self) -> None:
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        heading = readme.index("## Staging and production")
+        block = readme[readme.index("```toml", heading):]
+        toml = block[len("```toml\n"):block.index("```", 8)]
+        toml = toml.replace("your-name", "matt")
+        config = self._load(toml)
+        self.assertEqual(list(config.environments), ["staging", "production"])
+        self.assertNotEqual(config.env("staging").backups.bucket, config.env("production").backups.bucket)
+        self.assertNotEqual(config.env("staging").logs.bucket, config.env("production").logs.bucket)
+
+
 class EnvironmentsTests(unittest.TestCase):
     def test_legacy_file_is_one_implicit_env(self) -> None:
         with TempInfraDir() as infra_dir:

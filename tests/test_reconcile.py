@@ -3534,6 +3534,22 @@ class BaselineRequiredTests(unittest.TestCase):
             check_baseline(env)
         self.assertIn("staging", f"{caught.exception} {caught.exception.hint}")
 
+    def test_an_environments_hint_points_at_its_own_table_not_the_shared_one(self) -> None:
+        env = _baseline_env(name="staging", logs=self._logs(enabled=False))
+        with self.assertRaises(StackError) as caught:
+            check_baseline(env)
+        self.assertIn('[environments.staging.backups] bucket = "', caught.exception.hint)
+
+    def test_shared_opt_out_plus_environment_bucket_names_both_tables(self) -> None:
+        env = _baseline_env(
+            name="staging", backups=self._backups(enabled=False, bucket="b"), logs=self._logs(bucket="l")
+        )
+        with self.assertRaises(StackError) as caught:
+            check_baseline(env)
+        self.assertNotIn("both in one table", str(caught.exception))
+        self.assertIn("[environments.staging.backups]", caught.exception.message)
+        self.assertIn("enabled = false", caught.exception.message)
+
     def test_backups_opt_out_warns(self) -> None:
         env = _baseline_env(backups=self._backups(enabled=False), logs=self._logs(bucket="l"))
         warnings = check_baseline(env)

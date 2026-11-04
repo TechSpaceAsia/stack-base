@@ -446,8 +446,10 @@ def _parse_environments(
             plan=plan,
             price_item=price_item,
             nodes=nodes,
-            backups=_opt_out(_merge(shared.backups, _parse_backups(table, toml_path, table=f"{label}.backups"),
-                           table.get("backups")), table.get("backups")),
+            backups=_opt_out(
+                _merge(shared.backups, _parse_backups(table, toml_path, table=f"{label}.backups"), table.get("backups")),
+                table.get("backups"),
+            ),
             logs=_opt_out(
                 _merge(shared.logs, _parse_logs(table, toml_path, table=f"{label}.logs"), table.get("logs")),
                 table.get("logs"),
@@ -473,7 +475,29 @@ def _reject_shared_servers(environments: dict[str, Environment], toml_path: Path
     """
     domains: dict[str, str] = {}
     vps_ids: dict[int, str] = {}
+    # A bucket is as shared as a server: staging's lifecycle/lock rules,
+    # restores and `--env staging` writes would land on production's data.
+    # Compared as whole strings, so "acme-backups/staging" and
+    # "acme-backups/production" (one bucket, two prefixes) stay legal.
+    buckets: dict[tuple[str, str], str] = {}
     for name, env in environments.items():
+        for section, bucket in (
+            ("backups", env.backups.bucket),
+            ("logs", env.logs.bucket),
+            ("files", env.files.bucket),
+        ):
+            if not bucket:
+                continue
+            other = buckets.setdefault((section, bucket), name)
+            if other != name:
+                raise StackError(
+                    f"environments '{other}' and '{name}' in {toml_path} both use the [{section}] "
+                    f'bucket "{bucket}"',
+                    f'give each environment its own bucket under [environments.<env>.{section}] '
+                    'bucket = "..." -- otherwise one environment\'s lifecycle rules and restores act on '
+                    "the other's data"
+                    + (' (a distinct prefix such as "acme-backups/staging" is enough)' if section == "backups" else ""),
+                )
         other = domains.setdefault(env.domain.lower(), name)
         if other != name:
             raise StackError(
@@ -514,7 +538,7 @@ def _reject_opt_out_with_bucket(section: Any, toml_path: Path, table: str) -> No
     if section.enabled is False and section.bucket:
         raise StackError(
             f"{toml_path} [{table}] has both enabled = false and bucket = \"{section.bucket}\"",
-            f"remove one of them: delete enabled = false to keep it on, or delete the bucket to leave it off",
+            "remove one of them: delete enabled = false to keep it on, or delete the bucket to leave it off",
         )
 
 

@@ -735,8 +735,18 @@ def check_baseline(env: Environment) -> list[str]:
     warnings: list[str] = []
     for table, section in (("backups", env.backups), ("logs", env.logs)):
         if section.enabled is False and section.bucket:
+            if env.implicit:
+                together = f"[{table}] has both enabled = false and bucket = \"{section.bucket}\""
+            else:
+                # Two tables: the shared one says enabled = false, the
+                # environment's names a bucket (one table alone is refused
+                # while parsing).
+                together = (
+                    f"[{table}] says enabled = false but [environments.{env.name}.{table}] names "
+                    f"the bucket \"{section.bucket}\""
+                )
             raise StackError(
-                f"[{table}] has both enabled = false and bucket = \"{section.bucket}\"{scope}",
+                f"{together}{scope}",
                 f"remove one of them: delete enabled = false to keep {table} on, or delete the bucket "
                 f"to leave {table} off",
             )
@@ -746,11 +756,13 @@ def check_baseline(env: Environment) -> list[str]:
                 + ("nothing is backed up off-box" if table == "backups" else "the journal is not shipped off-box")
             )
         elif not section.bucket:
-            where = f"[{table}]" if env.implicit else f"[{table}] (or [environments.{env.name}] {table}.bucket)"
+            # With environments the bucket belongs in the environment's own
+            # table: a shared one would be refused as soon as two share it.
+            where = f"[{table}]" if env.implicit else f"[environments.{env.name}.{table}]"
             raise StackError(
                 f"{table} are required but no {where} bucket is set{scope}",
-                f'either set bucket = "..." in {where} (an R2 bucket name), or opt out explicitly '
-                f"with enabled = false in [{table}]",
+                f'either set {where} bucket = "..." (an R2 bucket name), or opt out explicitly '
+                f"with enabled = false in {where}",
             )
     return warnings
 

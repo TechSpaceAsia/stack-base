@@ -259,18 +259,21 @@ datacenter = "kul"
 plan       = "KVM 1"
 admins     = ["your-name"]
 
-[backups]
-bucket = "acme-backups"
-
+# Each environment names its OWN buckets. Two environments on one bucket
+# would let staging's lifecycle rules and restores touch production's data,
+# so a shared bucket is refused. A prefix is enough to tell them apart.
 [environments.staging]
 domain         = "staging.acme.example.com"
-backups.bucket = "acme-backups-staging"
+backups.bucket = "acme-backups/staging"
+logs.bucket    = "acme-logs-staging"
 
 [environments.staging.nodes.a]
 role = "primary"
 
 [environments.production]
-domain = "acme.example.com"
+domain         = "acme.example.com"
+backups.bucket = "acme-backups/production"
+logs.bucket    = "acme-logs-production"
 
 [environments.production.nodes.a]
 role = "primary"
