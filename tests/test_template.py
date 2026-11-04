@@ -461,6 +461,8 @@ class TemplateEnvironmentsTests(unittest.TestCase):
             " openFirewall = node.config.services.cloudflare-warp.openFirewall;"
             " unit = node.config.systemd.services ? cloudflare-warp;"
             " warp = node.config.nixpkgs.config.allowUnfreePredicate { pname = \"cloudflare-warp\"; };"
+            " version = node.config.services.cloudflare-warp.package.version;"
+            " nft = node.config.systemd.services.cloudflare-warp.serviceConfig.BindReadOnlyPaths;"
             " other = node.config.nixpkgs.config.allowUnfreePredicate { pname = \"vscode\"; }; }"
         )
         with TemporaryDirectory() as tmp:
@@ -476,6 +478,10 @@ class TemplateEnvironmentsTests(unittest.TestCase):
             self.assertFalse(facts["openFirewall"])
             self.assertTrue(facts["unit"])
             self.assertTrue(facts["warp"])
+            # The 2026-10-20 certificate-chain hotfix build, not 26.05's 2026.3.
+            version = tuple(int(part) for part in facts["version"].split("."))
+            self.assertGreaterEqual(version, (2026, 8), facts["version"])
+            self.assertTrue(any(m.endswith(":/usr/sbin/nft") for m in facts["nft"]), facts["nft"])
             self.assertFalse(facts["other"])
 
     def test_no_mesh_table_leaves_the_warp_connector_off(self) -> None:

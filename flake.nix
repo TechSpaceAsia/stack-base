@@ -8,7 +8,14 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
-  outputs = { self, nixpkgs }:
+  # Only nixos/mesh.nix's cloudflare-warp comes from here. nixos-26.05 ships
+  # 2026.3.846.0; this commit has 2026.8.2115.0, the build carrying
+  # Cloudflare's 2026-10-20 certificate-chain hotfix, without which Mesh
+  # enrolment fails. Same commit platform-base pins. Drop this input (and use
+  # pkgs.cloudflare-warp) once nixos-26.05 ships >= 2026.8.
+  inputs.nixpkgs-warp.url = "github:NixOS/nixpkgs/d0fdd02155a254227dce86380a58a4bf94f1e56f";
+
+  outputs = { self, nixpkgs, nixpkgs-warp }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
@@ -36,7 +43,7 @@
       nixosModules.deploy = import ./nixos/deploy.nix;
       nixosModules.backups = import ./nixos/backups.nix;
       nixosModules.logs = import ./nixos/logs.nix;
-      nixosModules.mesh = import ./nixos/mesh.nix;
+      nixosModules.mesh = import ./nixos/mesh.nix { inherit nixpkgs-warp; };
       nixosModules.default = { imports = baseModules; };
 
       # `provider` selects the module that reproduces one hosting provider's

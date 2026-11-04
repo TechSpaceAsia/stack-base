@@ -15,17 +15,20 @@
 # The firewall is not opened: WARP dials out, and nothing needs to reach
 # its UDP port from the Internet.
 #
-# platform-base also bind-mounts nftables at /usr/sbin/nft, because the
-# 2026-10 daemon build calls nft by that FHS path. The nixpkgs this flake
-# pins (nixos-26.05) packages cloudflare-warp 2026.3, which wraps warp-svc
-# with nftables on its PATH instead and calls no FHS path, so the mount is
-# not carried here. If a later pin ships the newer daemon, add
-#   systemd.services.cloudflare-warp.serviceConfig.BindReadOnlyPaths =
-#     [ "${lib.getExe pkgs.nftables}:/usr/sbin/nft" ];
+# The package comes from the `nixpkgs-warp` flake input, not the main
+# nixpkgs: see flake.nix for why, and when to drop the pin. The 2026-10
+# daemon build calls nft by the FHS path /usr/sbin/nft, which the 26.05
+# service module does not provide, so nftables is bind-mounted there (as in
+# platform-base).
+{ nixpkgs-warp }:
 { config, lib, pkgs, ... }:
 
 let
   cfg = config.stackbase.mesh;
+  warpPkgs = import nixpkgs-warp {
+    system = pkgs.stdenv.hostPlatform.system;
+    config.allowUnfree = true; # this import only, to take the one package
+  };
 in
 {
   options.stackbase.mesh.enable = lib.mkEnableOption "joining Cloudflare Mesh (headless cloudflare-warp connector)";
@@ -33,9 +36,13 @@ in
   config = lib.mkIf cfg.enable {
     services.cloudflare-warp = {
       enable = true;
-      package = pkgs.cloudflare-warp.override { headless = true; };
+      package = warpPkgs.cloudflare-warp.override { headless = true; };
       openFirewall = false;
     };
+
+    systemd.services.cloudflare-warp.serviceConfig.BindReadOnlyPaths = [
+      "${lib.getExe pkgs.nftables}:/usr/sbin/nft"
+    ];
 
     # cloudflare-warp is unfree. Admit that one package, and nothing else.
     nixpkgs.config.allowUnfreePredicate = pkg: lib.getName pkg == "cloudflare-warp";
