@@ -3363,7 +3363,15 @@ def _env_plan_transcript(root: Path) -> tuple[str, list[str], list[Any]]:
     shutil.copy(_FIXTURES / "stack-envs.toml", infra_dir / "stack.toml")
     (infra_dir / "keys" / "matt.pub").write_text(_KEY_MATT + "\n", encoding="utf-8")
     (infra_dir / "flake.lock").write_text(json.dumps(_LOCK), encoding="utf-8")
-    secrets = {"hostinger_token": "h-token", "cloudflare_token": "c-token", "cloudflare_account_id": "acct123"}
+    secrets = {
+        "hostinger_token": "h-token",
+        "cloudflare_token": "c-token",
+        "cloudflare_account_id": "acct123",
+        # production ships logs, so `up` refuses to plan without these.
+        "logs_access_key_id": "LOGSKEY",
+        "logs_secret_access_key": "logs-secret",
+        "r2_endpoint": "https://acct123.r2.cloudflarestorage.com",
+    }
     meta = {"current_page": 1, "per_page": 20, "total": 0}
     page = {"page": 1, "per_page": 20, "count": 1, "total_count": 1, "total_pages": 1}
     domain = "acme.example.com"
@@ -3437,6 +3445,11 @@ class EnvironmentPlanTests(unittest.TestCase):
         self.assertIn("delete journal/ after 90 days", output)
         self.assertIn("R2 bucket acme-files: setting the bucket-lock rule", output)
         self.assertIn("GET /accounts/acct123/r2/buckets/acme-logs", requests)
+        # Vector's credentials reach each production node before its rebuild.
+        self.assertIn("node a: updating the log shipping credentials on the server", output)
+        self.assertLess(
+            output.index("node a: updating the log shipping credentials"), output.index("node a: rebuilding NixOS")
+        )
 
 
 if __name__ == "__main__":

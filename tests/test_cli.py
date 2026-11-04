@@ -186,6 +186,27 @@ class PlanTests(unittest.TestCase):
             self.assertIn("node a: rebuilding NixOS", output)
             self.assertNotIn(_HOSTINGER_TOKEN, output)
 
+    def test_plan_refuses_logs_on_without_logs_credentials(self) -> None:
+        """Vector cannot start without logs.env, and a unit that fails to
+        start fails the rebuild -- so `up` refuses up front, --plan included."""
+        with TemporaryDirectory() as tmp, FakeServer() as server:
+            infra_dir, identity = _project(Path(tmp))
+            with (infra_dir / "stack.toml").open("a", encoding="utf-8") as f:
+                f.write('\n[logs]\nbucket = "acme-logs"\n')
+            _script_observe(server)
+            stderr = io.StringIO()
+
+            with _cli(server, identity) as (ssh_class, execute):
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as caught:
+                        main(["--infra-dir", str(infra_dir), "up", "--plan"])
+
+            self.assertEqual(caught.exception.code, 1)
+            self.assertIn("logs_access_key_id", stderr.getvalue())
+            self.assertIn("enabled = false", stderr.getvalue())
+            ssh_class.assert_not_called()
+            execute.assert_not_called()
+
     def test_plan_writes_nothing_to_the_infra_directory(self) -> None:
         with TemporaryDirectory() as tmp, FakeServer() as server:
             infra_dir, identity = _project(Path(tmp))

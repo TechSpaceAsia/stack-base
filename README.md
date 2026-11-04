@@ -129,6 +129,7 @@ Then commit what it wrote back: `infra/stack.state.json`,
 | creating the origin certificate | Gets a TLS certificate from Cloudflare for your domain |
 | uploading | Copies `infra/` and the certificate onto the server |
 | rebuilding NixOS | Applies the configuration (this is the slow one — minutes) |
+| updating the log shipping credentials | Pushes the logs bucket's R2 credentials before the rebuild that starts Vector (see [Logs](#logs)) |
 | updating the application's environment file | Pushes `app_env` from `secrets.age` to the server and restarts the running release (see [The app's environment](#the-apps-environment-app_env) below) |
 | pointing the domain | Points your domain at the server in Cloudflare |
 | creating the R2 bucket / setting the retention rule / setting the bucket-lock rule | See [R2 buckets](#r2-buckets-logs-and-files) |
@@ -856,6 +857,116 @@ step 2 — the same requirement the node has for writing the backup.
 **Test this before you need it.** A backup nobody has ever restored is a
 hypothesis, not a backup.
 
+## Logs
+
+Every server streams its journal to R2 as soon as its environment names a
+logs bucket:
+
+```toml
+# infra/stack.toml
+[logs]
+bucket = "acme-logs"
+retention_days = 90
+```
+
+With [environments](#staging-and-production), give each one its own bucket
+(`logs.bucket = "acme-logs-staging"` in `[environments.staging]`). A `[logs]`
+table that names no bucket after that merge is refused; `enabled = false` in
+`[logs]` turns logs off instead. A project with no `[logs]` table at all ships
+nothing and plans exactly what it did before.
+
+The node writes with its own R2 token, scoped to the logs bucket — not the
+backup one. `r2_endpoint` is shared with backups:
+
+```bash
+LOGS_ACCESS_KEY_ID=<paste here>
+LOGS_SECRET_ACCESS_KEY=<paste here>
+R2_ENDPOINT=<paste here, e.g. https://<account>.r2.cloudflarestorage.com>
+printf '%s' "$LOGS_ACCESS_KEY_ID"     | ./infra/up secrets set logs_access_key_id
+printf '%s' "$LOGS_SECRET_ACCESS_KEY" | ./infra/up secrets set logs_secret_access_key
+printf '%s' "$R2_ENDPOINT"            | ./infra/up secrets set r2_endpoint
+./infra/up
+```
+
+(add `--env <name>` to each command once you have environments). With logs on
+and any of the three missing, `up` and `--plan` stop and name them: Vector
+cannot start without its credentials, and a service that fails to start
+fails the whole rebuild. `up` pushes them to `/var/lib/stackbase/logs.env`
+(0600, root) **before** the rebuild that starts Vector, and restarts Vector
+when they change.
+
+**What is shipped, and when.** [Vector](https://vector.dev) reads the whole
+persistent journal and keeps nine fields per entry — `timestamp`, `host`,
+`unit`, `ident`, `pid`, `priority`, `message`, `boot_id`, `cursor` — and
+uploads a batch at least every 15 seconds. Command lines, executable paths
+and the rest of journald's metadata stay on the server. If the server is
+destroyed, you lose at most the last ~15 seconds — plus, if R2 was
+unreachable at that moment, whatever was still waiting to be sent.
+
+**Key layout.** One gzipped, newline-delimited JSON object per batch:
+
+```
+journal/<host>/<YYYY>/<MM>/<DD>/<HH>/<uuid>.ndjson.gz
+```
+
+`<host>` is the server's hostname (`a`, or `staging-a` with environments),
+and the hour is UTC.
+
+**Searching.** From your machine, with a read-only R2 token:
+
+```bash
+BUCKET=acme-logs
+HOST=a
+DAY=2026/11/04
+R2_ENDPOINT=<paste here>
+export AWS_ACCESS_KEY_ID=<paste here> AWS_SECRET_ACCESS_KEY=<paste here>
+aws s3 ls --recursive --endpoint-url "$R2_ENDPOINT" "s3://$BUCKET/journal/$HOST/$DAY/"
+KEY=<one key from the listing>
+aws s3 cp --endpoint-url "$R2_ENDPOINT" "s3://$BUCKET/$KEY" - | zcat -f | rg 'panicked'
+# a whole day, duplicates removed by cursor:
+aws s3 cp --recursive --endpoint-url "$R2_ENDPOINT" "s3://$BUCKET/journal/$HOST/$DAY/" ./logs/
+fd -e gz . ./logs -x zcat -f | jq -c -s 'unique_by(.cursor) | sort_by(.timestamp)[]' | rg 'panicked'
+```
+
+On the server itself, the last 3 days are plain text under `/var/log/vector`,
+and the journal keeps 7:
+
+```bash
+./infra/up ssh a -- rg 'panicked' /var/log/vector
+./infra/up ssh a -- journalctl -u acme@blue --since -2h
+```
+
+**Outages.** Vector keeps unsent batches in a 1 GiB buffer on disk that
+survives restarts, and only moves its journal bookmark once an entry is in
+that buffer. When the buffer is full it waits, and the journal itself holds
+the rest — so an R2 outage of up to **7 days** (the local journal's
+retention) loses nothing, and Vector catches up on its own afterwards.
+Delivery is **at least once**: after a restart or a retry the same entry
+can be uploaded twice. Every entry carries its journal `cursor`, which is
+unique — dedupe on it (as the `jq` line above does). A full local disk
+never holds up R2: the local copy is best effort and simply skips entries it
+cannot write.
+
+**Retention** is the bucket's lifecycle rule (see
+[R2 buckets](#r2-buckets-logs-and-files)): objects under `journal/` are
+deleted by R2 after `retention_days` (default 90). The server never deletes
+a log object.
+
+**Checking it works** (on the server, `./infra/up ssh a`):
+
+```bash
+# the config Vector is running, with a dummy endpoint (nothing is contacted)
+CONFIG=$(systemctl show -p ExecStart --value vector.service | grep -o '/nix/store/[^ ]*vector.toml')
+LOGS_ENDPOINT=https://validate.invalid vector validate --no-environment "$CONFIG"
+vector top                      # live throughput per component (API on 127.0.0.1:8686)
+vector tap slim                 # watch entries as they leave the journal
+curl -s http://127.0.0.1:9598/metrics | rg 'vector_component_sent_events_total|vector_buffer_byte_size'
+```
+
+`vector_buffer_byte_size` for the `r2` sink climbing and staying up means R2
+has been unreachable for a while; `vector_component_sent_events_total` for
+`r2` should keep rising. Both endpoints listen on 127.0.0.1 only.
+
 ## R2 buckets (logs and files)
 
 When an environment's `[logs]` or `[files]` table names a `bucket`, `./infra/up`
@@ -953,6 +1064,9 @@ Every failure is one line: what went wrong, then what to check.
 | Cargo.toml declares several `[[bin]]` entries and stack.toml has no `[app].binary` | Ambiguous — add `[app] binary = "..."` to `stack.toml`, choosing one of the listed candidates |
 | `infra/ has uncommitted changes that would be pushed` | Commit them, or re-run with `--allow-dirty` if you are deliberately testing |
 | `the backup unit failed on node a` | `./infra/up ssh a -- journalctl -u stackbase-backup -n 50` — the usual causes are wrong R2 credentials or a bucket that does not exist |
+| `… turns logs on but names no [logs] bucket` | Set `bucket` in `[logs]` (or `logs.bucket` in that environment), or `enabled = false` to leave logs off — see [Logs](#logs) |
+| `[logs] bucket = "…" is set but … has no complete set of logs credentials` | Set `logs_access_key_id`, `logs_secret_access_key` and `r2_endpoint` as in [Logs](#logs) |
+| Nothing new in the logs bucket | `./infra/up ssh a -- systemctl status vector` and `-- journalctl -u vector -n 50`; the usual causes are a wrong token or a bucket that does not exist |
 | `this project has no backup bucket` | Add `[backups] bucket = "..."` to `stack.toml` and run `./infra/up` |
 
 A failed run changes nothing further and can always simply be run again: it

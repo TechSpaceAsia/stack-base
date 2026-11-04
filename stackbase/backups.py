@@ -94,28 +94,37 @@ def backup_env_content(secrets: dict[str, str]) -> str | None:
         value = secrets.get(key)
         if not value:
             return None
-        # Kept as its own message: a line break is the one case whose
-        # consequence is injection into the FILE (a second KEY=value line
-        # that systemd itself would honour), not just into a shell.
-        if "\n" in value or "\r" in value:
-            raise StackError(
-                f"infra/secrets.age's '{key}' contains a line break",
-                f"R2 credentials are single-line values -- re-issue it and set it with "
-                f"`./infra/up secrets set {key}`, then run `up` again",
-            )
-        if not _VALUE_RE.match(value):
-            raise StackError(
-                f"infra/secrets.age's '{key}' contains whitespace or a character a shell "
-                "would reinterpret",
-                f"an R2 access key, secret and endpoint contain only {_VALUE_SHAPE} -- this "
-                f"one does not, so re-issue it in the Cloudflare dashboard and set it with "
-                f"`./infra/up secrets set {key}`, then run `up` again",
-            )
-        values.append(value)
+        values.append(checked_credential(key, value))
 
     lines = ["RCLONE_CONFIG_BACKUP_TYPE=s3", "RCLONE_CONFIG_BACKUP_PROVIDER=Cloudflare"]
     lines.extend(f"{variable}={value}" for (_key, variable), value in zip(_R2_KEYS, values))
     return "\n".join(lines) + "\n"
+
+
+def checked_credential(key: str, value: str) -> str:
+    """`value`, if it is a single-line R2 credential inside `_VALUE_RE`.
+
+    Shared with stackbase/logs.py, so every credentials file under
+    /var/lib/stackbase is held to the same allowlist.
+    """
+    # Kept as its own message: a line break is the one case whose
+    # consequence is injection into the FILE (a second KEY=value line
+    # that systemd itself would honour), not just into a shell.
+    if "\n" in value or "\r" in value:
+        raise StackError(
+            f"infra/secrets.age's '{key}' contains a line break",
+            f"R2 credentials are single-line values -- re-issue it and set it with "
+            f"`./infra/up secrets set {key}`, then run `up` again",
+        )
+    if not _VALUE_RE.match(value):
+        raise StackError(
+            f"infra/secrets.age's '{key}' contains whitespace or a character a shell "
+            "would reinterpret",
+            f"an R2 access key, secret and endpoint contain only {_VALUE_SHAPE} -- this "
+            f"one does not, so re-issue it in the Cloudflare dashboard and set it with "
+            f"`./infra/up secrets set {key}`, then run `up` again",
+        )
+    return value
 
 
 def backup_env_digest(content: str) -> str:

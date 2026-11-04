@@ -129,6 +129,7 @@ class Action(Enum):
     REBUILD = "rebuild"
     ENSURE_APP_ENV = "ensure_app_env"
     ENSURE_BACKUP_ENV = "ensure_backup_env"
+    ENSURE_LOGS_ENV = "ensure_logs_env"
     UPSERT_DNS = "upsert_dns"
     ENSURE_R2_BUCKET = "ensure_r2_bucket"
     ENSURE_R2_LIFECYCLE = "ensure_r2_lifecycle"
@@ -152,6 +153,7 @@ _DOING: dict[Action, str] = {
     Action.REBUILD: "rebuilding NixOS (this can take a few minutes)",
     Action.ENSURE_APP_ENV: "updating the application's environment file",
     Action.ENSURE_BACKUP_ENV: "updating the backup credentials on the server",
+    Action.ENSURE_LOGS_ENV: "updating the log shipping credentials on the server",
     Action.UPSERT_DNS: "pointing the domain at the server in Cloudflare",
     Action.ENSURE_R2_BUCKET: "creating the R2 bucket",
     Action.ENSURE_R2_LIFECYCLE: "setting the retention rule",
@@ -247,6 +249,10 @@ class Local:
     # None when the project has no R2 credentials. Compared against each
     # node's recorded `NodeState.backup_env_sha` -- see `_needs_backup_env`.
     backup_env_sha: str | None = None
+    # sha256 of the rendered logs.env (the environment's logs_* keys plus
+    # r2_endpoint), or None when any is missing. `plan()` only ever looks at
+    # it for an environment whose logs are on -- see `_needs_logs_env`.
+    logs_env_sha: str | None = None
 
 
 def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str | None = None) -> Local:
@@ -259,9 +265,11 @@ def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str 
     # this module, so importing it at the top would be a cycle -- the same
     # trick `apply()` already uses for `stackbase.steps`.
     from stackbase.backups import backup_env_content, backup_env_digest
+    from stackbase.logs import logs_env_content, logs_env_digest
 
     app_env_raw = secrets.get("app_env")
     backup_env = backup_env_content(secrets)
+    logs_env = logs_env_content(secrets)
     return Local(
         desired_rev=compute_rev(infra_dir, stackbase_src=stackbase_src),
         has_origin_cert=bool(secrets.get("origin_cert")) and bool(secrets.get("origin_key")),
@@ -270,6 +278,7 @@ def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str 
         has_cloudflare_token=bool(secrets.get("cloudflare_token")),
         app_env_sha=app_env_digest(validate_app_env(app_env_raw)) if app_env_raw else None,
         backup_env_sha=backup_env_digest(backup_env) if backup_env else None,
+        logs_env_sha=logs_env_digest(logs_env) if logs_env else None,
     )
 
 
@@ -1063,6 +1072,13 @@ def plan(cfg: StackConfig, state: StackState, observed: Observed, *, env: Enviro
     steps.extend(r2_steps(observed.r2))
 
     for name in env.nodes:
+        # BEFORE the rebuild, unlike the other two env files: the rebuild is
+        # what starts Vector, Vector cannot start without ${LOGS_ENDPOINT},
+        # and a unit that fails to start fails the whole `switch`. The step
+        # creates /var/lib/stackbase itself, so it needs nothing the rebuild
+        # provides. No [logs] (or an opt-out) plans nothing and removes nothing.
+        if _needs_logs_env(state, observed, env, name):
+            steps.append(Step(Action.ENSURE_LOGS_ENV, name))
         if _needs_deploy(state, observed, name, cert_pending):
             steps.append(Step(Action.PUSH_CONFIG, name))
             steps.append(Step(Action.REBUILD, name))
@@ -1199,6 +1215,19 @@ def _needs_backup_env(state: StackState, observed: Observed, name: str) -> bool:
         return False
     node_state = state.nodes.get(name) or NodeState()
     return node_state.backup_env_sha != desired
+
+
+def _needs_logs_env(state: StackState, observed: Observed, env: Environment, name: str) -> bool:
+    """True when logs are on for `env` and the rendered logs.env differs from
+    what this node last had pushed. Credentials with logs off plan nothing,
+    so a project without [logs] plans exactly what it always did."""
+    from stackbase.logs import logs_enabled
+
+    desired = observed.local.logs_env_sha
+    if desired is None or not logs_enabled(env.logs):
+        return False
+    node_state = state.nodes.get(name) or NodeState()
+    return node_state.logs_env_sha != desired
 
 
 def _dns_converged(state: StackState, observed: Observed) -> bool:

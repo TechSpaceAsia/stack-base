@@ -916,6 +916,44 @@ class SectionTypesTests(unittest.TestCase):
         self.assertEqual(env.alerts, AlertsConfig(to=["a@example.com", "b@example.com"]))
         self.assertEqual(env.files, FilesConfig(bucket="acme-files", lock_days=30))
 
+    def test_logs_on_without_bucket_is_an_error(self) -> None:
+        """A [logs] table that is not opted out must name a bucket -- after
+        the environment merge, so a shared table may leave it to each env."""
+        for extra in ("[logs]\n", "[logs]\nenabled = true\n", "[logs]\nretention_days = 90\n"):
+            with self.subTest(extra=extra):
+                with self.assertRaises(StackError) as caught:
+                    self._load(extra)
+                self.assertIn("[logs] bucket", str(caught.exception))
+                self.assertIn("enabled = false", caught.exception.hint)
+
+        with TempInfraDir() as infra_dir:
+            toml = _TWO_ENVS.replace(
+                '[environments.production]\ndomain = "acme.example.com"\n',
+                '[environments.production]\ndomain = "acme.example.com"\nlogs.bucket = "acme-logs"\n',
+            ) + "\n[logs]\nretention_days = 90\n"
+            _envs_project(infra_dir, toml)
+            with self.assertRaises(StackError) as caught:
+                load_config(infra_dir)
+            # Production has its bucket; staging is the one named.
+            self.assertIn("staging", caught.exception.message)
+            self.assertNotIn("production", caught.exception.message)
+
+    def test_logs_without_a_table_or_opted_out_need_no_bucket(self) -> None:
+        self.assertEqual(self._load("").env(None).logs, LogsConfig())
+        self.assertEqual(self._load("[logs]\nenabled = false\n").env(None).logs, LogsConfig(enabled=False))
+        with TempInfraDir() as infra_dir:
+            toml = (_TWO_ENVS + "\n[logs]\nretention_days = 90\n").replace(
+                '[environments.staging]\ndomain = "staging.acme.example.com"\n',
+                '[environments.staging]\ndomain = "staging.acme.example.com"\nlogs.bucket = "acme-logs-staging"\n',
+            ).replace(
+                '[environments.production]\ndomain = "acme.example.com"\n',
+                '[environments.production]\ndomain = "acme.example.com"\nlogs.bucket = "acme-logs"\n',
+            )
+            _envs_project(infra_dir, toml)
+            config = load_config(infra_dir)
+            self.assertEqual(config.env("staging").logs.bucket, "acme-logs-staging")
+            self.assertEqual(config.env("production").logs.bucket, "acme-logs")
+
     def test_wrong_types_are_refused(self) -> None:
         for extra, named in (
             ('[backups]\nenabled = "no"\n', "enabled"),

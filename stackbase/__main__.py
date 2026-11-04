@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable
 
 from stackbase.backups import check_backup_credentials, run_backup_now
+from stackbase.logs import check_logs_credentials
 from stackbase.ci import ci_setup
 from stackbase.cloudflare import CloudflareClient
 from stackbase.r2 import r2_account_for
@@ -355,6 +356,9 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env_
     # under `--plan` too: it is a statement about the configuration, not
     # about what this particular run is going to push.
     check_backup_credentials(env.backups.bucket, local.backup_env_sha, emit=_emit_masked(secrets))
+    # Logs on with no credentials would fail the rebuild that starts Vector,
+    # so it is refused here, before anything is touched.
+    check_logs_credentials(env, local.logs_env_sha)
     # None (and no R2 request at all) unless [logs]/[files] names a bucket.
     r2 = r2_account_for(env, secrets)
     observed = observe(cfg, state, hostinger, cloudflare, local=local, env=env, r2=r2)

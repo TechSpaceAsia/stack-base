@@ -5,8 +5,8 @@
 # With [environments.<env>] tables (staging, production, ...), it builds one
 # machine per [environments.<env>.nodes.*] entry instead, named
 # "<env>-<node>" (nixosConfigurations."staging-a", infra/nodes/staging-a/),
-# each with its environment's domain, its [backups] overrides merged over
-# the shared table, and that environment's own deploy key
+# each with its environment's domain, its [backups] and [logs] overrides
+# merged over the shared tables, and that environment's own deploy key
 # (keys/deploy.<env>.pub). A file with no [environments] is one implicit
 # environment: attributes, paths and options exactly as they always were.
 #
@@ -121,6 +121,16 @@
         // (if backupsConfig ? extra_paths then { extraPaths = backupsConfig.extra_paths; } else { })
         // (if backupsConfig ? on_calendar then { onCalendar = backupsConfig.on_calendar; } else { });
 
+      # The optional [logs] table -> nixos/logs.nix's stackbase.logs.*
+      # options, merged the same way: naming a bucket turns Vector on, and
+      # `enabled = false` turns it off even with one. retention_days is the
+      # bucket's lifecycle rule, which `./infra/up` sets -- not a node option.
+      logsOptions = env:
+        let logsConfig = (stack.logs or { }) // (environments.${env}.logs or { });
+        in
+        (if logsConfig ? bucket then { bucket = logsConfig.bucket; } else { })
+        // (if logsConfig ? enabled then { enable = logsConfig.enabled; } else { });
+
       nodeConfig = env: node:
         let
           name = nixosName env node;
@@ -138,6 +148,7 @@
               stackbase.deploy.keys = deployKeys env;
               stackbase.app = appOptions;
               stackbase.backups = backupsOptions env;
+              stackbase.logs = logsOptions env;
             }
           ]
           # Project-wide modules: every infra/conf.d/*.nix lands on EVERY

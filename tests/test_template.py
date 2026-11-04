@@ -376,6 +376,9 @@ _ENV_FACTS = (
     " domain = node.config.stackbase.domain;"
     " backupsBucket = node.config.stackbase.backups.bucket;"
     " backupsRetentionDays = node.config.stackbase.backups.retentionDays;"
+    " logsEnable = node.config.stackbase.logs.enable;"
+    " logsBucket = node.config.stackbase.logs.bucket;"
+    " vectorEnable = node.config.services.vector.enable;"
     " deployKeys = node.config.stackbase.deploy.keys;"
     " }"
 )
@@ -421,6 +424,35 @@ class TemplateEnvironmentsTests(unittest.TestCase):
             # A staging deploy key cannot deploy production.
             self.assertNotIn("deploy", production["deployKeys"])
 
+    def test_logs_bucket_env_override(self) -> None:
+        """[environments.<env>] logs.bucket wins over the shared [logs] table,
+        and naming a bucket is what turns Vector on."""
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_envs_template(directory)
+
+            staging = _nix_eval_attr(directory, 'nixosConfigurations."staging-a"', _ENV_FACTS)
+            production = _nix_eval_attr(directory, 'nixosConfigurations."production-a"', _ENV_FACTS)
+
+            self.assertEqual(staging["logsBucket"], "acme-logs-staging")
+            self.assertEqual(production["logsBucket"], "acme-logs")
+            for facts in (staging, production):
+                self.assertTrue(facts["logsEnable"])
+                self.assertTrue(facts["vectorEnable"])
+
+    def test_logs_enabled_false_turns_vector_off_even_with_a_bucket(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+            (directory / "stack.toml").write_text(
+                _SAMPLE_STACK_TOML + '\n[logs]\nenabled = false\nbucket = "acme-logs"\n', encoding="utf-8"
+            )
+
+            facts = _nix_eval_attr(directory, "nixosConfigurations.a", _ENV_FACTS)
+
+            self.assertFalse(facts["logsEnable"])
+            self.assertFalse(facts["vectorEnable"])
+
     def test_a_legacy_project_has_an_empty_environment(self) -> None:
         with TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -431,6 +463,10 @@ class TemplateEnvironmentsTests(unittest.TestCase):
             self.assertEqual(facts["hostName"], "a")
             self.assertEqual(facts["environment"], "")
             self.assertEqual(facts["domain"], "acme.example.com")
+            # No [logs] table: no Vector, exactly as before logs existed.
+            self.assertFalse(facts["logsEnable"])
+            self.assertEqual(facts["logsBucket"], "")
+            self.assertFalse(facts["vectorEnable"])
 
 
 @unittest.skipIf(_NIX is None, "nix is not installed")
@@ -600,6 +636,109 @@ class ProjectDeployKeyTests(unittest.TestCase):
                 all(line.startswith("restrict,command=") for line in facts["deployAuthorizedKeys"]),
                 facts["deployAuthorizedKeys"],
             )
+
+
+@unittest.skipIf(_NIX is None, "nix is not installed")
+class VectorSettingsTests(unittest.TestCase):
+    """nixos/logs.nix renders the approved Vector design verbatim (Brief D).
+    The VM test (tests/vm-logs.nix) proves the behaviour; this pins the
+    values, fast, so a drive-by edit to one of them is caught."""
+
+    def _eval(self, apply_fn: str, extra: str = 'stackbase.logs.bucket = "acme-logs";') -> Any:
+        result = _eval_mk_node(apply_fn, provider="null", extra_config=f"stackbase.admins.matt = \"k\"; {extra}")
+        if result.returncode != 0:
+            raise AssertionError(f"nix eval failed:\n{result.stderr}")
+        return json.loads(result.stdout)
+
+    def test_vector_settings_match_the_spec(self) -> None:
+        settings = self._eval("node.config.services.vector.settings")
+
+        self.assertEqual(settings["data_dir"], "/var/lib/vector")
+        self.assertEqual(settings["api"], {"enabled": True, "address": "127.0.0.1:8686"})
+        journal = settings["sources"]["journal"]
+        self.assertEqual(journal["type"], "journald")
+        self.assertIs(journal["current_boot_only"], False)
+        self.assertIs(journal["since_now"], False)
+        self.assertEqual(journal["exclude_units"], ["vector.service"])
+        self.assertIs(journal["emit_cursor"], True)
+
+        remap = settings["transforms"]["slim"]
+        self.assertEqual(remap["inputs"], ["journal"])
+        for field in ("timestamp", "host", "unit", "ident", "pid", "priority", "message", "boot_id", "cursor"):
+            self.assertIn(f'"{field}"', remap["source"])
+        self.assertIn("compact(", remap["source"])
+
+        r2 = settings["sinks"]["r2"]
+        self.assertEqual(r2["type"], "aws_s3")
+        self.assertEqual(r2["bucket"], "acme-logs")
+        self.assertEqual(r2["region"], "auto")
+        self.assertEqual(r2["endpoint"], "${LOGS_ENDPOINT}")
+        self.assertIs(r2["force_path_style"], True)
+        self.assertEqual(r2["key_prefix"], "journal/{{ host }}/%Y/%m/%d/%H/")
+        self.assertIs(r2["filename_append_uuid"], True)
+        self.assertEqual(r2["filename_extension"], "ndjson.gz")
+        self.assertEqual(r2["compression"], "gzip")
+        self.assertEqual(r2["encoding"], {"codec": "json"})
+        self.assertEqual(r2["framing"], {"method": "newline_delimited"})
+        self.assertEqual(r2["batch"], {"timeout_secs": 15, "max_bytes": 67108864})
+        self.assertEqual(r2["buffer"], {"type": "disk", "max_size": 1073741824, "when_full": "block"})
+        self.assertEqual(r2["acknowledgements"], {"enabled": True})
+        self.assertEqual(r2["request"], {"concurrency": "adaptive"})
+        self.assertEqual(r2["healthcheck"], {"enabled": True})
+        for forbidden in ("storage_class", "acl", "server_side_encryption", "ssekms_key_id", "grant_full_control"):
+            self.assertNotIn(forbidden, r2)
+
+        local = settings["sinks"]["local"]
+        self.assertEqual(local["type"], "file")
+        self.assertEqual(local["path"], "/var/log/vector/%Y-%m-%d/%H.ndjson")
+        self.assertEqual(local["buffer"], {"type": "memory", "max_events": 10000, "when_full": "drop_newest"})
+
+        self.assertEqual(settings["sources"]["vector_metrics"], {"type": "internal_metrics"})
+        self.assertEqual(
+            settings["sinks"]["metrics"],
+            {"type": "prometheus_exporter", "inputs": ["vector_metrics"], "address": "127.0.0.1:9598"},
+        )
+
+    def test_the_unit_reads_the_credentials_file_and_the_local_copy_ages_out(self) -> None:
+        facts = self._eval(
+            "{"
+            " env = node.config.systemd.services.vector.serviceConfig.EnvironmentFile;"
+            " rw = node.config.systemd.services.vector.serviceConfig.ReadWritePaths;"
+            " rules = node.config.systemd.tmpfiles.rules;"
+            " journaldAccess = node.config.services.vector.journaldAccess;"
+            " }"
+        )
+        self.assertEqual(facts["env"], "/var/lib/stackbase/logs.env")
+        self.assertIn("/var/log/vector", facts["rw"])
+        self.assertIn("d /var/log/vector 0750 vector vector 3d", facts["rules"])
+        self.assertTrue(facts["journaldAccess"])
+
+    def test_batch_seconds_and_buffer_bytes_are_options(self) -> None:
+        r2 = self._eval(
+            "node.config.services.vector.settings.sinks.r2",
+            'stackbase.logs.bucket = "b2"; stackbase.logs.batchSeconds = 5; stackbase.logs.bufferBytes = 268435488;',
+        )
+        self.assertEqual(r2["batch"]["timeout_secs"], 5)
+        self.assertEqual(r2["buffer"]["max_size"], 268435488)
+
+    def test_journald_keeps_seven_days_and_syncs_every_five_seconds(self) -> None:
+        conf = self._eval('node.config.environment.etc."systemd/journald.conf".text', "")
+        for line in (
+            "Storage=persistent",
+            "Compress=yes",
+            "SystemMaxUse=2G",
+            "SystemKeepFree=4G",
+            "SystemMaxFileSize=128M",
+            "MaxRetentionSec=7day",
+            "MaxFileSec=1day",
+            "SyncIntervalSec=5s",
+            "RateLimitBurst=10000",
+            "ForwardToSyslog=no",
+        ):
+            self.assertIn(line, conf.splitlines())
+        self.assertIn("RateLimitInterval=30s", conf.splitlines())
+        self.assertNotIn("SystemMaxUse=500M", conf)
+        self.assertNotIn("ForwardToSyslog=yes", conf)
 
 
 @unittest.skipIf(_NIX is None, "nix is not installed")

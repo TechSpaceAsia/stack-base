@@ -315,7 +315,9 @@ def load_config(infra_dir: Path) -> StackConfig:
             name="", domain=domain, plan=plan, price_item=price_item, nodes={},
             backups=backups, logs=logs, alerts=alerts, files=files,
         )
-        environments = _parse_environments(environments_raw, shared, toml_path)
+        environments = _parse_environments(environments_raw, shared, toml_path, shared_logs="logs" in data)
+    else:
+        _check_logs_bucket(logs, "logs" in data, toml_path, None)
 
     return StackConfig(
         project=project,
@@ -367,7 +369,9 @@ def _checked_domain(value: str, key: str) -> str:
     )
 
 
-def _parse_environments(raw: Any, shared: Environment, toml_path: Path) -> dict[str, Environment]:
+def _parse_environments(
+    raw: Any, shared: Environment, toml_path: Path, *, shared_logs: bool = False
+) -> dict[str, Environment]:
     if not isinstance(raw, dict) or not raw:
         raise StackError(
             f"{toml_path} has an empty or invalid [environments]",
@@ -435,6 +439,7 @@ def _parse_environments(raw: Any, shared: Environment, toml_path: Path) -> dict[
             files=_merge(shared.files, _parse_files(table, toml_path, table=f"{label}.files"),
                          table.get("files")),
         )
+        _check_logs_bucket(environments[name].logs, shared_logs or "logs" in table, toml_path, name)
     _reject_shared_servers(environments, toml_path)
     return environments
 
@@ -765,6 +770,25 @@ def _parse_logs(data: dict[str, Any], toml_path: Path, *, table: str = "logs") -
     )
 
 
+def _check_logs_bucket(logs: LogsConfig, present: bool, toml_path: Path, env: str | None) -> None:
+    """A [logs] table that is not opted out must name a bucket.
+
+    Checked after the environment merge: a shared [logs] may set only
+    retention_days and leave each environment to name its own bucket. A
+    project with no [logs] table at all is not refused here -- it keeps
+    working exactly as before logs existed.
+    """
+    if not present or logs.enabled is False or logs.bucket:
+        return
+    where = f" for environment '{env}'" if env else ""
+    table = f"[environments.{env}] logs.bucket" if env else 'bucket = "..." in [logs]'
+    raise StackError(
+        f"{toml_path} turns logs on but names no [logs] bucket{where}",
+        f"set {table} to the R2 bucket the servers' journal is shipped to, or set "
+        "enabled = false in [logs] to leave logs off",
+    )
+
+
 def _parse_alerts(data: dict[str, Any], toml_path: Path, *, table: str = "alerts") -> AlertsConfig:
     raw = _section(data, "alerts", AlertsConfig, toml_path, table)
     if raw is None:
@@ -844,6 +868,11 @@ class NodeState:
     # sha256 of the backup.env content (from secrets.age's r2_* keys) most
     # recently pushed to this node. None until the first push.
     backup_env_sha: str | None = None
+    # sha256 of the logs.env content (from the environment's logs_* keys)
+    # most recently pushed to this node. None until the first push, and then
+    # left out of the state file, so a project without [logs] keeps writing
+    # exactly the bytes it always wrote.
+    logs_env_sha: str | None = None
     # Set when a purchase answered HTTP 202 (payment still processing): the
     # subscription id the VM-to-be will carry. While set, the node is never
     # purchased again; it is adopted by this id once the VM shows up, and
@@ -908,10 +937,11 @@ def save_state(infra_dir: Path, env: Environment, state: StackState) -> None:
 def _save_state_file(state_path: Path, state: StackState) -> None:
     payload = asdict(state)
     # An unset marker is omitted so a state file that never saw a 202 purchase
-    # is byte-identical to what earlier versions wrote.
+    # (or never shipped logs) is byte-identical to what earlier versions wrote.
     for node in payload["nodes"].values():
-        if node.get("pending_subscription_id") is None:
-            node.pop("pending_subscription_id", None)
+        for key in ("pending_subscription_id", "logs_env_sha"):
+            if node.get(key) is None:
+                node.pop(key, None)
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
     # pid-suffixed, like ssh.py's known_hosts temp file: two concurrent runs

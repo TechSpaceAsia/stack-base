@@ -22,6 +22,8 @@
         # Every server gets the module; `enable` defaults to false until a
         # bucket is named in stack.toml's [backups] table.
         self.nixosModules.backups
+        # Same shape: off until stack.toml's [logs] table names a bucket.
+        self.nixosModules.logs
       ];
     in
     {
@@ -31,6 +33,7 @@
       nixosModules.hostinger = import ./nixos/providers/hostinger.nix;
       nixosModules.deploy = import ./nixos/deploy.nix;
       nixosModules.backups = import ./nixos/backups.nix;
+      nixosModules.logs = import ./nixos/logs.nix;
       nixosModules.default = { imports = baseModules; };
 
       # `provider` selects the module that reproduces one hosting provider's
@@ -77,6 +80,7 @@
       checks.${system} = {
         vm = import ./tests/vm.nix { inherit self pkgs lib; };
         vm-deploy = import ./tests/vm-deploy.nix { inherit self pkgs lib; };
+        vm-logs = import ./tests/vm-logs.nix { inherit self pkgs lib; };
       };
     };
 }
