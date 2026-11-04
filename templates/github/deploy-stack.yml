@@ -74,6 +74,23 @@ jobs:
       # node24 actions throughout: the runner ships only the node24 runtime.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
+      # Runs before anything else that needs a tool: a runner that lacks one
+      # (the ubuntu-latest fallback has no tailwindcss or rustup, for
+      # instance) fails here in seconds with the full list, instead of
+      # halfway through `./infra/up deploy` with a bare "command not found".
+      - name: Check the runner has stack-base's tools
+        run: |
+          missing=()
+          for t in python3 rsync tailwindcss x86_64-unknown-linux-musl-gcc rustup git ssh; do
+            if ! command -v "$t" >/dev/null 2>&1; then
+              missing+=("$t")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::this runner is missing: ${missing[*]} — use the production runner or add them to its extraPackages"
+            exit 1
+          fi
+
       - name: Verify the tag matches Cargo.toml's version
         run: |
           CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')

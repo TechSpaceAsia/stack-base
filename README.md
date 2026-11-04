@@ -417,6 +417,12 @@ for want of a matching runner, it simply never schedules it — so a tag that
 never deploys and never fails is a sign to check `runs-on`, not to wait
 longer.
 
+Right after checkout, the workflow checks that the runner has `python3`, `rsync`,
+`tailwindcss`, the musl cross compiler, `rustup`, `git` and `ssh` on its `PATH`,
+and fails listing whatever is missing. A runner without them (the `ubuntu-latest`
+fallback has no `tailwindcss` or `rustup`, for instance) stops there in seconds
+rather than partway through the deploy.
+
 **CI decrypts nothing.** The workflow writes the `STACK_DEPLOY_KEY` secret
 to a file under `$RUNNER_TEMP` and exports `$STACKBASE_SSH_IDENTITY` — that
 is step **1** of "Which key a deploy offers" above, and it wins over

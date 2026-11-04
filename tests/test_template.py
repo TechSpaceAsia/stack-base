@@ -1302,6 +1302,12 @@ def _node20_violations(text: str) -> list[str]:
     return violations
 
 
+def _ci_step_blocks(lines: list[str]) -> list[list[str]]:
+    """Split the workflow's job steps: each block starts at a `      - ` item line."""
+    starts = [i for i, line in enumerate(lines) if line.startswith("      - ")]
+    return [lines[start : end] for start, end in zip(starts, starts[1:] + [len(lines)])]
+
+
 class CiTemplateTests(unittest.TestCase):
     def test_ci_template_has_no_node20_dependencies(self) -> None:
         text = _CI_TEMPLATE.read_text(encoding="utf-8")
@@ -1313,6 +1319,28 @@ class CiTemplateTests(unittest.TestCase):
             _node20_violations("      - uses: actions/cache@v4\n"),
             ["- uses: actions/cache@v4"],
         )
+
+    def test_ci_template_preflight_lists_required_tools(self) -> None:
+        blocks = _ci_step_blocks(_CI_TEMPLATE.read_text(encoding="utf-8").splitlines())
+        preflight = [i for i, b in enumerate(blocks) if b[0].endswith("name: Check the runner has stack-base's tools")]
+        checkout = [i for i, b in enumerate(blocks) if "uses: actions/checkout@" in b[0]]
+        self.assertEqual(len(preflight), 1)
+        self.assertEqual(len(checkout), 1)
+        # Right after checkout: nothing else may run before the tools are known to exist.
+        self.assertEqual(preflight[0], checkout[0] + 1)
+
+        infra_up = [
+            i
+            for i, b in enumerate(blocks)
+            if any(not line.strip().startswith("#") and "./infra/up" in line for line in b)
+        ]
+        self.assertTrue(infra_up)
+        for i in infra_up:
+            self.assertGreater(i, preflight[0])
+
+        script = "\n".join(blocks[preflight[0]])
+        for tool in ("python3", "rsync", "tailwindcss", "x86_64-unknown-linux-musl-gcc", "rustup", "git", "ssh"):
+            self.assertIn(tool, script)
 
 
 if __name__ == "__main__":
