@@ -35,6 +35,7 @@ from stackbase.config import (
 )
 from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
+from stackbase.r2 import r2_account_for
 from stackbase.reconcile import (
     locked_stack_base_rev,
     PUSH_EXCLUDES,
@@ -408,10 +409,11 @@ class AppEnvPlanTests(unittest.TestCase):
         """`--plan` must show the step without revealing anything about the
         app_env content -- not even its length. `Step` structurally cannot
         carry content (only `action`/`node`), so this is guaranteed, not just
-        conventional."""
+        conventional. (`bucket` and `detail` are R2 steps' bucket name and
+        the rule change in words -- neither is a secret, neither is app_env.)"""
         from dataclasses import fields
 
-        self.assertEqual({f.name for f in fields(Step)}, {"action", "node"})
+        self.assertEqual({f.name for f in fields(Step)}, {"action", "node", "bucket", "detail"})
 
         step = Step(Action.ENSURE_APP_ENV, "a")
         self.assertEqual(step.description, "node a: updating the application's environment file")
@@ -3361,7 +3363,7 @@ def _env_plan_transcript(root: Path) -> tuple[str, list[str], list[Any]]:
     shutil.copy(_FIXTURES / "stack-envs.toml", infra_dir / "stack.toml")
     (infra_dir / "keys" / "matt.pub").write_text(_KEY_MATT + "\n", encoding="utf-8")
     (infra_dir / "flake.lock").write_text(json.dumps(_LOCK), encoding="utf-8")
-    secrets = {"hostinger_token": "h-token", "cloudflare_token": "c-token"}
+    secrets = {"hostinger_token": "h-token", "cloudflare_token": "c-token", "cloudflare_account_id": "acct123"}
     meta = {"current_page": 1, "per_page": 20, "total": 0}
     page = {"page": 1, "per_page": 20, "count": 1, "total_count": 1, "total_pages": 1}
     domain = "acme.example.com"
@@ -3392,10 +3394,20 @@ def _env_plan_transcript(root: Path) -> tuple[str, list[str], list[Any]]:
             "GET", f"/zones/zone1/dns_records?type=A&name={domain}&page=1", 200,
             {"success": True, "errors": [], "result": [], "result_info": page},
         )
+        # production names [logs] and [files] buckets: both are missing in R2.
+        for bucket in ("acme-logs", "acme-files"):
+            server.script(
+                "GET", f"/accounts/acct123/r2/buckets/{bucket}", 404,
+                {"success": False, "errors": [{"code": 10006, "message": "The specified bucket does not exist."}]},
+            )
         stdout = io.StringIO()
         with (
             mock.patch.dict(os.environ, {}, clear=False),
             mock.patch("stackbase.__main__.load_secrets", fake_load_secrets),
+            mock.patch(
+                "stackbase.__main__.r2_account_for",
+                lambda env, secrets: r2_account_for(env, secrets, base_url=server.url),
+            ),
             mock.patch("stackbase.__main__.HostingerClient", lambda token: HostingerClient(token, base_url=server.url)),
             mock.patch("stackbase.__main__.CloudflareClient", lambda token: CloudflareClient(token, base_url=server.url)),
             mock.patch("stackbase.reconcile._cloudflare_ips_path", return_value=root / "no-such-file.nix"),
@@ -3420,6 +3432,11 @@ class EnvironmentPlanTests(unittest.TestCase):
         self.assertIn("node b: adopting an existing virtual machine", output)
         self.assertIn("GET /zones?name=acme.example.com&page=1", requests)
         self.assertEqual([file.name for file in loads], ["secrets.production.age"])
+        # The environment's own buckets, planned with their exact rule change.
+        self.assertIn("R2 bucket acme-logs: creating the R2 bucket", output)
+        self.assertIn("delete journal/ after 90 days", output)
+        self.assertIn("R2 bucket acme-files: setting the bucket-lock rule", output)
+        self.assertIn("GET /accounts/acct123/r2/buckets/acme-logs", requests)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,4 @@
+{"success": true, "errors": [], "messages": [], "result": {"rules": [
+  {"id": "legal-hold", "enabled": true, "prefix": "contracts/", "condition": {"type": "Indefinite"}},
+  {"id": "stackbase-files", "enabled": true, "prefix": "", "condition": {"type": "Age", "maxAgeSeconds": 86400}}
+]}}

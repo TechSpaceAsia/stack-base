@@ -45,6 +45,7 @@ from stackbase.cloudflare import CloudflareClient
 from stackbase.config import Environment, Node, NodeState, StackConfig, StackState, save_state
 from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
+from stackbase.r2 import R2Account, R2Observation, observe_r2, r2_steps
 from stackbase.secrets import SecretsFile, redact, secrets_file
 from stackbase.ssh import Ssh
 
@@ -129,6 +130,9 @@ class Action(Enum):
     ENSURE_APP_ENV = "ensure_app_env"
     ENSURE_BACKUP_ENV = "ensure_backup_env"
     UPSERT_DNS = "upsert_dns"
+    ENSURE_R2_BUCKET = "ensure_r2_bucket"
+    ENSURE_R2_LIFECYCLE = "ensure_r2_lifecycle"
+    ENSURE_R2_LOCK = "ensure_r2_lock"
 
 
 # What each step is doing, in the words of someone who does not run
@@ -149,6 +153,9 @@ _DOING: dict[Action, str] = {
     Action.ENSURE_APP_ENV: "updating the application's environment file",
     Action.ENSURE_BACKUP_ENV: "updating the backup credentials on the server",
     Action.UPSERT_DNS: "pointing the domain at the server in Cloudflare",
+    Action.ENSURE_R2_BUCKET: "creating the R2 bucket",
+    Action.ENSURE_R2_LIFECYCLE: "setting the retention rule",
+    Action.ENSURE_R2_LOCK: "setting the bucket-lock rule",
 }
 
 # Steps worth announcing before they start, because the operator would
@@ -164,10 +171,17 @@ class Step:
 
     action: Action
     node: str | None = None
+    # R2 steps are scoped to a bucket, not a node; `detail` is the exact rule
+    # change `--plan` shows (see stackbase/r2.py).
+    bucket: str | None = None
+    detail: str | None = None
 
     @property
     def description(self) -> str:
         doing = _DOING[self.action]
+        if self.bucket:
+            text = f"R2 bucket {self.bucket}: {doing}"
+            return f"{text} ({self.detail})" if self.detail else text
         return f"node {self.node}: {doing}" if self.node else doing
 
     @property
@@ -647,6 +661,9 @@ class Observed:
     # ranges and the snapshot in nixos/cloudflare-ips.nix. Never fatal --
     # see `_cloudflare_ip_warnings`.
     cloudflare_ip_warnings: list[str] = field(default_factory=list)
+    # What R2 holds for each bucket the environment manages (`[logs]`,
+    # `[files]`); empty when it names none -- see stackbase/r2.py.
+    r2: tuple[R2Observation, ...] = ()
 
 
 def firewall_name(cfg: StackConfig, env: Environment | None = None) -> str:
@@ -787,6 +804,7 @@ def observe(
     *,
     local: Local,
     env: Environment | None = None,
+    r2: R2Account | None = None,
 ) -> Observed:
     """Read the current state of the world. GET requests only.
 
@@ -843,6 +861,7 @@ def observe(
         record_id=record_id,
         record_matches=record_matches,
         cloudflare_ip_warnings=cloudflare_ip_warnings,
+        r2=observe_r2(r2, env) if r2 is not None else (),
     )
 
 
@@ -1039,6 +1058,10 @@ def plan(cfg: StackConfig, state: StackState, observed: Observed, *, env: Enviro
     if cert_pending:
         steps.append(Step(Action.ENSURE_ORIGIN_CERT))
 
+    # Buckets and their rules exist before any node is rebuilt: the logs
+    # shipper starts on the first rebuild and needs somewhere to write.
+    steps.extend(r2_steps(observed.r2))
+
     for name in env.nodes:
         if _needs_deploy(state, observed, name, cert_pending):
             steps.append(Step(Action.PUSH_CONFIG, name))
@@ -1212,6 +1235,8 @@ class Context:
     cloudflare: CloudflareClient | None
     observed: Observed
     stackbase_src: str | None = None
+    # None unless the environment names an R2 bucket (see stackbase/r2.py).
+    r2: R2Account | None = None
     runner: Any = subprocess.run
     popen: Any = subprocess.Popen
     connector: Any = socket.create_connection

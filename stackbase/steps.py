@@ -47,6 +47,7 @@ from stackbase.reconcile import (
     primary_node,
     validate_app_env,
 )
+from stackbase.r2 import R2Account, ensure_lifecycle_rule, ensure_lock_rule, r2_targets, summarize_rule
 from stackbase.secrets import save_secrets
 from stackbase.ssh import HOST_KEY_CHANGED_MARKER, Ssh, host_key_mismatch_hint
 
@@ -885,6 +886,60 @@ def _ensure_backup_env(ctx: Context, step: Step) -> str:
     return f"node {node}: backup credentials updated"
 
 
+# --------------------------------------------------------------------------
+# Cloudflare R2: buckets, the logs retention rule, the files lock
+# --------------------------------------------------------------------------
+
+
+def _r2(ctx: Context) -> R2Account:
+    if ctx.r2 is None:
+        raise StackError(
+            "an R2 step ran without an R2 client",
+            "this is a bug in stack-base -- please report it",
+        )
+    return ctx.r2
+
+
+def _bucket(step: Step) -> str:
+    if not step.bucket:
+        raise StackError(
+            f"step '{step.action.value}' has no bucket",
+            "this is a bug in stack-base -- please report it",
+        )
+    return step.bucket
+
+
+def _r2_rule(ctx: Context, step: Step, kind: str) -> dict:
+    bucket = _bucket(step)
+    for target in r2_targets(ctx.environment):
+        if target.kind == kind and target.bucket == bucket:
+            return target.rule
+    raise StackError(
+        f"stack.toml no longer names bucket '{bucket}' for this",
+        "run `up` again to re-plan",
+    )
+
+
+def _ensure_r2_bucket(ctx: Context, step: Step) -> str:
+    bucket = _bucket(step)
+    _r2(ctx).create_bucket(bucket)
+    return f"R2 bucket {bucket}: created"
+
+
+def _ensure_r2_lifecycle(ctx: Context, step: Step) -> str:
+    bucket = _bucket(step)
+    rule = _r2_rule(ctx, step, "logs")
+    ensure_lifecycle_rule(_r2(ctx), bucket, rule)
+    return f"R2 bucket {bucket}: {summarize_rule('logs', rule)}"
+
+
+def _ensure_r2_lock(ctx: Context, step: Step) -> str:
+    bucket = _bucket(step)
+    rule = _r2_rule(ctx, step, "files")
+    ensure_lock_rule(_r2(ctx), bucket, rule)
+    return f"R2 bucket {bucket}: {summarize_rule('files', rule)}"
+
+
 def _tail_hint(tail: list[str], advice: str) -> str:
     text = "\n".join(tail).strip()
     return f"{text}\n{advice}" if text else advice
@@ -937,5 +992,8 @@ _EXECUTORS: dict[Action, Callable[[Context, Step], str]] = {
     Action.REBUILD: _rebuild,
     Action.ENSURE_APP_ENV: _ensure_app_env,
     Action.ENSURE_BACKUP_ENV: _ensure_backup_env,
+    Action.ENSURE_R2_BUCKET: _ensure_r2_bucket,
+    Action.ENSURE_R2_LIFECYCLE: _ensure_r2_lifecycle,
+    Action.ENSURE_R2_LOCK: _ensure_r2_lock,
     Action.UPSERT_DNS: _upsert_dns,
 }

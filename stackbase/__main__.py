@@ -31,6 +31,7 @@ from typing import Callable
 from stackbase.backups import check_backup_credentials, run_backup_now
 from stackbase.ci import ci_setup
 from stackbase.cloudflare import CloudflareClient
+from stackbase.r2 import r2_account_for
 from stackbase.config import Environment, environment_names, load_config, load_state
 from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
@@ -354,7 +355,9 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env_
     # under `--plan` too: it is a statement about the configuration, not
     # about what this particular run is going to push.
     check_backup_credentials(env.backups.bucket, local.backup_env_sha, emit=_emit_masked(secrets))
-    observed = observe(cfg, state, hostinger, cloudflare, local=local, env=env)
+    # None (and no R2 request at all) unless [logs]/[files] names a bucket.
+    r2 = r2_account_for(env, secrets)
+    observed = observe(cfg, state, hostinger, cloudflare, local=local, env=env, r2=r2)
     for warning in observed.cloudflare_ip_warnings:
         print(redact(f"! {warning}", redaction_values(secrets)))
     steps = plan(cfg, state, observed, env=env)
@@ -376,6 +379,7 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env_
         cloudflare=cloudflare,
         observed=observed,
         stackbase_src=stackbase_src,
+        r2=r2,
         env=env,
     )
     apply(steps, ctx, allow_purchase=args.allow_purchase)

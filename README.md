@@ -37,7 +37,9 @@ You also need:
   Leave it out and stack-base still stands up the server — it just skips DNS
   and the TLS origin certificate, so the server is only reachable by its bare
   IP over SSH. Add the token later and run `./infra/up` again to fill both
-  in.
+  in. If your `stack.toml` names a `[logs]` or `[files]` bucket, the same
+  token also needs **Account → Workers R2 Storage → Edit** (see
+  [R2 buckets](#r2-buckets-logs-and-files) below).
 - **Your Cloudflare zone set to Full (strict) SSL mode** (only if you're using
   Cloudflare). stack-base installs a Cloudflare origin certificate on the
   server; Full (strict) is the setting that makes Cloudflare actually check
@@ -129,6 +131,7 @@ Then commit what it wrote back: `infra/stack.state.json`,
 | rebuilding NixOS | Applies the configuration (this is the slow one — minutes) |
 | updating the application's environment file | Pushes `app_env` from `secrets.age` to the server and restarts the running release (see [The app's environment](#the-apps-environment-app_env) below) |
 | pointing the domain | Points your domain at the server in Cloudflare |
+| creating the R2 bucket / setting the retention rule / setting the bucket-lock rule | See [R2 buckets](#r2-buckets-logs-and-files) |
 
 ## Everyday things
 
@@ -853,6 +856,35 @@ step 2 — the same requirement the node has for writing the backup.
 **Test this before you need it.** A backup nobody has ever restored is a
 hypothesis, not a backup.
 
+## R2 buckets (logs and files)
+
+When an environment's `[logs]` or `[files]` table names a `bucket`, `./infra/up`
+(and `--plan`) looks after that bucket in Cloudflare R2:
+
+| Table | What `up` ensures |
+|---|---|
+| `[logs] bucket` | The bucket exists, with a lifecycle rule `stackbase-logs`: delete objects under `journal/` after `retention_days` (default 90). |
+| `[files] bucket` | The bucket exists, with a bucket-lock rule `stackbase-files`: every object (prefix `""`) is locked for `lock_days` (default 30), which forbids deleting **and overwriting** it until the lock expires. |
+
+Other rules on those buckets are left exactly as they are; only the rule with
+stack-base's own id is added or changed. `--plan` prints the exact rule change,
+for example `R2 bucket acme-logs: setting the retention rule (rule
+stackbase-logs: delete journal/ after 90 days)`. stack-base never deletes a
+bucket, an object or a rule. The `[backups]` bucket is not managed here: create
+it yourself. With `[logs] enabled = false` no logs bucket is managed. A project
+with neither bucket needs no account id and makes no R2 call.
+
+It needs two secrets:
+
+```bash
+ACCOUNT_ID=<your Cloudflare account id>
+printf '%s' "$ACCOUNT_ID" | ./infra/up secrets set cloudflare_account_id
+```
+
+and a `cloudflare_token` that carries **Account → Workers R2 Storage → Edit**
+(the DNS token may simply carry that scope too). If a bucket is named and
+`cloudflare_account_id` is missing, `up` stops and says so.
+
 ## Things to watch
 
 Three ways to hurt yourself that no amount of code can prevent.
@@ -902,6 +934,7 @@ Every failure is one line: what went wrong, then what to check.
 | `the API token is wrong or expired` | Re-issue the token and re-create `secrets.age` |
 | `the API token doesn't have permission` | Cloudflare: add **Zone → SSL and Certificates → Edit**. Hostinger: use a full-access token |
 | `no Cloudflare zone found for domain …` | The token can't see that zone — check it's scoped to the right account |
+| `… the 'cloudflare_account_id' secret is not set` | `[logs]` or `[files]` names an R2 bucket; set the secret as in [R2 buckets](#r2-buckets-logs-and-files) |
 | `multiple A records found for …` | Two records fight over the name. Delete the wrong one in the Cloudflare dashboard; stack-base won't guess |
 | `no Hostinger data center named …` | The message lists the valid names — put one in `stack.toml` |
 | `node(s) a have no vps_id…` | Either set `vps_id`, or re-run with `--allow-purchase` |
