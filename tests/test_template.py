@@ -17,6 +17,7 @@ import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest import mock
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -337,6 +338,99 @@ class TemplateFlakeEvaluatesTests(unittest.TestCase):
             )
 
             self.assertEqual(_nix_eval(directory)["grubDevice"], "/dev/sdz")
+
+
+
+def _instantiate_envs_template(directory: Path) -> None:
+    """The template laid out for tests/fixtures/stack-envs.toml: one
+    hardware file per `<env>-<node>`, as CAPTURE_HARDWARE writes them."""
+    _instantiate_template(directory)
+    shutil.rmtree(directory / "nodes")
+    shutil.copy(_REPO_ROOT / "tests" / "fixtures" / "stack-envs.toml", directory / "stack.toml")
+    for name in ("staging-a", "production-a", "production-b"):
+        (directory / "nodes" / name).mkdir(parents=True)
+        (directory / "nodes" / name / "hardware-configuration.nix").write_text(_HOSTINGER_HARDWARE, encoding="utf-8")
+
+
+def _nix_eval_attr(directory: Path, attr: str, apply_fn: str) -> Any:
+    result = subprocess.run(
+        [
+            _NIX or "nix", "eval", "--json",
+            f"path:{directory}#{attr}",
+            "--apply", apply_fn,
+            "--override-input", "stack-base", f"path:{_REPO_ROOT}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"nix eval failed:\n{result.stderr}")
+    return json.loads(result.stdout)
+
+
+_ENV_FACTS = (
+    "node: {"
+    " hostName = node.config.networking.hostName;"
+    " environment = node.config.stackbase.environment;"
+    " domain = node.config.stackbase.domain;"
+    " backupsBucket = node.config.stackbase.backups.bucket;"
+    " backupsRetentionDays = node.config.stackbase.backups.retentionDays;"
+    " deployKeys = node.config.stackbase.deploy.keys;"
+    " }"
+)
+
+
+@unittest.skipIf(_NIX is None, "nix is not installed")
+class TemplateEnvironmentsTests(unittest.TestCase):
+    """One nixosConfigurations."<env>-<node>" per environment node, each
+    with its environment's own domain, overrides and deploy key."""
+
+    def test_one_configuration_per_environment_node(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_envs_template(directory)
+
+            names = _nix_eval_attr(directory, "nixosConfigurations", "builtins.attrNames")
+
+            self.assertEqual(sorted(names), ["production-a", "production-b", "staging-a"])
+
+    def test_hostname_environment_and_overrides(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_envs_template(directory)
+            (directory / "keys" / "deploy.staging.pub").write_text(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAACIExampleStagingDeploy deploy@acme\n", encoding="utf-8"
+            )
+
+            staging = _nix_eval_attr(directory, 'nixosConfigurations."staging-a"', _ENV_FACTS)
+            production = _nix_eval_attr(directory, 'nixosConfigurations."production-a"', _ENV_FACTS)
+
+            self.assertEqual(staging["hostName"], "staging-a")
+            self.assertEqual(staging["environment"], "staging")
+            self.assertEqual(staging["domain"], "staging.acme.example.com")
+            self.assertEqual(staging["backupsBucket"], "acme-backups-staging")
+            self.assertEqual(staging["backupsRetentionDays"], 30)
+            self.assertIn("deploy", staging["deployKeys"])
+
+            self.assertEqual(production["hostName"], "production-a")
+            self.assertEqual(production["environment"], "production")
+            self.assertEqual(production["domain"], "acme.example.com")
+            self.assertEqual(production["backupsBucket"], "acme-backups")
+            self.assertEqual(production["backupsRetentionDays"], 365)
+            # A staging deploy key cannot deploy production.
+            self.assertNotIn("deploy", production["deployKeys"])
+
+    def test_a_legacy_project_has_an_empty_environment(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+
+            facts = _nix_eval_attr(directory, "nixosConfigurations.a", _ENV_FACTS)
+
+            self.assertEqual(facts["hostName"], "a")
+            self.assertEqual(facts["environment"], "")
+            self.assertEqual(facts["domain"], "acme.example.com")
 
 
 @unittest.skipIf(_NIX is None, "nix is not installed")
@@ -693,6 +787,26 @@ class TemplateUpScriptTests(unittest.TestCase):
                 (["--allow-purchase"], "up --allow-purchase"),
                 (["ssh", "a"], "ssh a"),
                 (["up", "--plan"], "up --plan"),
+            ]
+            for args, expected_tail in cases:
+                with self.subTest(args=args):
+                    result = self._run_up(infra_dir, *args, env_extra={"STACKBASE_SRC": str(source)})
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), f"--infra-dir {infra_dir} {expected_tail}")
+
+    def test_a_leading_env_flag_still_finds_or_inserts_the_subcommand(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = self._infra_dir(tmp)
+            source = self._fake_echo_source(tmp)
+
+            cases = [
+                (["--env", "staging"], "--env staging up"),
+                (["--env", "staging", "--plan"], "--env staging up --plan"),
+                (["--env=staging", "--plan"], "--env=staging up --plan"),
+                (["--env", "staging", "deploy", "v1.0.0"], "--env staging deploy v1.0.0"),
+                (["--env", "production", "ssh", "a"], "--env production ssh a"),
+                (["deploy", "v1.0.0", "--env", "staging"], "deploy v1.0.0 --env staging"),
+                (["--plan", "--env", "staging"], "up --plan --env staging"),
             ]
             for args, expected_tail in cases:
                 with self.subTest(args=args):
@@ -1233,6 +1347,10 @@ class TemplateFilesTests(unittest.TestCase):
         self.assertNotIn("backups", data)
         self.assertIn("bucket", text)
         self.assertIn("retention_days", text)
+        # Environments are opt-in too: documented, commented out.
+        self.assertNotIn("environments", data)
+        self.assertIn("# [environments.staging]", text)
+        self.assertIn("# [environments.production.nodes.a]", text)
 
     def test_the_example_stack_toml_has_no_real_vps_id_and_still_loads(self) -> None:
         """The example must never carry a real Hostinger VPS id (Finding 7)."""
@@ -1308,6 +1426,20 @@ def _ci_step_blocks(lines: list[str]) -> list[list[str]]:
     return [lines[start : end] for start, end in zip(starts, starts[1:] + [len(lines)])]
 
 
+def _ci_job_lines(text: str) -> dict[str, list[str]]:
+    """The workflow's jobs, each as its own list of lines."""
+    jobs: dict[str, list[str]] = {}
+    current = None
+    for line in text.split("\njobs:\n", 1)[1].splitlines():
+        match = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        if match:
+            current = match.group(1)
+            jobs[current] = []
+        elif current is not None:
+            jobs[current].append(line)
+    return jobs
+
+
 class CiTemplateTests(unittest.TestCase):
     def test_ci_template_has_no_node20_dependencies(self) -> None:
         text = _CI_TEMPLATE.read_text(encoding="utf-8")
@@ -1321,7 +1453,14 @@ class CiTemplateTests(unittest.TestCase):
         )
 
     def test_ci_template_preflight_lists_required_tools(self) -> None:
-        blocks = _ci_step_blocks(_CI_TEMPLATE.read_text(encoding="utf-8").splitlines())
+        jobs = _ci_job_lines(_CI_TEMPLATE.read_text(encoding="utf-8"))
+        self.assertEqual(list(jobs), ["staging", "production"])
+        for name, lines in jobs.items():
+            with self.subTest(job=name):
+                self._assert_preflight_first(lines)
+
+    def _assert_preflight_first(self, lines: list[str]) -> None:
+        blocks = _ci_step_blocks(lines)
         preflight = [i for i, b in enumerate(blocks) if b[0].endswith("name: Check the runner has stack-base's tools")]
         checkout = [i for i, b in enumerate(blocks) if "uses: actions/checkout@" in b[0]]
         self.assertEqual(len(preflight), 1)

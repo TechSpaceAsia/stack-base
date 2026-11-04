@@ -19,6 +19,13 @@ owner's GitHub plan has no org-level secrets/variables, so a repo secret is
 not a simplification here, it's the only option. A leaked CI key can only
 ever reach the same six door commands as any other `stackbase.deploy.keys`
 entry -- see the README.
+
+With environments, each one has its own deploy key and its own secret:
+`ci-setup --env staging` pushes `deploy.staging.age` into
+`STACK_DEPLOY_KEY_STAGING`, `--env production` pushes `deploy.production.age`
+into `STACK_DEPLOY_KEY_PRODUCTION`. The workflow template deploys staging on
+a tag push and production only from a manual run gated by the GitHub
+Environment `production`, whose creation ci-setup explains.
 """
 
 from __future__ import annotations
@@ -28,11 +35,32 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
+from stackbase.config import load_config
 from stackbase.errors import StackError
-from stackbase.secrets import DEPLOY_FILE, DEPLOY_KEY_NAME, load_secrets, register_private_key
-from stackbase.secrets_cli import DEPLOY_PUB_FILENAME, deploy_key_init
+from stackbase.secrets import (
+    DEPLOY_FILE,
+    DEPLOY_KEY_NAME,
+    deploy_file,
+    deploy_pub_name,
+    load_secrets,
+    register_private_key,
+)
+from stackbase.secrets_cli import deploy_key_init
 
 SECRET_NAME = "STACK_DEPLOY_KEY"
+
+# The GitHub Environment the template's production job runs in. Required
+# reviewers on it are what stops a production deploy from happening without
+# a human's say-so.
+PRODUCTION_ENVIRONMENT = "production"
+
+
+def ci_secret_name(env: str | None) -> str:
+    """`STACK_DEPLOY_KEY`, or `STACK_DEPLOY_KEY_<ENV>` (`-` -> `_`, as GitHub
+    secret names allow only letters, digits and underscores)."""
+    if not env:
+        return SECRET_NAME
+    return f"{SECRET_NAME}_{env.upper().replace('-', '_')}"
 
 _HTTPS_RE = re.compile(r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$")
 _SCP_RE = re.compile(r"^git@github\.com:(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?$")
@@ -101,8 +129,12 @@ def ci_setup(
     runner: Any = subprocess.run,
     emit: Callable[[str], None] = print,
     register_secret: Callable[[str], None] = lambda _value: None,
+    env: str | None = None,
 ) -> None:
     """Push the project's deploy key into the repo-level GitHub Actions secret.
+
+    `env` selects the environment: its own deploy key, pushed into its own
+    secret (`ci_secret_name`).
 
     There is ONE project deploy key (`infra/deploy.age`, public half
     `infra/keys/deploy.pub`), used by CI and by humans alike -- ci-setup no
@@ -120,7 +152,10 @@ def ci_setup(
     a key is generated. The private key is registered for redaction before
     the one call that could conceivably echo it back.
     """
-    deploy_path = infra_dir / DEPLOY_FILE.name
+    file = deploy_file(load_config(infra_dir).env(env)) if env else DEPLOY_FILE
+    deploy_path = infra_dir / file.name
+    secret_name = ci_secret_name(env)
+    env_flag = f" --env {env}" if env else ""
 
     repo_dir = infra_dir.parent
     owner, repo = parse_github_repo(_origin_url(repo_dir, runner=runner))
@@ -129,13 +164,18 @@ def ci_setup(
     _require_gh(runner=runner)
 
     if rotate or not deploy_path.exists():
-        deploy_key_init(infra_dir, rotate=rotate, runner=runner, emit=emit, register_secret=register_secret)
+        if env:
+            deploy_key_init(
+                infra_dir, rotate=rotate, runner=runner, emit=emit, register_secret=register_secret, env=env
+            )
+        else:
+            deploy_key_init(infra_dir, rotate=rotate, runner=runner, emit=emit, register_secret=register_secret)
 
-    private_key = load_secrets(infra_dir, file=DEPLOY_FILE).get(DEPLOY_KEY_NAME)
+    private_key = load_secrets(infra_dir, file=file).get(DEPLOY_KEY_NAME)
     if not private_key:
         raise StackError(
             f"{deploy_path} has no '{DEPLOY_KEY_NAME}'",
-            "re-create it with `./infra/up deploy-key init --rotate`",
+            f"re-create it with `./infra/up{env_flag} deploy-key init --rotate`",
         )
     register_private_key(private_key, register_secret)
 
@@ -143,7 +183,7 @@ def ci_setup(
     # (`input=`) -- never as an argv element, never as an environment
     # variable, never written anywhere on this machine's disk.
     secret_set = runner(
-        ["gh", "secret", "set", SECRET_NAME, "--repo", repo_slug],
+        ["gh", "secret", "set", secret_name, "--repo", repo_slug],
         input=private_key.encode("utf-8"),
         capture_output=True,
         check=False,
@@ -153,7 +193,7 @@ def ci_setup(
         if isinstance(stderr, bytes):
             stderr = stderr.decode("utf-8", errors="replace")
         raise StackError(
-            f"gh secret set {SECRET_NAME} failed",
+            f"gh secret set {secret_name} failed",
             (stderr or "").strip() or "check `gh auth status` and that you can push secrets to this repository",
         )
 
@@ -164,19 +204,35 @@ def ci_setup(
         check=False,
     )
     names = [line.strip() for line in (verify.stdout or "").splitlines() if line.strip()]
-    if verify.returncode != 0 or SECRET_NAME not in names:
+    if verify.returncode != 0 or secret_name not in names:
         raise StackError(
-            f"could not confirm {SECRET_NAME} exists on {repo_slug} after setting it",
+            f"could not confirm {secret_name} exists on {repo_slug} after setting it",
             f"run `gh secret list --repo {repo_slug}` yourself to check",
         )
 
-    pub_path = infra_dir / "keys" / DEPLOY_PUB_FILENAME
-    emit(f"{SECRET_NAME} on {repo_slug} now holds this project's deploy key.")
+    pub_path = infra_dir / "keys" / deploy_pub_name(env)
+    whose = f"the {env} environment's" if env else "this project's"
+    emit(f"{secret_name} on {repo_slug} now holds {whose} deploy key.")
     emit("Next steps:")
     emit(f"  1. git add {deploy_path} {pub_path} && git commit -m 'ci: the project deploy key'")
-    emit("  2. ./infra/up                 # installs the key on every server")
+    if env:
+        emit(f"  2. ./infra/up --env {env}     # installs the key on every {env} server")
+    else:
+        emit("  2. ./infra/up                 # installs the key on every server")
     emit(f"  3. mkdir -p .github/workflows && cp {_WORKFLOW_TEMPLATE} .github/workflows/deploy-stack.yml")
     emit("     git add .github/workflows/deploy-stack.yml && git commit -m 'ci: add the deploy workflow'")
+    if not env:
+        # The template deploys `--env staging` on a tag and `--env production`
+        # by hand; a project without [environments] runs the staging job only.
+        emit("     (the workflow is for staging + production: without [environments], drop `--env staging`")
+        emit("     from its staging job and delete its production job)")
+    if env == PRODUCTION_ENVIRONMENT:
+        emit(f"  4. create the GitHub Environment '{PRODUCTION_ENVIRONMENT}' the production job runs in, and")
+        emit("     give it required reviewers so nobody promotes a release alone:")
+        emit(f"     gh api -X PUT repos/{repo_slug}/environments/{PRODUCTION_ENVIRONMENT}")
+        emit(f"     then add the required reviewers in https://github.com/{repo_slug}/settings/environments")
+        emit("     A production deploy is then: Actions -> Deploy (stack-base) -> Run workflow, with the")
+        emit("     tag staging already runs.")
     if rotate:
         # The GitHub secret was already replaced above, immediately -- not
         # step 2. Until step 1 is committed AND step 2 has installed the new
@@ -186,5 +242,5 @@ def ci_setup(
         emit("  CI deploys will FAIL (wrong key) until steps 1 and 2 above have both completed --")
         emit("  the GitHub secret was already replaced, just now.")
     emit("To turn CI deploys back off:")
-    emit(f"  gh secret delete {SECRET_NAME} --repo {repo_slug}")
-    emit("  (leave deploy.age and keys/deploy.pub in place -- they are also your own deploy key)")
+    emit(f"  gh secret delete {secret_name} --repo {repo_slug}")
+    emit(f"  (leave {file.name} and keys/{deploy_pub_name(env)} in place -- they are also your own deploy key)")

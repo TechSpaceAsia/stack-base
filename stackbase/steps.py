@@ -43,6 +43,7 @@ from stackbase.reconcile import (
     firewall_name,
     first_address,
     hostname_for,
+    nixos_name,
     primary_node,
     validate_app_env,
 )
@@ -87,10 +88,10 @@ def _purchase(ctx: Context, step: Step) -> str:
     node = _node(step)
     inline_key, extra_ids = _admin_keys(ctx)
     result = ctx.hostinger.purchase_vm(
-        price_item=ctx.cfg.price_item or "",
+        price_item=ctx.environment.price_item or "",
         template_id=ctx.hostinger.template_id("NixOS"),
         data_center_id=ctx.hostinger.data_center_id(ctx.cfg.datacenter),
-        hostname=hostname_for(ctx.cfg, node),
+        hostname=hostname_for(ctx.cfg, ctx.environment, node),
         public_key=inline_key,
         public_key_ids=extra_ids,
     )
@@ -100,7 +101,7 @@ def _purchase(ctx: Context, step: Step) -> str:
         # `apply` only saves after a step returns, and this one raises -- so
         # the next run waits for this subscription instead of buying again.
         ctx.node_state(node).pending_subscription_id = result.subscription_id
-        save_state(ctx.infra_dir, ctx.state)
+        save_state(ctx.infra_dir, ctx.environment, ctx.state)
         raise _still_processing(node, result.subscription_id)
     ctx.node_state(node).vps_id = result.vps_id
     return f"node {node}: bought and installed virtual machine {result.vps_id}"
@@ -136,7 +137,7 @@ def _adopt(ctx: Context, step: Step) -> str:
             f"node {node} has no adoptable virtual machine on record",
             "this is a bug in stack-base -- please report it",
         )
-    hostname = hostname_for(ctx.cfg, node)
+    hostname = hostname_for(ctx.cfg, ctx.environment, node)
     ctx.emit(
         f"! found an existing server {vps_id} named {hostname} -- adopting it instead of buying another"
     )
@@ -155,7 +156,7 @@ def _setup(ctx: Context, step: Step) -> str:
         vps_id,
         template_id=ctx.hostinger.template_id("NixOS"),
         data_center_id=ctx.hostinger.data_center_id(ctx.cfg.datacenter),
-        hostname=hostname_for(ctx.cfg, node),
+        hostname=hostname_for(ctx.cfg, ctx.environment, node),
         public_key=inline_key,
         public_key_ids=extra_ids,
     )
@@ -213,7 +214,7 @@ def _ensure_keys(ctx: Context, _step: Step) -> str:
 
 def _ensure_firewall(ctx: Context, step: Step) -> str:
     node = _node(step)
-    firewall_id = ctx.hostinger.ensure_firewall(firewall_name(ctx.cfg), desired_firewall_rules())
+    firewall_id = ctx.hostinger.ensure_firewall(firewall_name(ctx.cfg, ctx.environment), desired_firewall_rules())
     ctx.state.hostinger.firewall_id = firewall_id
     ctx.hostinger.activate_firewall(firewall_id, _vps_id(ctx, node))
     return f"node {node}: firewall up to date (SSH and HTTPS only)"
@@ -283,7 +284,10 @@ def _capture_hardware(ctx: Context, step: Step) -> str:
         if line.strip().endswith(".nix") and "/" not in line.strip()
     ]
 
-    destination = ctx.infra_dir / "nodes" / node
+    # `nixos_name`: `nodes/<env>-<node>/` in an environment, so staging's
+    # node a and production's node a never overwrite each other's disk facts.
+    directory = nixos_name(ctx.environment, node)
+    destination = ctx.infra_dir / "nodes" / directory
     destination.mkdir(parents=True, exist_ok=True)
 
     if _HARDWARE_FILE in names:
@@ -301,7 +305,7 @@ def _capture_hardware(ctx: Context, step: Step) -> str:
         (destination / _HARDWARE_FILE).write_text(output, encoding="utf-8")
 
     ctx.node_state(node).hardware_captured = True
-    return f"node {node}: disk and boot settings saved to infra/nodes/{node}/ (commit them)"
+    return f"node {node}: disk and boot settings saved to infra/nodes/{directory}/ (commit them)"
 
 
 # --------------------------------------------------------------------------
@@ -316,7 +320,8 @@ def _ensure_origin_cert(ctx: Context, _step: Step) -> str:
     the same stdout; both are split apart in memory. The key goes straight
     into `secrets.age` (encrypted) and, at push time, into an ssh stdin pipe.
     """
-    domain = ctx.cfg.domain
+    domain = ctx.environment.domain
+    secrets_name = ctx.secrets_file.name
     key_pem, csr_pem = _generate_key_and_csr(ctx, domain)
     cert_pem = ctx.cloudflare.create_origin_cert([domain], csr_pem)
 
@@ -325,7 +330,7 @@ def _ensure_origin_cert(ctx: Context, _step: Step) -> str:
     ctx.secrets["origin_cert"] = cert_pem
     ctx.secrets["origin_key"] = key_pem
     try:
-        save_secrets(ctx.infra_dir, ctx.secrets)
+        save_secrets(ctx.infra_dir, ctx.secrets, file=ctx.secrets_file)
     except StackError as exc:
         # Cloudflare has already issued the certificate by this point -- a
         # failure to save it locally does not un-issue it. Say so, so the
@@ -333,11 +338,11 @@ def _ensure_origin_cert(ctx: Context, _step: Step) -> str:
         raise StackError(
             exc.message,
             f"{exc.hint} -- a Cloudflare origin certificate for {domain} was just issued and is "
-            "now orphaned (it was never saved to secrets.age); running `up` again will issue a "
+            f"now orphaned (it was never saved to {secrets_name}); running `up` again will issue a "
             "fresh one, and the orphaned certificate can be revoked in the Cloudflare dashboard -> "
             "SSL/TLS -> Origin Server",
         ) from exc
-    return f"origin certificate for {domain} created and stored in infra/secrets.age"
+    return f"origin certificate for {domain} created and stored in infra/{secrets_name}"
 
 
 def _generate_key_and_csr(ctx: Context, domain: str) -> tuple[str, str]:
@@ -382,19 +387,20 @@ def _extract_pem(text: str, label: str) -> str | None:
 
 
 def _upsert_dns(ctx: Context, step: Step) -> str:
-    node = step.node or primary_node(ctx.cfg)
+    domain = ctx.environment.domain
+    node = step.node or primary_node(ctx.cfg, ctx.environment)
     ipv4 = ctx.node_state(node).ipv4
     if not ipv4:
         raise StackError(
-            f"node {node} has no IP address to point {ctx.cfg.domain} at",
+            f"node {node} has no IP address to point {domain} at",
             "run `up` again -- the address is recorded once the server is running",
         )
 
-    zone_id = ctx.observed.zone_id or ctx.cloudflare.zone_for(ctx.cfg.domain)[0]
-    record_id = ctx.cloudflare.upsert_a_record(zone_id, ctx.cfg.domain, ipv4, proxied=True)
+    zone_id = ctx.observed.zone_id or ctx.cloudflare.zone_for(domain)[0]
+    record_id = ctx.cloudflare.upsert_a_record(zone_id, domain, ipv4, proxied=True)
     ctx.state.cloudflare.zone_id = zone_id
     ctx.state.cloudflare.record_id = record_id
-    return f"{ctx.cfg.domain} now points at node {node} ({ipv4}), proxied by Cloudflare"
+    return f"{domain} now points at node {node} ({ipv4}), proxied by Cloudflare"
 
 
 # --------------------------------------------------------------------------
@@ -438,7 +444,7 @@ def _push_origin_cert(ctx: Context, ssh: Ssh) -> None:
     key = ctx.secrets.get("origin_key")
     if not cert or not key:
         raise StackError(
-            "the origin certificate is missing from infra/secrets.age",
+            f"the origin certificate is missing from infra/{ctx.secrets_file.name}",
             "run `up` again -- stack-base creates the certificate before pushing it",
         )
 
@@ -512,7 +518,7 @@ def _rebuild(ctx: Context, step: Step) -> str:
             raise _host_key_mismatch_error(ctx, node)
         raise StackError(
             f"node {node}: the new configuration failed to build or activate",
-            _tail_hint(tail, _test_failure_advice(node, tail)),
+            _tail_hint(tail, _test_failure_advice(nixos_name(ctx.environment, node), tail)),
         )
 
     probe = ctx.ssh(node).run("true", check=False)  # a NEW connection, on purpose
@@ -607,7 +613,10 @@ def _test_failure_advice(node: str, tail: list[str]) -> str:
 
 
 def _rebuild_command(ctx: Context, node: str, mode: str) -> str:
-    """`nixos-rebuild <mode> --flake /etc/nixos/stack#<node>`, safely quoted.
+    """`nixos-rebuild <mode> --flake /etc/nixos/stack#<nixos_name>`, safely quoted.
+
+    The flake attribute is `nixos_name(env, node)`: the bare node name for a
+    single-environment project, `<env>-<node>` in an environment.
 
     This string is handed to a root shell on the node, and `node` is a
     stack.toml table key. `load_config` already constrains it, but the flake
@@ -616,7 +625,7 @@ def _rebuild_command(ctx: Context, node: str, mode: str) -> str:
     there is no `str.format` here either: a brace in `node` would otherwise
     be a second interpolation nobody asked for.)
     """
-    target = shlex.quote(f"{REMOTE_CONFIG_DIR}#{node}")
+    target = shlex.quote(f"{REMOTE_CONFIG_DIR}#{nixos_name(ctx.environment, node)}")
     override = (
         f" --override-input stack-base {shlex.quote(f'path:{REMOTE_SRC_DIR}')}"
         if ctx.stackbase_src
@@ -729,7 +738,7 @@ def _ensure_app_env(ctx: Context, step: Step) -> str:
     raw = ctx.secrets.get("app_env")
     if not raw:
         raise StackError(
-            "infra/secrets.age has no 'app_env' to push",
+            f"infra/{ctx.secrets_file.name} has no 'app_env' to push",
             "this is a bug in stack-base -- please report it",
         )
     # Validated and normalised before any ssh call: a malformed app_env must
@@ -856,7 +865,7 @@ def _ensure_backup_env(ctx: Context, step: Step) -> str:
     content = backup_env_content(ctx.secrets)
     if not content:
         raise StackError(
-            "infra/secrets.age has no complete set of R2 credentials to push",
+            f"infra/{ctx.secrets_file.name} has no complete set of R2 credentials to push",
             "this is a bug in stack-base -- please report it",
         )
 
@@ -901,7 +910,8 @@ def _node(step: Step) -> str:
 
 
 def _vps_id(ctx: Context, node: str) -> int:
-    configured = ctx.cfg.nodes[node].vps_id if node in ctx.cfg.nodes else None
+    nodes = ctx.environment.nodes
+    configured = nodes[node].vps_id if node in nodes else None
     vps_id = configured or ctx.node_state(node).vps_id
     if vps_id is None:
         raise StackError(

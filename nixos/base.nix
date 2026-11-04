@@ -24,6 +24,18 @@ in
       '';
     };
 
+    environment = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      example = "staging";
+      description = ''
+        The stack.toml environment this node belongs to ("staging",
+        "production", ...), or "" for a project without [environments].
+        Set by the project's flake; alert subjects use it to say which
+        environment a failure is in.
+      '';
+    };
+
     admins = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = { };

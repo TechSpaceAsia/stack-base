@@ -19,7 +19,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-from stackbase.ci import SECRET_NAME, ci_setup, parse_github_repo
+from stackbase.ci import SECRET_NAME, ci_secret_name, ci_setup, parse_github_repo
 from stackbase.errors import StackError
 from stackbase.secrets import DEPLOY_FILE, DEPLOY_KEY_NAME, load_secrets
 from stackbase.secrets_cli import deploy_key_init
@@ -425,6 +425,25 @@ def _reference_actions() -> set[str]:
     return names
 
 
+def _jobs() -> dict[str, str]:
+    """`jobs:` split into {job id: its text}, by the two-space-indented ids."""
+    body = _WORKFLOW_TEXT.split("\njobs:\n", 1)[1]
+    found: dict[str, list[str]] = {}
+    current = None
+    for line in body.splitlines():
+        match = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        if match:
+            current = match.group(1)
+            found[current] = []
+        elif current is not None:
+            found[current].append(line)
+    return {name: "\n".join(lines) for name, lines in found.items()}
+
+
+def _non_comment(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if not line.strip().startswith("#"))
+
+
 class WorkflowExistsTests(unittest.TestCase):
     def test_the_file_exists_and_is_non_empty(self) -> None:
         self.assertTrue(_WORKFLOW_PATH.is_file())
@@ -446,19 +465,20 @@ class WorkflowTriggerAndPermissionsTests(unittest.TestCase):
 
 
 class WorkflowSecretsAndVarsTests(unittest.TestCase):
-    def test_exactly_one_distinct_secret_is_referenced_and_it_is_stack_deploy_key(self) -> None:
+    def test_only_the_two_environment_deploy_keys_are_referenced(self) -> None:
         # The `${{ secrets.X }}` expression form only -- not every English
         # occurrence of the word "secrets." (this file's own header comment
         # talks about infra/secrets.age, which must not count).
         refs = set(re.findall(r"\$\{\{\s*secrets\.([A-Za-z0-9_]+)\s*\}\}", _WORKFLOW_TEXT))
 
-        self.assertEqual(refs, {SECRET_NAME})
+        self.assertEqual(refs, {"STACK_DEPLOY_KEY_STAGING", "STACK_DEPLOY_KEY_PRODUCTION"})
 
     def test_no_vars_context_is_referenced(self) -> None:
         self.assertNotIn("vars.", _WORKFLOW_TEXT)
 
-    def test_no_environment_context_is_referenced(self) -> None:
-        self.assertNotIn("environment:", _WORKFLOW_TEXT)
+    def test_the_only_github_environment_is_production(self) -> None:
+        environments = re.findall(r"^\s*environment:\s*(\S+)\s*$", _WORKFLOW_TEXT, re.MULTILINE)
+        self.assertEqual(environments, ["production"])
 
     def test_the_secret_interpolation_never_appears_inside_a_run_script_line(self) -> None:
         """The `${{ secrets... }}` expression must live in an `env:` mapping
@@ -471,7 +491,10 @@ class WorkflowSecretsAndVarsTests(unittest.TestCase):
             if "${{ secrets" in line:
                 stripped = line.strip()
                 self.assertTrue(
-                    re.match(r"^STACK_DEPLOY_KEY:\s*\$\{\{\s*secrets\.STACK_DEPLOY_KEY\s*\}\}$", stripped),
+                    re.match(
+                        r"^STACK_DEPLOY_KEY:\s*\$\{\{\s*secrets\.STACK_DEPLOY_KEY_(STAGING|PRODUCTION)\s*\}\}$",
+                        stripped,
+                    ),
                     f"line {number} interpolates a secret outside an env: mapping: {line!r}",
                 )
 
@@ -511,18 +534,19 @@ class WorkflowRunnerTests(unittest.TestCase):
     def test_it_runs_on_the_self_hosted_production_runner(self) -> None:
         # `production`, and NOT `x86_64-linux`: the release runner is reserved
         # for tag deploys so they never queue behind pull-request CI.
-        match = re.search(r"^\s*runs-on:\s*(.+)$", _WORKFLOW_TEXT, re.MULTILINE)
+        runners = re.findall(r"^\s*runs-on:\s*(.+)$", _WORKFLOW_TEXT, re.MULTILINE)
 
-        self.assertIsNotNone(match, "expected a runs-on: line")
-        self.assertEqual(match.group(1).strip(), "[self-hosted, production]")
+        self.assertTrue(runners, "expected a runs-on: line")
+        self.assertEqual({runner.strip() for runner in runners}, {"[self-hosted, production]"})
 
     def test_it_never_uses_the_runner_builtin_hashfiles(self) -> None:
         # The self-hosted runners ship only the node24 runtime; the runner's
         # built-in hashFiles() is hard-wired to node20 and fails there.
         self.assertNotIn("hashFiles(", _WORKFLOW_TEXT)
 
-    def test_there_is_exactly_one_job_and_one_runner(self) -> None:
-        self.assertEqual(len(re.findall(r"^\s*runs-on:", _WORKFLOW_TEXT, re.MULTILINE)), 1)
+    def test_there_are_exactly_two_jobs_staging_and_production(self) -> None:
+        self.assertEqual(list(_jobs()), ["staging", "production"])
+        self.assertEqual(len(re.findall(r"^\s*runs-on:", _WORKFLOW_TEXT, re.MULTILINE)), 2)
 
     def test_nothing_installs_a_c_toolchain_at_job_time(self) -> None:
         # The runner is a NixOS machine that already carries the cross
@@ -572,6 +596,106 @@ class WorkflowKeyHandlingTests(unittest.TestCase):
     def test_the_deploy_step_invokes_infra_up_deploy_with_the_tag_ref(self) -> None:
         self.assertIn("./infra/up deploy", _WORKFLOW_TEXT)
         self.assertIn("$GITHUB_REF_NAME", _WORKFLOW_TEXT)
+
+
+
+class WorkflowEnvironmentsTests(unittest.TestCase):
+    def test_ci_template_tag_deploys_staging_dispatch_deploys_production(self) -> None:
+        on = _WORKFLOW_TEXT.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("workflow_dispatch:", on)
+        self.assertRegex(on, r"inputs:\s*\n\s+tag:")
+
+        jobs = _jobs()
+        staging = _non_comment(jobs["staging"])
+        production = _non_comment(jobs["production"])
+
+        self.assertIn("if: github.event_name == 'push'", staging)
+        self.assertIn("secrets.STACK_DEPLOY_KEY_STAGING", staging)
+        self.assertNotIn("STACK_DEPLOY_KEY_PRODUCTION", staging)
+        self.assertNotIn("environment:", staging)
+        self.assertIn('./infra/up --env staging deploy "$GITHUB_REF_NAME"', staging)
+
+        self.assertIn("if: github.event_name == 'workflow_dispatch'", production)
+        self.assertRegex(production, r"(?m)^    environment: production$")
+        self.assertIn("secrets.STACK_DEPLOY_KEY_PRODUCTION", production)
+        self.assertNotIn("STACK_DEPLOY_KEY_STAGING", production)
+        # The same release: the tag the operator names, checked out and deployed as-is.
+        self.assertIn("ref: ${{ inputs.tag }}", production)
+        self.assertIn('./infra/up --env production deploy "$TAG"', production)
+        # The input reaches a script only through env:, never interpolated.
+        for line in production.splitlines():
+            if "${{ inputs.tag }}" in line:
+                self.assertRegex(line.strip(), r"^(TAG|ref):\s*\$\{\{ inputs\.tag \}\}$")
+
+    def test_both_jobs_check_the_runner_and_clean_up_the_key(self) -> None:
+        for name, text in _jobs().items():
+            with self.subTest(job=name):
+                self.assertIn("name: Check the runner has stack-base's tools", text)
+                self.assertIn("if: always()", text)
+                self.assertIn('rm -f "$RUNNER_TEMP/deploy_key"', text.split("if: always()", 1)[1])
+
+    def test_the_rustup_comment_is_accurate(self) -> None:
+        # GitHub's Ubuntu images ship rustup; only the self-hosted tools matter.
+        self.assertNotIn("no tailwindcss or rustup", _WORKFLOW_TEXT)
+
+
+_ENVS_TOML = (Path(__file__).resolve().parent / "fixtures" / "stack-envs.toml").read_text(encoding="utf-8")
+
+
+class CiSecretNameTests(unittest.TestCase):
+    def test_names(self) -> None:
+        self.assertEqual(ci_secret_name(None), "STACK_DEPLOY_KEY")
+        self.assertEqual(ci_secret_name("staging"), "STACK_DEPLOY_KEY_STAGING")
+        self.assertEqual(ci_secret_name("production"), "STACK_DEPLOY_KEY_PRODUCTION")
+        self.assertEqual(ci_secret_name("qa-2"), "STACK_DEPLOY_KEY_QA_2")
+
+
+class CiSetupEnvironmentTests(unittest.TestCase):
+    def _run(self, env: str) -> tuple[Path, FakeRunner, list[str], str]:
+        if not _DEPLOY_TOOLS:
+            raise unittest.SkipTest("age / age-keygen / ssh-keygen not installed")
+        lines: list[str] = []
+        project = Project()
+        infra_dir = project.__enter__()
+        self.addCleanup(project.__exit__, None, None, None)
+        (infra_dir / "stack.toml").write_text(_ENVS_TOML, encoding="utf-8")
+        identity_path, public_key = _generate_age_identity(infra_dir.parent)
+        (infra_dir / "age-recipients.txt").write_text(public_key + "\n", encoding="utf-8")
+        (infra_dir / "deploy-recipients.txt").write_text(public_key + "\n", encoding="utf-8")
+        runner = FakeRunner(handler=_happy_path_handler(secret_list_names=[ci_secret_name(env)]))
+        with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(identity_path)}):
+            ci_setup(infra_dir, env=env, emit=lines.append, runner=runner)
+            private_key = load_secrets(infra_dir, file=_deploy_file(infra_dir, env))[DEPLOY_KEY_NAME]
+        return infra_dir, runner, lines, private_key
+
+    def test_staging_writes_its_own_repo_secret_from_its_own_key(self) -> None:
+        infra_dir, runner, lines, private_key = self._run("staging")
+
+        secret_calls = [c for c in runner.calls if c["argv"][:3] == ["gh", "secret", "set"]]
+        self.assertEqual(len(secret_calls), 1)
+        self.assertEqual(secret_calls[0]["argv"][3], "STACK_DEPLOY_KEY_STAGING")
+        self.assertEqual(secret_calls[0]["kwargs"]["input"], private_key.encode("utf-8"))
+        self.assertTrue((infra_dir / "deploy.staging.age").exists())
+        self.assertTrue((infra_dir / "keys" / "deploy.staging.pub").is_file())
+        self.assertFalse((infra_dir / "deploy.age").exists())
+        self.assertFalse((infra_dir / "keys" / "deploy.pub").exists())
+        self.assertTrue(any("--env staging" in line for line in lines))
+
+    def test_production_writes_its_secret_and_explains_the_github_environment(self) -> None:
+        _infra_dir, runner, lines, _key = self._run("production")
+
+        secret_calls = [c for c in runner.calls if c["argv"][:3] == ["gh", "secret", "set"]]
+        self.assertEqual(secret_calls[0]["argv"][3], "STACK_DEPLOY_KEY_PRODUCTION")
+        text = "\n".join(lines)
+        self.assertIn("environments/production", text)
+        self.assertIn("required reviewers", text.lower())
+
+
+def _deploy_file(infra_dir: Path, env: str):
+    from stackbase.config import load_config
+    from stackbase.secrets import deploy_file
+
+    return deploy_file(load_config(infra_dir).env(env))
 
 
 if __name__ == "__main__":

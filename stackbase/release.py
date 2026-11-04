@@ -50,12 +50,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from stackbase.config import StackConfig, StackState, load_config, load_state
+from stackbase.config import Environment, Node, StackConfig, StackState, load_config, load_state
 from stackbase.errors import StackError
 from stackbase.ramdir import private_ram_dir
 from stackbase.secrets import (
     DEPLOY_FILE,
     DEPLOY_KEY_NAME,
+    SecretsFile,
+    deploy_file,
     _identity_path,
     load_secrets,
     register_private_key,
@@ -740,8 +742,13 @@ def deploy_identity(
     *,
     emit: Callable[[str], None] = print,
     register_secret: Callable[[str], None] = lambda _value: None,
+    file: SecretsFile = DEPLOY_FILE,
 ) -> Iterator[None]:
     """Resolve which SSH key this deploy offers, in a fixed order.
+
+    `file` is the environment's deploy key (`deploy_file(env)`):
+    `deploy.<env>.age` in an environment, so a deploy to production can only
+    ever be made with production's key.
 
     1. `$STACKBASE_SSH_IDENTITY` -- an explicit operator choice always wins,
        and nothing is decrypted.
@@ -766,7 +773,7 @@ def deploy_identity(
         yield
         return
 
-    deploy_path = infra_dir / DEPLOY_FILE.name
+    deploy_path = infra_dir / file.name
     if not deploy_path.exists():
         emit(_NO_PROJECT_KEY_WARNING)
         yield
@@ -792,14 +799,14 @@ def deploy_identity(
             f"this project has a deploy key ({deploy_path}) but this machine cannot decrypt it",
             f"the age identity {identity_path} does not exist -- either point "
             "$STACKBASE_AGE_IDENTITY at an identity listed in "
-            f"infra/{DEPLOY_FILE.recipients_name}, or deploy without decrypting anything by "
+            f"{file.recipients_path(infra_dir)}, or deploy without decrypting anything by "
             "pointing $STACKBASE_SSH_IDENTITY at an SSH private key whose public half is in "
             "stackbase.deploy.keys:\n"
             "STACKBASE_SSH_IDENTITY=<path to your SSH private key>\n"
             "./infra/up deploy <version>",
         )
 
-    private_key = load_secrets(infra_dir, file=DEPLOY_FILE).get(DEPLOY_KEY_NAME)
+    private_key = load_secrets(infra_dir, file=file).get(DEPLOY_KEY_NAME)
     if not private_key:
         raise StackError(
             f"{deploy_path} has no '{DEPLOY_KEY_NAME}'",
@@ -834,30 +841,30 @@ def deploy_identity(
 # --------------------------------------------------------------------------
 
 
-def _node_order(cfg: StackConfig, *, primary_first: bool) -> list[str]:
-    """`cfg.nodes` in declaration order, split into primary/replicas and reordered.
+def _node_order(nodes: dict[str, Node], *, primary_first: bool) -> list[str]:
+    """The environment's nodes in declaration order, split into primary/replicas and reordered.
 
     `ship` wants replicas first, primary last (a bad release is caught
     before the node serving traffic is touched); `rollback` wants the
     opposite (getting the traffic-serving node back is the priority).
     """
-    primary_names = [name for name, node in cfg.nodes.items() if node.role == "primary"]
-    replica_names = [name for name, node in cfg.nodes.items() if node.role != "primary"]
+    primary_names = [name for name, node in nodes.items() if node.role == "primary"]
+    replica_names = [name for name, node in nodes.items() if node.role != "primary"]
     if primary_first:
         return [*primary_names, *replica_names]
     return [*replica_names, *primary_names]
 
 
-def _select_nodes(cfg: StackConfig, order: list[str], only: str | None) -> list[str]:
+def _select_nodes(nodes: dict[str, Node], order: list[str], only: str | None) -> list[str]:
     if only is None:
         return order
-    if only not in cfg.nodes:
-        known = ", ".join(cfg.nodes) or "none"
+    if only not in nodes:
+        known = ", ".join(nodes) or "none"
         raise StackError(f"there is no node called '{only}' in stack.toml", f"known nodes: {known}")
     return [only]
 
 
-def _emit_untouched_notice(cfg: StackConfig, only: str | None, emit: Callable[[str], None]) -> None:
+def _emit_untouched_notice(nodes: dict[str, Node], only: str | None, emit: Callable[[str], None]) -> None:
     """With `--node`, tell the operator how many OTHER configured nodes this
     run never touched -- easy to miss otherwise, since a `--node`-filtered
     run's output looks identical in shape to an unfiltered one (minor c,
@@ -865,7 +872,7 @@ def _emit_untouched_notice(cfg: StackConfig, only: str | None, emit: Callable[[s
     """
     if only is None:
         return
-    other = len(cfg.nodes) - 1
+    other = len(nodes) - 1
     if other <= 0:
         return
     noun = "node" if other == 1 else "nodes"
@@ -896,8 +903,12 @@ def ship(
     runner: Any = subprocess.run,
     popen: Any = subprocess.Popen,
     emit: Callable[[str], None] = print,
+    env: Environment | None = None,
 ) -> dict[str, str]:
     """Upload and switch `version` on every selected node, replicas first, primary last.
+
+    The nodes are `env`'s (default: the implicit environment of a
+    single-environment project), with `state` being that environment's.
 
     Per node: `upload <version> <sha256>` with the tarball streamed on
     stdin, then `deploy <version>`. Both go through `Ssh.run_stream` (the
@@ -914,8 +925,9 @@ def ship(
     node's current release (via `colors`) so the operator knows exactly
     what is live where.
     """
-    order = _select_nodes(cfg, _node_order(cfg, primary_first=False), node)
-    _emit_untouched_notice(cfg, node, emit)
+    nodes = (env if env is not None else cfg.env(None)).nodes
+    order = _select_nodes(nodes, _node_order(nodes, primary_first=False), node)
+    _emit_untouched_notice(nodes, node, emit)
     results: dict[str, str] = {}
     try:
         for name in order:
@@ -964,10 +976,12 @@ def rollback_nodes(
     runner: Any = subprocess.run,
     popen: Any = subprocess.Popen,
     emit: Callable[[str], None] = print,
+    env: Environment | None = None,
 ) -> None:
     """Run `rollback` on every selected node, primary first -- getting traffic back is the priority."""
-    order = _select_nodes(cfg, _node_order(cfg, primary_first=True), node)
-    _emit_untouched_notice(cfg, node, emit)
+    nodes = (env if env is not None else cfg.env(None)).nodes
+    order = _select_nodes(nodes, _node_order(nodes, primary_first=True), node)
+    _emit_untouched_notice(nodes, node, emit)
     for name in order:
         ssh = Ssh(infra_dir, _node_ip(state, name), user=_DEPLOY_SSH_USER, runner=runner, popen=popen)
         emit(f"→ node {name}: rollback")
@@ -990,10 +1004,12 @@ def status_nodes(
     runner: Any = subprocess.run,
     popen: Any = subprocess.Popen,
     emit: Callable[[str], None] = print,
+    env: Environment | None = None,
 ) -> None:
     """Run `status` on every selected node, one ssh call each."""
-    order = _select_nodes(cfg, _node_order(cfg, primary_first=True), node)
-    _emit_untouched_notice(cfg, node, emit)
+    nodes = (env if env is not None else cfg.env(None)).nodes
+    order = _select_nodes(nodes, _node_order(nodes, primary_first=True), node)
+    _emit_untouched_notice(nodes, node, emit)
     for name in order:
         ssh = Ssh(infra_dir, _node_ip(state, name), user=_DEPLOY_SSH_USER, runner=runner, popen=popen)
         emit(f"node {name}:")
@@ -1070,8 +1086,12 @@ def run_deploy(
     popen: Any = subprocess.Popen,
     emit: Callable[[str], None] = print,
     register_secret: Callable[[str], None] = lambda _value: None,
+    env: str | None = None,
 ) -> None:
     """`deploy <version>`: build (or reuse a prebuilt tarball), package, ship.
+
+    `env` names the environment (required once stack.toml has
+    `[environments]`); its nodes, state and deploy key are the ones used.
 
     Reads no API token and never decrypts `secrets.age`. The one secret this
     path can hold is the project's own SSH deploy key, resolved by
@@ -1086,7 +1106,9 @@ def run_deploy(
         )
 
     cfg = load_config(infra_dir)
-    state = load_state(infra_dir)
+    environment = cfg.env(env)
+    state = load_state(infra_dir, environment)
+    key_file = deploy_file(environment)
     repo_dir = infra_dir.parent
 
     if skip_build:
@@ -1099,8 +1121,11 @@ def run_deploy(
         if not tarball.is_file():
             raise StackError(f"tarball not found: {tarball}", "check the --tarball path")
         sha256 = _sha256_file(tarball)
-        with deploy_identity(infra_dir, emit=emit, register_secret=register_secret):
-            ship(infra_dir, cfg, state, version, tarball, sha256, node=node, runner=runner, popen=popen, emit=emit)
+        with deploy_identity(infra_dir, emit=emit, register_secret=register_secret, file=key_file):
+            ship(
+                infra_dir, cfg, state, version, tarball, sha256,
+                node=node, runner=runner, popen=popen, emit=emit, env=environment,
+            )
         return
 
     # A private, per-run work dir (`tempfile.mkdtemp`'s own default mode,
@@ -1130,8 +1155,11 @@ def run_deploy(
         # Opened only now, not around the build: a cargo build can take many
         # minutes, and the decrypted key only needs to exist for the
         # upload/switch phase.
-        with deploy_identity(infra_dir, emit=emit, register_secret=register_secret):
-            ship(infra_dir, cfg, state, version, tarball, sha256, node=node, runner=runner, popen=popen, emit=emit)
+        with deploy_identity(infra_dir, emit=emit, register_secret=register_secret, file=key_file):
+            ship(
+                infra_dir, cfg, state, version, tarball, sha256,
+                node=node, runner=runner, popen=popen, emit=emit, env=environment,
+            )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1144,11 +1172,13 @@ def run_rollback(
     popen: Any = subprocess.Popen,
     emit: Callable[[str], None] = print,
     register_secret: Callable[[str], None] = lambda _value: None,
+    env: str | None = None,
 ) -> None:
     cfg = load_config(infra_dir)
-    state = load_state(infra_dir)
-    with deploy_identity(infra_dir, emit=emit, register_secret=register_secret):
-        rollback_nodes(infra_dir, cfg, state, node=node, runner=runner, popen=popen, emit=emit)
+    environment = cfg.env(env)
+    state = load_state(infra_dir, environment)
+    with deploy_identity(infra_dir, emit=emit, register_secret=register_secret, file=deploy_file(environment)):
+        rollback_nodes(infra_dir, cfg, state, node=node, runner=runner, popen=popen, emit=emit, env=environment)
 
 
 def run_status(
@@ -1159,8 +1189,10 @@ def run_status(
     popen: Any = subprocess.Popen,
     emit: Callable[[str], None] = print,
     register_secret: Callable[[str], None] = lambda _value: None,
+    env: str | None = None,
 ) -> None:
     cfg = load_config(infra_dir)
-    state = load_state(infra_dir)
-    with deploy_identity(infra_dir, emit=emit, register_secret=register_secret):
-        status_nodes(infra_dir, cfg, state, node=node, runner=runner, popen=popen, emit=emit)
+    environment = cfg.env(env)
+    state = load_state(infra_dir, environment)
+    with deploy_identity(infra_dir, emit=emit, register_secret=register_secret, file=deploy_file(environment)):
+        status_nodes(infra_dir, cfg, state, node=node, runner=runner, popen=popen, emit=emit, env=environment)

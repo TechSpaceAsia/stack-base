@@ -80,3 +80,26 @@ role = "primary"
 # retention_days = 30
 # extra_paths = ["/var/lib/acme/uploads"]
 # on_calendar = "03:00"
+
+# Optional. Staging and production from this one file. Replace the
+# top-level `domain` and [nodes.*] above with one table per environment;
+# everything else in this file is then shared, so the two match. An
+# environment may set only its domain, its nodes, plan/price_item, and the
+# bucket/retention_days/to/lock_days keys of [backups], [logs], [alerts]
+# and [files]. Every command then needs --env (`./infra/up --env staging
+# up --plan`), and each environment keeps its own stack.state.<env>.json,
+# secrets.<env>.age and deploy.<env>.age. See the README's "Staging and
+# production" section.
+#
+# [environments.staging]
+# domain = "staging.acme.example.com"
+# backups.bucket = "acme-backups-staging"
+#
+# [environments.staging.nodes.a]
+# role = "primary"
+#
+# [environments.production]
+# domain = "acme.example.com"
+#
+# [environments.production.nodes.a]
+# role = "primary"

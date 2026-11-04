@@ -240,6 +240,108 @@ performs, so a mistake is caught here, not on the next `up`.
 Key names must match `^[a-z][a-z0-9_]{0,40}$` — lowercase letters, digits,
 and underscores, starting with a letter.
 
+## Staging and production
+
+One `stack.toml` can describe two (or more) matching environments. Everything
+outside the `[environments.*]` tables is shared — project, admins, data
+centre, `[app]`, and the shared `[backups]`/`[logs]`/`[alerts]`/`[files]` —
+so staging and production are the same stack by construction. Each
+environment carries only what is allowed to differ:
+
+```toml
+project    = "acme"
+owner      = "your-github-handle"
+datacenter = "kul"
+plan       = "KVM 1"
+admins     = ["your-name"]
+
+[backups]
+bucket = "acme-backups"
+
+[environments.staging]
+domain         = "staging.acme.example.com"
+backups.bucket = "acme-backups-staging"
+
+[environments.staging.nodes.a]
+role = "primary"
+
+[environments.production]
+domain = "acme.example.com"
+
+[environments.production.nodes.a]
+role = "primary"
+```
+
+- **What an environment may set:** `domain` (required), its own
+  `[environments.<env>.nodes.<n>]` (required, same shape as `[nodes.<n>]`),
+  `plan` and `price_item`, and `backups.bucket`, `backups.retention_days`,
+  `logs.bucket`, `logs.retention_days`, `alerts.to`, `files.bucket` and
+  `files.lock_days`, each overriding the shared value. Any other key there is
+  an error, and so is a top-level `[nodes]` next to `[environments]`.
+  Environment names are lowercase letters, digits and `-`, at most 16
+  characters.
+- **`--env <name>` is required on every command** once `[environments]`
+  exists: `up`, `up --plan`, `deploy`, `rollback`, `status`, `ssh`,
+  `backup-now`, `secrets`, `deploy-key` and `ci-setup`. There is no default,
+  so a forgotten flag fails with the list of environments instead of touching
+  production. It goes before or after the command
+  (`./infra/up --env staging up --plan`, `./infra/up deploy v1.4.2 --env staging`);
+  for `ssh`, put it before the node name (`./infra/up ssh --env staging a`).
+  `--plan` prints `would do in staging:` so a plan is never mistaken for the
+  other environment's.
+- **Files per environment:**
+
+  | | single environment | environment `<env>` |
+  |---|---|---|
+  | state | `stack.state.json` | `stack.state.<env>.json` |
+  | secrets | `secrets.age` | `secrets.<env>.age` |
+  | its recipients | `age-recipients.txt` | `age-recipients.<env>.txt` if present, else `age-recipients.txt` |
+  | deploy key | `deploy.age`, `keys/deploy.pub` | `deploy.<env>.age`, `keys/deploy.<env>.pub` |
+  | deploy recipients | `deploy-recipients.txt` | `deploy-recipients.<env>.txt` if present, else `deploy-recipients.txt` |
+  | hardware | `nodes/<node>/` | `nodes/<env>-<node>/` |
+
+  Staging never holds production's secrets, and a staging deploy key cannot
+  deploy production: each environment's servers trust only their own key.
+  Give production its own `age-recipients.production.txt` to keep its
+  secrets away from people who only work on staging.
+- **Names:** a server is `<env>-<node>` (e.g. `staging-a`) as its NixOS
+  hostname and flake attribute, and `<node>.<env domain>`
+  (`a.staging.acme.example.com`) in Hostinger. Each environment has its own
+  Hostinger firewall, `stackbase-<project>-<env>`. The node module gets
+  `stackbase.environment = "<env>"`.
+- **Set up each environment** like a project of its own:
+
+  ```bash
+  ENV=staging
+  HOSTINGER_TOKEN=<paste here>
+  CLOUDFLARE_TOKEN=<paste here, or leave empty>
+  printf '{"hostinger_token": "%s", "cloudflare_token": "%s"}' "$HOSTINGER_TOKEN" "$CLOUDFLARE_TOKEN" \
+    | age -R infra/age-recipients.txt -o "infra/secrets.$ENV.age"
+  ./infra/up --env "$ENV" up --plan
+  ./infra/up --env "$ENV" up --allow-purchase
+  ./infra/up --env "$ENV" deploy-key init
+  ```
+
+  After that, `./infra/up --env "$ENV" secrets set <key>` manages that
+  environment's secrets one key at a time, as in "Managing secrets".
+
+- **Promoting a tag to production:** deploy a tag to staging, check it, then
+  deploy the very same tag to production:
+
+  ```bash
+  VERSION=v1.4.2
+  ./infra/up --env staging deploy "$VERSION"
+  ./infra/up --env production deploy "$VERSION"
+  ```
+
+  With the GitHub Actions workflow (below), the tag push does the staging
+  half; production is **Actions → Deploy (stack-base) → Run workflow** with
+  the tag, behind the GitHub Environment `production`.
+
+A `stack.toml` without `[environments]` is one implicit environment: the
+files, hostnames, plans and commands above stay exactly what they were, and
+`--env` is refused.
+
 ## Releasing a version
 
 Once a server is up (`./infra/up` has completed at least once), you ship
@@ -485,6 +587,28 @@ git add infra/deploy.age infra/keys/deploy.pub && git commit -m "deploy: rotate 
 Because it's the SAME key everywhere, rotating it also replaces what you
 and any build host deploy with — there is no "laptop deploys are
 unaffected" any more (Task 2 removed the separate `ci-deploy` key).
+
+**With staging and production** the workflow has two jobs. A `v*` tag push
+runs the `staging` job, which deploys that tag with
+`./infra/up --env staging deploy` and the `STACK_DEPLOY_KEY_STAGING` secret.
+The `production` job runs only from **Run workflow** (`workflow_dispatch`),
+takes the tag as its input, checks that tag out and deploys the same release
+with `--env production` and `STACK_DEPLOY_KEY_PRODUCTION`. It runs in the
+GitHub Environment `production`, so required reviewers on that environment
+must approve every production deploy:
+
+```bash
+./infra/up --env staging ci-setup       # writes STACK_DEPLOY_KEY_STAGING
+./infra/up --env production ci-setup    # writes STACK_DEPLOY_KEY_PRODUCTION
+OWNER_REPO=<owner>/<repo>
+gh api -X PUT "repos/$OWNER_REPO/environments/production"
+```
+
+then add the required reviewers under the repository's Settings →
+Environments → production. `ci-setup --env production` prints the same
+steps. A project without `[environments]` keeps the single
+`STACK_DEPLOY_KEY`: drop `--env staging` from the workflow's staging job and
+delete its production job.
 
 **Turn it off** (CI only — this does not remove the deploy key itself,
 since it's also your own):
@@ -945,6 +1069,7 @@ config and used directly, so edits to stack-base take effect on the next run.
 | `deploy-recipients.txt` | Who can decrypt `deploy.age` — a superset of `age-recipients.txt`. Commit |
 | `deploy.age` | The project's encrypted SSH deploy key. Commit (it's encrypted) |
 | `keys/deploy.pub` | The deploy key's public half — this is what gets installed on the servers. Commit |
+| `secrets.<env>.age`, `deploy.<env>.age`, `keys/deploy.<env>.pub`, `stack.state.<env>.json` | The same, per environment, when `stack.toml` has `[environments]` (see "Staging and production") |
 | `stack.state.json` | What stack-base has done so far — addresses, record ids, fingerprints. Written for you: commit it, don't edit it. The servers' configuration is built from `stack.toml` alone, so nothing in here changes what gets installed |
 | `known_hosts` | The servers' SSH fingerprints. Commit |
 | `nodes/<name>/` | Each server's own disk and boot settings, copied off the machine. Commit |

@@ -9,6 +9,7 @@ failure is one redacted line plus exit code 1.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -592,7 +593,7 @@ class SecretsAndCiSetupFailureRedactionTests(unittest.TestCase):
     # -- secrets edit: both the original bundle value and the edited value --
 
     def _fake_edit_key_leaking(self, original_value: str, new_value: str):
-        def fake_edit_key(infra_dir: Path, key: str, *, emit, register_secret) -> None:  # noqa: ANN001
+        def fake_edit_key(infra_dir: Path, key: str, *, emit, register_secret, file) -> None:  # noqa: ANN001
             register_secret(key, original_value)
             register_secret(key, new_value)
             raise StackError(
@@ -654,7 +655,7 @@ class SecretsAndCiSetupFailureRedactionTests(unittest.TestCase):
     # -- ci-setup: a private-key body line -----------------------------------
 
     def _fake_ci_setup_leaking(self, key_line: str):
-        def fake_ci_setup(infra_dir: Path, *, rotate: bool, emit, register_secret) -> None:  # noqa: ANN001
+        def fake_ci_setup(infra_dir: Path, *, rotate: bool, emit, register_secret, env) -> None:  # noqa: ANN001
             register_secret(key_line)
             raise StackError(
                 f"gh secret set STACK_DEPLOY_KEY failed, stderr echoed: {key_line}",
@@ -1062,6 +1063,172 @@ class AllowDirtyTests(unittest.TestCase):
                 main(["--infra-dir", str(infra_dir), "up", "--plan"])
 
             check_mock.assert_not_called()
+
+
+
+# --------------------------------------------------------------------------
+# Environments: --env is required once stack.toml has [environments]
+# --------------------------------------------------------------------------
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+# Every command that touches servers or per-environment secrets (Brief I).
+# `alert-test` joins this list when it exists; the coverage check below
+# fails until it does.
+_ENV_COMMANDS = [
+    ["up"],
+    ["up", "--plan"],
+    ["deploy", "v1.0.0"],
+    ["rollback"],
+    ["status"],
+    ["ssh", "a"],
+    ["backup-now"],
+    ["secrets", "keys"],
+    ["secrets", "set", "app_env"],
+    ["secrets", "unset", "app_env"],
+    ["secrets", "edit", "app_env"],
+    ["deploy-key", "init"],
+    ["deploy-key", "show-pub"],
+    ["ci-setup"],
+]
+
+
+def _envs_infra(root: Path) -> Path:
+    infra_dir = root / "infra"
+    (infra_dir / "keys").mkdir(parents=True)
+    shutil.copy(_FIXTURES / "stack-envs.toml", infra_dir / "stack.toml")
+    (infra_dir / "keys" / "matt.pub").write_text(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForCliTests matt@laptop\n", encoding="utf-8"
+    )
+    return infra_dir
+
+
+def _run_failing(argv: list[str]) -> str:
+    stderr = io.StringIO()
+    with (
+        contextlib.redirect_stderr(stderr),
+        contextlib.redirect_stdout(io.StringIO()),
+        mock.patch("subprocess.run", side_effect=AssertionError("no subprocess may run")),
+        mock.patch("os.execvp", side_effect=AssertionError("no exec may happen")),
+        mock.patch("sys.stdin", io.StringIO("")),
+        mock.patch.dict(os.environ, {"EDITOR": "false", "VISUAL": "false"}),
+    ):
+        try:
+            main(argv)
+        except SystemExit as exit_:
+            if exit_.code != 1:
+                raise AssertionError(f"exit code {exit_.code} for {argv}") from None
+        else:
+            raise AssertionError(f"{argv} did not fail")
+    return stderr.getvalue()
+
+
+class EnvironmentFlagTests(unittest.TestCase):
+    def test_every_server_or_secret_command_is_covered(self) -> None:
+        from stackbase.__main__ import build_parser
+
+        parser = build_parser()
+        subparsers = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        self.assertEqual(set(subparsers.choices), {cmd[0] for cmd in _ENV_COMMANDS})
+
+    def test_multi_env_requires_env_flag_for_every_command(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = _envs_infra(Path(tmp))
+            before = {path: path.read_bytes() for path in infra_dir.rglob("*") if path.is_file()}
+            for command in _ENV_COMMANDS:
+                with self.subTest(command=command):
+                    output = _run_failing(["--infra-dir", str(infra_dir), *command])
+
+                    self.assertEqual(len(output.strip().splitlines()), 1, output)
+                    self.assertIn("this project has environments: staging, production", output)
+                    self.assertIn("--env", output)
+            after = {path: path.read_bytes() for path in infra_dir.rglob("*") if path.is_file()}
+            self.assertEqual(after, before)
+
+    def test_unknown_env_lists_valid(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = _envs_infra(Path(tmp))
+            for argv in (
+                ["--env", "prod", "up", "--plan"],
+                ["up", "--plan", "--env", "prod"],
+                ["secrets", "keys", "--env", "prod"],
+                ["deploy-key", "show-pub", "--env", "prod"],
+                ["ssh", "--env", "prod", "a"],
+                ["deploy", "v1.0.0", "--env", "prod"],
+            ):
+                with self.subTest(argv=argv):
+                    output = _run_failing(["--infra-dir", str(infra_dir), *argv])
+
+                    self.assertIn("'prod'", output)
+                    self.assertIn("staging, production", output)
+
+    def test_env_on_a_project_without_environments_is_refused(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp) / "infra"
+            (infra_dir / "keys").mkdir(parents=True)
+            (infra_dir / "stack.toml").write_text(_STACK_TOML, encoding="utf-8")
+            (infra_dir / "keys" / "matt.pub").write_text(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForCliTests matt@laptop\n", encoding="utf-8"
+            )
+
+            output = _run_failing(["--infra-dir", str(infra_dir), "--env", "staging", "status"])
+
+            self.assertIn("'staging'", output)
+            self.assertIn("[environments]", output)
+
+    def test_env_is_threaded_to_each_command(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = _envs_infra(Path(tmp))
+            base = ["--infra-dir", str(infra_dir)]
+            for argv, target in (
+                (["deploy", "v1.0.0", "--env", "staging"], "run_deploy"),
+                (["--env", "staging", "rollback"], "run_rollback"),
+                (["status", "--env", "staging"], "run_status"),
+                (["backup-now", "--env", "staging"], "run_backup_now"),
+                (["ci-setup", "--env", "staging"], "ci_setup"),
+                (["deploy-key", "init", "--env", "staging"], "deploy_key_init"),
+                (["deploy-key", "show-pub", "--env", "staging"], "deploy_key_show_pub"),
+            ):
+                with self.subTest(argv=argv), mock.patch(f"stackbase.__main__.{target}") as target_mock:
+                    main([*base, *argv])
+
+                    self.assertEqual(target_mock.call_args.args[0], infra_dir)
+                    self.assertEqual(target_mock.call_args.kwargs["env"], "staging")
+
+    def test_secrets_commands_use_the_environments_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = _envs_infra(Path(tmp))
+            base = ["--infra-dir", str(infra_dir), "--env", "production", "secrets"]
+            for argv, target in (
+                (["keys"], "list_key_names"),
+                (["set", "app_env"], "set_key"),
+                (["unset", "app_env"], "unset_key"),
+                (["edit", "app_env"], "edit_key"),
+            ):
+                with (
+                    self.subTest(argv=argv),
+                    mock.patch(f"stackbase.__main__.{target}", return_value=[]) as target_mock,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    main([*base, *argv])
+
+                    self.assertEqual(target_mock.call_args.kwargs["file"].name, "secrets.production.age")
+
+    def test_ssh_reads_the_environments_state(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = _envs_infra(Path(tmp))
+            (infra_dir / "stack.state.production.json").write_text(
+                json.dumps({"version": 1, "nodes": {"b": {"ipv4": "9.9.9.9"}}}), encoding="utf-8"
+            )
+
+            with mock.patch("os.execvp") as execvp:
+                main(["--infra-dir", str(infra_dir), "ssh", "--env", "production", "b"])
+
+            self.assertIn("root@9.9.9.9", execvp.call_args[0][1])
+
+            # staging has no node b: the node list is the environment's own.
+            output = _run_failing(["--infra-dir", str(infra_dir), "--env", "staging", "ssh", "b"])
+            self.assertIn("known nodes: a", output)
 
 
 if __name__ == "__main__":

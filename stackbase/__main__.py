@@ -1,7 +1,12 @@
 """The `stack-base` command line: `up` and `ssh`.
 
-    python3 -m stackbase [--infra-dir DIR] up [--plan] [--allow-purchase] [--debug]
-    python3 -m stackbase [--infra-dir DIR] ssh <node> [-- command ...]
+    python3 -m stackbase [--infra-dir DIR] [--env NAME] up [--plan] [--allow-purchase] [--debug]
+    python3 -m stackbase [--infra-dir DIR] [--env NAME] ssh <node> [-- command ...]
+
+`--env` may also come after the subcommand. It is REQUIRED for every command
+once stack.toml has `[environments]` -- there is no default environment, so
+a forgotten flag fails with the list of names instead of touching
+production -- and refused on a project without them.
 
 Two promises this file keeps, on top of parsing arguments:
 
@@ -26,7 +31,7 @@ from typing import Callable
 from stackbase.backups import check_backup_credentials, run_backup_now
 from stackbase.ci import ci_setup
 from stackbase.cloudflare import CloudflareClient
-from stackbase.config import load_config, load_state
+from stackbase.config import Environment, environment_names, load_config, load_state
 from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
 from stackbase.reconcile import (
@@ -36,17 +41,35 @@ from stackbase.reconcile import (
     apply,
     check_infra_clean,
     local_facts,
+    nothing_to_do,
     observe,
     plan,
+    plan_header,
     redaction_values,
     render_description,
 )
 from stackbase.release import run_deploy, run_rollback, run_status
-from stackbase.secrets import check_recipients_superset, load_secrets, redact
+from stackbase.secrets import (
+    SECRETS_FILE,
+    SecretsFile,
+    check_recipients_superset,
+    deploy_file,
+    load_secrets,
+    redact,
+    secrets_file,
+)
 from stackbase.secrets_cli import deploy_key_init, deploy_key_show_pub, edit_key, list_key_names, set_key, unset_key
 from stackbase.ssh import Ssh
 
 _DEFAULT_INFRA_DIR = "./infra"
+
+_ENV_HELP = "the environment to act on -- required once stack.toml has [environments]"
+
+
+def _add_env(parser: argparse.ArgumentParser) -> None:
+    """`--env` after the subcommand as well as before it. SUPPRESS keeps a
+    subcommand that was not given the flag from resetting the global one."""
+    parser.add_argument("--env", default=argparse.SUPPRESS, metavar="NAME", help=_ENV_HELP)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=_DEFAULT_INFRA_DIR,
         help=f"the project's infra directory (default: {_DEFAULT_INFRA_DIR})",
     )
+    parser.add_argument("--env", default=None, metavar="NAME", help=_ENV_HELP)
     commands = parser.add_subparsers(dest="command", required=True)
 
     up = commands.add_parser("up", help="make the servers match infra/stack.toml")
@@ -137,6 +161,12 @@ def build_parser() -> argparse.ArgumentParser:
     secrets_edit_p.add_argument("key", help="the secret's name")
     secrets_edit_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
 
+    for leaf in (
+        up, shell, deploy, rollback, status, backup_now_p, ci_setup_p, deploy_key_p, deploy_key_init_p,
+        deploy_key_show_p, secrets_p, secrets_keys_p, secrets_set_p, secrets_unset_p, secrets_edit_p,
+    ):
+        _add_env(leaf)
+
     return parser
 
 
@@ -150,24 +180,27 @@ def main(argv: list[str] | None = None) -> None:
     secrets: dict[str, str] = {}
 
     try:
+        # Every command acts on one environment, so the selection is checked
+        # here, once, before any of them reads a secret or opens a socket.
+        env = _selected_env(infra_dir, args.env)
         if args.command == "up":
-            _up(args, infra_dir, secrets)
+            _up(args, infra_dir, secrets, env)
         elif args.command == "ssh":
-            _ssh(args, infra_dir)
+            _ssh(args, infra_dir, env)
         elif args.command == "deploy":
-            _deploy(args, infra_dir, secrets)
+            _deploy(args, infra_dir, secrets, env)
         elif args.command == "rollback":
-            _rollback(args, infra_dir, secrets)
+            _rollback(args, infra_dir, secrets, env)
         elif args.command == "status":
-            _status(args, infra_dir, secrets)
+            _status(args, infra_dir, secrets, env)
         elif args.command == "backup-now":
-            _backup_now(args, infra_dir, secrets)
+            _backup_now(args, infra_dir, secrets, env)
         elif args.command == "ci-setup":
-            _ci_setup(args, infra_dir, secrets)
+            _ci_setup(args, infra_dir, secrets, env)
         elif args.command == "deploy-key":
-            _deploy_key(args, infra_dir, secrets)
+            _deploy_key(args, infra_dir, secrets, env)
         elif args.command == "secrets":
-            _secrets(args, infra_dir, secrets)
+            _secrets(args, infra_dir, secrets, env)
         else:
             # argparse's subparsers are `required=True`, so this is
             # unreachable in practice -- but an explicit branch that fails
@@ -199,6 +232,25 @@ def main(argv: list[str] | None = None) -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
+
+
+def _selected_env(infra_dir: Path, name: str | None) -> str | None:
+    """The `--env` name after checking it against stack.toml, or None for a
+    single-environment project.
+
+    A project with no `[environments]` and no `--env` is not even parsed
+    here: each command loads (or does not need) stack.toml exactly as it
+    did before environments existed. Everything else goes through
+    `StackConfig.env`, which refuses a missing name on a project with
+    environments, an unknown one, and any name on a project without them.
+    """
+    if name is None and not environment_names(infra_dir):
+        return None
+    return load_config(infra_dir).env(name).name or None
+
+
+def _secrets_file_for(infra_dir: Path, env: str | None) -> SecretsFile:
+    return secrets_file(load_config(infra_dir).env(env)) if env else SECRETS_FILE
 
 
 def _print_traceback(debug: bool, secrets: dict[str, str]) -> None:
@@ -237,16 +289,18 @@ _NO_CLOUDFLARE_WARNING = (
 )
 
 
-def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env_name: str | None) -> None:
     cfg = load_config(infra_dir)
-    state = load_state(infra_dir)
+    env = cfg.env(env_name)
+    state = load_state(infra_dir, env)
+    env_secrets = secrets_file(env)
     # Before anything reaches the network: a deploy-recipients.txt that has
     # drifted behind age-recipients.txt means an admin who can read every
     # project secret can no longer decrypt the deploy key -- caught here,
     # once, rather than at their next failed deploy. This one runs
     # unconditionally (even under --plan) because it is a correctness check
     # on the secrets setup itself, not on what would be pushed.
-    check_recipients_superset(infra_dir)
+    check_recipients_superset(infra_dir, env_secrets, deploy_file(env))
     # `--plan` changes nothing, so it never has to be clean. Otherwise:
     # what gets pushed is the working tree, so refuse to push one nobody
     # has committed unless the operator says so explicitly. Placed second
@@ -257,7 +311,7 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> N
     # proceed" right before secrets.update() commits to actually running.
     if not args.plan and not args.allow_dirty:
         check_infra_clean(infra_dir, emit=_emit_plain)
-    secrets.update(load_secrets(infra_dir))
+    secrets.update(load_secrets(infra_dir, file=env_secrets))
 
     hostinger = HostingerClient(_token(secrets, "hostinger_token", "Hostinger"))
 
@@ -269,7 +323,8 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> N
         cloudflare = CloudflareClient(cloudflare_token)
     else:
         cloudflare = None
-        print(redact(_NO_CLOUDFLARE_WARNING, redaction_values(secrets)))
+        warning = _NO_CLOUDFLARE_WARNING.replace("secrets.age", env_secrets.name)
+        print(redact(warning, redaction_values(secrets)))
 
     stackbase_src = os.environ.get("STACKBASE_SRC") or None
     local = local_facts(infra_dir, secrets, stackbase_src=stackbase_src)
@@ -279,18 +334,18 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> N
     # 03:00 -- say so now, next to the other pre-flight warnings. Emitted
     # under `--plan` too: it is a statement about the configuration, not
     # about what this particular run is going to push.
-    check_backup_credentials(cfg.backups.bucket, local.backup_env_sha, emit=_emit_masked(secrets))
-    observed = observe(cfg, state, hostinger, cloudflare, local=local)
+    check_backup_credentials(env.backups.bucket, local.backup_env_sha, emit=_emit_masked(secrets))
+    observed = observe(cfg, state, hostinger, cloudflare, local=local, env=env)
     for warning in observed.cloudflare_ip_warnings:
         print(redact(f"! {warning}", redaction_values(secrets)))
-    steps = plan(cfg, state, observed)
+    steps = plan(cfg, state, observed, env=env)
 
     if args.plan:
-        _print_plan(steps, secrets)
+        _print_plan(steps, secrets, env)
         return
 
     if not steps:
-        print("nothing to do")
+        print(nothing_to_do(env))
         return
 
     ctx = Context(
@@ -302,28 +357,30 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> N
         cloudflare=cloudflare,
         observed=observed,
         stackbase_src=stackbase_src,
+        env=env,
     )
     apply(steps, ctx, allow_purchase=args.allow_purchase)
     print("done")
 
 
-def _print_plan(steps: list[Step], secrets: dict[str, str]) -> None:
+def _print_plan(steps: list[Step], secrets: dict[str, str], env: Environment) -> None:
     if not steps:
-        print("nothing to do")
+        print(nothing_to_do(env))
         return
     values = redaction_values(secrets)
     has_cloudflare_token = bool(secrets.get("cloudflare_token"))
-    print("would do:")
+    print(plan_header(env))
     for number, step in enumerate(steps, start=1):
         description = render_description(step, has_cloudflare_token=has_cloudflare_token)
         print(redact(f"  {number}. {description}", values))
 
 
-def _ssh(args: argparse.Namespace, infra_dir: Path) -> None:
+def _ssh(args: argparse.Namespace, infra_dir: Path, env_name: str | None) -> None:
     cfg = load_config(infra_dir)
-    state = load_state(infra_dir)
-    if args.node not in cfg.nodes:
-        known = ", ".join(cfg.nodes) or "none"
+    env = cfg.env(env_name)
+    state = load_state(infra_dir, env)
+    if args.node not in env.nodes:
+        known = ", ".join(env.nodes) or "none"
         raise StackError(
             f"there is no node called '{args.node}' in stack.toml",
             f"known nodes: {known}",
@@ -377,7 +434,7 @@ def _emit_masked(secrets: dict[str, str]) -> Callable[[str], None]:
     return emit
 
 
-def _deploy(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+def _deploy(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env: str | None) -> None:
     run_deploy(
         infra_dir,
         args.version,
@@ -386,28 +443,31 @@ def _deploy(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) 
         tarball_path=args.tarball,
         emit=_emit_masked(secrets),
         register_secret=_secret_register_counter(secrets),
+        env=env,
     )
 
 
-def _rollback(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+def _rollback(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env: str | None) -> None:
     run_rollback(
         infra_dir,
         node=args.node,
         emit=_emit_masked(secrets),
         register_secret=_secret_register_counter(secrets),
+        env=env,
     )
 
 
-def _status(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+def _status(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env: str | None) -> None:
     run_status(
         infra_dir,
         node=args.node,
         emit=_emit_masked(secrets),
         register_secret=_secret_register_counter(secrets),
+        env=env,
     )
 
 
-def _backup_now(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+def _backup_now(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env: str | None) -> None:
     """Run the node's backup unit now, then list what landed in the bucket.
 
     `secrets` is empty here -- nothing is decrypted for this command, which
@@ -416,7 +476,7 @@ def _backup_now(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, st
     node's own, and the masking path should not depend on today's happening
     to have nothing to mask.
     """
-    run_backup_now(infra_dir, node=args.node, emit=_emit_masked(secrets))
+    run_backup_now(infra_dir, node=args.node, emit=_emit_masked(secrets), env=env)
 
 
 def _secret_register_counter(secrets: dict[str, str]) -> Callable[[str], None]:
@@ -443,7 +503,7 @@ def _secret_register_counter(secrets: dict[str, str]) -> Callable[[str], None]:
     return register
 
 
-def _ci_setup(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+def _ci_setup(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env: str | None) -> None:
     # `_emit_masked`, not `_emit_plain`: from the moment `register_secret`
     # fires, this command HOLDS the project's private deploy key. Nothing it
     # prints today can carry it, so this is belt-and-braces -- but the same
@@ -454,10 +514,11 @@ def _ci_setup(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]
         rotate=args.rotate,
         emit=_emit_masked(secrets),
         register_secret=_secret_register_counter(secrets),
+        env=env,
     )
 
 
-def _deploy_key(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+def _deploy_key(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env: str | None) -> None:
     if args.deploy_key_command == "init":
         # Masked for the same reason as `ci-setup` above: this is the
         # command that GENERATES the private deploy key. `show-pub` below
@@ -467,9 +528,10 @@ def _deploy_key(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, st
             rotate=args.rotate,
             emit=_emit_masked(secrets),
             register_secret=_secret_register_counter(secrets),
+            env=env,
         )
     elif args.deploy_key_command == "show-pub":
-        deploy_key_show_pub(infra_dir, emit=_emit_plain)
+        deploy_key_show_pub(infra_dir, emit=_emit_plain, env=env)
     else:
         # deploy_key_sub is required=True, so this is unreachable in
         # practice -- an explicit branch beats a bare `else` doing nothing.
@@ -479,21 +541,22 @@ def _deploy_key(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, st
         )
 
 
-def _secrets(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str]) -> None:
+def _secrets(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env: str | None) -> None:
     register_one = _secret_register_counter(secrets)
+    file = _secrets_file_for(infra_dir, env)
 
     def register_secret(_key: str, value: str) -> None:
         register_one(value)
 
     if args.secrets_command == "keys":
-        for name in list_key_names(infra_dir):
+        for name in list_key_names(infra_dir, file=file):
             _emit_plain(name)
     elif args.secrets_command == "set":
-        set_key(infra_dir, args.key, emit=_emit_plain, register_secret=register_secret)
+        set_key(infra_dir, args.key, emit=_emit_plain, register_secret=register_secret, file=file)
     elif args.secrets_command == "unset":
-        unset_key(infra_dir, args.key, emit=_emit_plain, register_secret=register_secret)
+        unset_key(infra_dir, args.key, emit=_emit_plain, register_secret=register_secret, file=file)
     elif args.secrets_command == "edit":
-        edit_key(infra_dir, args.key, emit=_emit_plain, register_secret=register_secret)
+        edit_key(infra_dir, args.key, emit=_emit_plain, register_secret=register_secret, file=file)
     else:
         # secrets_sub is required=True, so this is unreachable in practice --
         # an explicit branch beats a bare `else` silently doing nothing.

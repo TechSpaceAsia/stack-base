@@ -29,9 +29,13 @@ from stackbase.errors import StackError
 from stackbase.ramdir import private_ram_dir
 from stackbase.reconcile import validate_app_env
 from stackbase.secrets import (
-    DEPLOY_FILE,
     DEPLOY_KEY_NAME,
+    SECRETS_FILE,
+    SecretsFile,
     check_recipients_superset,
+    deploy_file,
+    deploy_pub_name,
+    secrets_file,
     load_secrets,
     read_recipients,
     register_private_key,
@@ -101,9 +105,13 @@ def _noop_register(_key: str, _value: str) -> None:
     pass
 
 
-def list_key_names(infra_dir: Path) -> list[str]:
-    """Every key currently in secrets.age, sorted. Names only -- never values."""
-    secrets = load_secrets(infra_dir)
+def list_key_names(infra_dir: Path, *, file: SecretsFile = SECRETS_FILE) -> list[str]:
+    """Every key currently in the secrets file, sorted. Names only -- never values.
+
+    `file` is the environment's secrets file (`secrets_file(env)`); every
+    command here defaults to the single-environment `secrets.age`.
+    """
+    secrets = load_secrets(infra_dir, file=file)
     return sorted(secrets)
 
 
@@ -114,6 +122,7 @@ def set_key(
     stdin: Any = None,
     emit: Callable[[str], None] = print,
     register_secret: Callable[[str, str], None] = _noop_register,
+    file: SecretsFile = SECRETS_FILE,
 ) -> None:
     """Set `key`'s value, read whole from `stdin` (defaults to `sys.stdin`).
 
@@ -143,7 +152,7 @@ def set_key(
         value = value.decode("utf-8")
     register_secret(key, value)
 
-    secrets = load_secrets(infra_dir)
+    secrets = load_secrets(infra_dir, file=file)
     for existing_key, existing_value in secrets.items():
         register_secret(existing_key, existing_value)
 
@@ -152,7 +161,7 @@ def set_key(
         register_secret(key, value)
 
     secrets[key] = value
-    save_secrets(infra_dir, secrets)
+    save_secrets(infra_dir, secrets, file=file)
     emit(key)
 
 
@@ -162,6 +171,7 @@ def unset_key(
     *,
     emit: Callable[[str], None] = print,
     register_secret: Callable[[str, str], None] = _noop_register,
+    file: SecretsFile = SECRETS_FILE,
 ) -> None:
     """Remove `key`. Refuses the required token key outright.
 
@@ -176,7 +186,7 @@ def unset_key(
             f"set a new value instead of unsetting it: ./infra/up secrets set {key}",
         )
 
-    secrets = load_secrets(infra_dir)
+    secrets = load_secrets(infra_dir, file=file)
     for existing_key, existing_value in secrets.items():
         register_secret(existing_key, existing_value)
 
@@ -185,7 +195,7 @@ def unset_key(
         return
 
     del secrets[key]
-    save_secrets(infra_dir, secrets)
+    save_secrets(infra_dir, secrets, file=file)
     emit(f"{key}: removed")
 
 
@@ -196,6 +206,7 @@ def edit_key(
     runner: Any = subprocess.run,
     emit: Callable[[str], None] = print,
     register_secret: Callable[[str, str], None] = _noop_register,
+    file: SecretsFile = SECRETS_FILE,
 ) -> None:
     """Edit `key`'s value in `$VISUAL`/`$EDITOR`/`vi`, via a RAM-only scratch file.
 
@@ -211,7 +222,7 @@ def edit_key(
     back -- before it is validated or saved.
     """
     _validate_key_name(key)
-    secrets = load_secrets(infra_dir)
+    secrets = load_secrets(infra_dir, file=file)
     for existing_key, existing_value in secrets.items():
         register_secret(existing_key, existing_value)
     original = secrets.get(key, "")
@@ -251,7 +262,7 @@ def edit_key(
         register_secret(key, edited)
 
     secrets[key] = edited
-    save_secrets(infra_dir, secrets)
+    save_secrets(infra_dir, secrets, file=file)
     emit(f"{key}: saved")
 
 
@@ -273,8 +284,14 @@ def deploy_key_init(
     runner: Any = subprocess.run,
     emit: Callable[[str], None] = print,
     register_secret: Callable[[str], None] = _noop_register_value,
+    env: str | None = None,
 ) -> None:
     """Generate the project's ONE SSH deploy key: `deploy.age` + `keys/deploy.pub`.
+
+    With environments there is one per environment (`env`):
+    `deploy.<env>.age` + `keys/deploy.<env>.pub`, encrypted to
+    `deploy-recipients.<env>.txt` when it exists, else `deploy-recipients.txt`.
+    Only that environment's servers trust it.
 
     The private half is generated inside `private_ram_dir()` (never a real
     disk), encrypted straight into `infra/deploy.age` against
@@ -292,17 +309,21 @@ def deploy_key_init(
     it is read, before anything else can echo it.
     """
     cfg = load_config(infra_dir)
-    deploy_path = infra_dir / DEPLOY_FILE.name
-    pub_path = infra_dir / "keys" / DEPLOY_PUB_FILENAME
+    environment = cfg.env(env)
+    file = deploy_file(environment)
+    env_flag = f" --env {env}" if env else ""
+    pub_name = deploy_pub_name(env)
+    deploy_path = infra_dir / file.name
+    pub_path = infra_dir / "keys" / pub_name
 
     if deploy_path.exists() and not rotate:
         raise StackError(
             f"{deploy_path} already exists",
             "pass --rotate to replace it -- the old key keeps working on the servers until you "
-            "commit the new infra/keys/deploy.pub and run ./infra/up",
+            f"commit the new infra/keys/{pub_name} and run ./infra/up{env_flag}",
         )
 
-    recipients_path = infra_dir / DEPLOY_FILE.recipients_name
+    recipients_path = file.recipients_path(infra_dir)
     if not recipients_path.exists():
         raise StackError(
             f"{recipients_path} not found",
@@ -321,7 +342,7 @@ def deploy_key_init(
         )
     # Checked BEFORE ssh-keygen runs: a key encrypted to a list that has
     # already drifted would lock an admin out the moment it is committed.
-    check_recipients_superset(infra_dir)
+    check_recipients_superset(infra_dir, secrets_file(environment), file)
 
     with private_ram_dir() as ramdir:
         key_path = ramdir / "deploy_key"
@@ -348,7 +369,7 @@ def deploy_key_init(
         register_private_key(private_key, register_secret)
         public_key = pub_key_path.read_text(encoding="utf-8").strip() + "\n"
 
-        save_secrets(infra_dir, {DEPLOY_KEY_NAME: private_key}, file=DEPLOY_FILE)
+        save_secrets(infra_dir, {DEPLOY_KEY_NAME: private_key}, file=file)
 
     # Past this point the RAM directory (and the private key it held) is
     # gone -- only the PUBLIC key is still in hand.
@@ -358,18 +379,25 @@ def deploy_key_init(
     emit(f"project deploy key {action}: {deploy_path} (encrypted) and {pub_path} (public).")
     emit("Next steps:")
     emit(f"  1. git add {deploy_path} {pub_path} && git commit -m 'deploy: {action} the project deploy key'")
-    emit("  2. ./infra/up                 # installs the key on every server")
-    emit("  3. ./infra/up ci-setup        # only if GitHub Actions deploys this project")
+    if env:
+        emit(f"  2. ./infra/up --env {env}     # installs the key on every {env} server")
+        emit(f"  3. ./infra/up --env {env} ci-setup   # only if GitHub Actions deploys this project")
+    else:
+        emit("  2. ./infra/up                 # installs the key on every server")
+        emit("  3. ./infra/up ci-setup        # only if GitHub Actions deploys this project")
     if rotate:
         emit("  Deploys using the OLD key (CI, and any build host) FAIL until steps 1-3 are done.")
 
 
-def deploy_key_show_pub(infra_dir: Path, *, emit: Callable[[str], None] = print) -> None:
+def deploy_key_show_pub(
+    infra_dir: Path, *, emit: Callable[[str], None] = print, env: str | None = None
+) -> None:
     """Print the deploy key's PUBLIC half -- never touches deploy.age."""
-    pub_path = infra_dir / "keys" / DEPLOY_PUB_FILENAME
+    pub_path = infra_dir / "keys" / deploy_pub_name(env)
     if not pub_path.is_file():
+        env_flag = f"--env {env} " if env else ""
         raise StackError(
             f"{pub_path} not found",
-            "run `./infra/up deploy-key init` first -- it writes the public half there",
+            f"run `./infra/up {env_flag}deploy-key init` first -- it writes the public half there",
         )
     emit(pub_path.read_text(encoding="utf-8").strip())

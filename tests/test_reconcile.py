@@ -918,7 +918,7 @@ class HostnameForTests(unittest.TestCase):
     def test_hostname_for_is_an_fqdn_under_the_project_domain(self) -> None:
         cfg = _config()  # project="acme", domain=_DOMAIN ("acme.example.com")
 
-        self.assertEqual(hostname_for(cfg, "a"), f"acme-a.{_DOMAIN}")
+        self.assertEqual(hostname_for(cfg, cfg.env(None), "a"), f"acme-a.{_DOMAIN}")
 
     def test_matches_the_live_verified_example(self) -> None:
         cfg = StackConfig(
@@ -934,7 +934,7 @@ class HostnameForTests(unittest.TestCase):
             admin_keys={"matt": _KEY_MATT},
         )
 
-        self.assertEqual(hostname_for(cfg, "a"), "stack-demo-a.stack-demo.techspace.asia")
+        self.assertEqual(hostname_for(cfg, cfg.env(None), "a"), "stack-demo-a.stack-demo.techspace.asia")
 
 
 class AdoptionTests(unittest.TestCase):
@@ -953,7 +953,7 @@ class AdoptionTests(unittest.TestCase):
 
     def test_a_single_hostname_match_is_adopted_instead_of_purchased(self) -> None:
         cfg = _config(nodes={"a": Node(name="a", role="primary", vps_id=None)})
-        hostname = hostname_for(cfg, "a")
+        hostname = hostname_for(cfg, cfg.env(None), "a")
         with FakeServer() as server:
             server.script("GET", "/api/vps/v1/virtual-machines", 200, [self._vm_for_adoption(hostname=hostname)])
             server.script("GET", "/api/vps/v1/virtual-machines/9999", 200, self._vm_for_adoption(hostname=hostname))
@@ -975,7 +975,7 @@ class AdoptionTests(unittest.TestCase):
 
     def test_more_than_one_match_raises_telling_the_operator_to_set_vps_id(self) -> None:
         cfg = _config(nodes={"a": Node(name="a", role="primary", vps_id=None)})
-        hostname = hostname_for(cfg, "a")
+        hostname = hostname_for(cfg, cfg.env(None), "a")
         with FakeServer() as server:
             server.script(
                 "GET",
@@ -994,7 +994,7 @@ class AdoptionTests(unittest.TestCase):
 
     def test_adopt_step_records_the_vps_id_and_prints_a_loud_line(self) -> None:
         with Infra() as infra_dir:
-            hostname = hostname_for(_config(), "a")
+            hostname = hostname_for(_config(), _config().env(None), "a")
             observed = replace(
                 _observed_fresh(),
                 nodes={"a": ObservedNode(vps_id=4321, state="initial", actions_lock="unlocked", adopted=True)},
@@ -1059,7 +1059,7 @@ class PendingPurchaseTests(unittest.TestCase):
             self.assertIsNone(ctx.state.nodes["a"].vps_id)
             self.assertEqual(ctx.state.nodes["a"].pending_subscription_id, self._SUB)
             # On disk too: the marker is what stops the next run buying again.
-            self.assertEqual(load_state(infra_dir).nodes["a"].pending_subscription_id, self._SUB)
+            self.assertEqual(load_state(infra_dir, _config().env(None)).nodes["a"].pending_subscription_id, self._SUB)
 
     def test_adopts_by_subscription_id_ignoring_hostname(self) -> None:
         cfg = _config(nodes={"a": Node(name="a", role="primary", vps_id=None)})
@@ -1070,7 +1070,7 @@ class PendingPurchaseTests(unittest.TestCase):
                 [
                     self._vm(hostname="srv2081685.hstgr.cloud", subscription_id=self._SUB),
                     # Same name we would have chosen, but someone else's subscription: must not match.
-                    self._vm(hostname=hostname_for(cfg, "a"), subscription_id="other", vps_id=7),
+                    self._vm(hostname=hostname_for(cfg, cfg.env(None), "a"), subscription_id="other", vps_id=7),
                 ],
             )
             hostinger = HostingerClient("htok", base_url=server.url)
@@ -1090,7 +1090,7 @@ class PendingPurchaseTests(unittest.TestCase):
         state = self._pending_state()
         with FakeServer() as server:
             # A VM under the expected hostname exists, but its subscription differs.
-            self._script_observe(server, [self._vm(hostname=hostname_for(cfg, "a"), subscription_id="other")])
+            self._script_observe(server, [self._vm(hostname=hostname_for(cfg, cfg.env(None), "a"), subscription_id="other")])
             hostinger = HostingerClient("htok", base_url=server.url)
             cloudflare = CloudflareClient("ctok", base_url=server.url)
 
@@ -1127,7 +1127,7 @@ class PendingPurchaseTests(unittest.TestCase):
 
             self.assertEqual(ctx.state.nodes["a"].vps_id, 2081685)
             self.assertIsNone(ctx.state.nodes["a"].pending_subscription_id)
-            self.assertIsNone(load_state(infra_dir).nodes["a"].pending_subscription_id)
+            self.assertIsNone(load_state(infra_dir, _config().env(None)).nodes["a"].pending_subscription_id)
 
 
 class CloudflareIpRangeWarningTests(unittest.TestCase):
@@ -1283,6 +1283,7 @@ def _context(
     stackbase_src: str | None = None,
     isatty: bool = True,
     secrets: dict[str, str] | None = None,
+    env: Any = None,
 ) -> tuple[Context, list[str]]:
     lines: list[str] = []
     base_url = server.url if server is not None else "http://127.0.0.1:1"
@@ -1301,6 +1302,7 @@ def _context(
         connector=connector or FakeConnector(),
         out=lines.append,
         isatty=lambda: isatty,
+        env=env,
     )
     return ctx, lines
 
@@ -1393,7 +1395,7 @@ class PurchaseGuardTests(unittest.TestCase):
             body = next(r["body"] for r in server.requests if r["path"] == "/api/vps/v1/virtual-machines")
             self.assertEqual(body["setup"]["public_key"], {"name": "matt", "key": _KEY_MATT})
             self.assertEqual(body["item_id"], "kvm1-price-item")
-            self.assertEqual(body["setup"]["hostname"], hostname_for(_config(), "a"))
+            self.assertEqual(body["setup"]["hostname"], hostname_for(_config(), _config().env(None), "a"))
             attach = next(r for r in server.requests if r["path"] == "/api/vps/v1/public-keys/attach/4242")
             self.assertEqual(attach["body"], {"ids": [12]})
 
@@ -1586,7 +1588,7 @@ class OriginCertTests(unittest.TestCase):
             runner = self._runner()
             ctx, _ = _context(infra_dir, server=server, runner=runner)
             saved: list[dict[str, str]] = []
-            with mock.patch("stackbase.steps.save_secrets", lambda _dir, data: saved.append(dict(data))):
+            with mock.patch("stackbase.steps.save_secrets", lambda _dir, data, file: saved.append(dict(data))):
                 apply([Step(Action.ENSURE_ORIGIN_CERT)], ctx, allow_purchase=False)
 
             openssl_calls = [call for call in runner.calls if call["argv"][0] == "openssl"]
@@ -1605,7 +1607,7 @@ class OriginCertTests(unittest.TestCase):
             server.script("POST", "/certificates", 200, _cf({"certificate": _CERT_PEM}))
             ctx, _ = _context(infra_dir, server=server, runner=self._runner())
 
-            def boom(_dir, _data):
+            def boom(_dir, _data, file=None):
                 raise StackError("failed to encrypt secrets to infra/secrets.age", "disk full")
 
             with mock.patch("stackbase.steps.save_secrets", boom):
@@ -1621,7 +1623,7 @@ class OriginCertTests(unittest.TestCase):
         with Infra() as infra_dir, FakeServer() as server:
             server.script("POST", "/certificates", 200, _cf({"certificate": _CERT_PEM}))
             ctx, _ = _context(infra_dir, server=server, runner=self._runner())
-            with mock.patch("stackbase.steps.save_secrets", lambda _dir, _data: None):
+            with mock.patch("stackbase.steps.save_secrets", lambda _dir, _data, file: None):
                 apply([Step(Action.ENSURE_ORIGIN_CERT)], ctx, allow_purchase=False)
 
             body = next(r["body"] for r in server.requests if r["path"] == "/certificates")
@@ -2278,7 +2280,7 @@ class EnsureAppEnvTests(unittest.TestCase):
             from stackbase.config import load_state, save_state
 
             state = StackState(nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)})
-            save_state(infra_dir, state)  # seed the on-disk state a real run would already have
+            save_state(infra_dir, _config().env(None), state)  # seed the on-disk state a real run would already have
             ctx, _ = self._ctx(
                 infra_dir,
                 app_env=self._APP_ENV_RAW,
@@ -2289,7 +2291,7 @@ class EnsureAppEnvTests(unittest.TestCase):
             with self.assertRaises(StackError):
                 apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
 
-            saved = load_state(infra_dir)
+            saved = load_state(infra_dir, _config().env(None))
             self.assertIsNone(saved.nodes["a"].app_env_sha)
             # Old behaviour (pre-B2) set the digest in ctx.state BEFORE the
             # restart ran, so it stayed set here even though the restart
@@ -2439,14 +2441,14 @@ class EnsureBackupEnvTests(unittest.TestCase):
             from stackbase.config import load_state, save_state
 
             state = StackState(nodes={"a": NodeState(vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True)})
-            save_state(infra_dir, state)
+            save_state(infra_dir, _config().env(None), state)
             ctx, _ = self._ctx(infra_dir, runner=self._runner(failing=self._MV_CMD), state=state)
 
             with self.assertRaises(StackError):
                 apply([Step(Action.ENSURE_BACKUP_ENV, "a")], ctx, allow_purchase=False)
 
             self.assertIsNone(ctx.state.nodes["a"].backup_env_sha)
-            self.assertIsNone(load_state(infra_dir).nodes["a"].backup_env_sha)
+            self.assertIsNone(load_state(infra_dir, _config().env(None)).nodes["a"].backup_env_sha)
 
     def test_incomplete_credentials_are_refused_before_any_ssh_call(self) -> None:
         """`plan()` never emits this step without all three keys, so reaching
@@ -2680,7 +2682,7 @@ class ResumeTests(unittest.TestCase):
 
             from stackbase.config import load_state
 
-            saved = load_state(infra_dir)
+            saved = load_state(infra_dir, _config().env(None))
             self.assertEqual(saved.hostinger.ssh_key_ids, {"matt": 11, "kim": 12})
             self.assertIsNone(saved.nodes.get("a", NodeState()).ipv4)
 
@@ -3205,6 +3207,219 @@ class LegacyPlanGoldenTests(unittest.TestCase):
             transcript = _legacy_plan_transcript(Path(tmp))
 
         self.assertEqual(transcript, _GOLDEN_PLAN.read_text(encoding="utf-8"))
+
+
+
+# --------------------------------------------------------------------------
+# Environments
+# --------------------------------------------------------------------------
+
+
+def _envs_config() -> StackConfig:
+    """tests/fixtures/stack-envs.toml, loaded (staging: node a; production: a, b)."""
+    from stackbase.config import load_config
+
+    with TemporaryDirectory() as tmp:
+        infra_dir = Path(tmp)
+        (infra_dir / "keys").mkdir()
+        (infra_dir / "keys" / "matt.pub").write_text(_KEY_MATT + "\n", encoding="utf-8")
+        shutil.copy(_FIXTURES / "stack-envs.toml", infra_dir / "stack.toml")
+        return load_config(infra_dir)
+
+
+class EnvironmentNamingTests(unittest.TestCase):
+    def test_hostname_uses_env_domain(self) -> None:
+        cfg = _envs_config()
+
+        self.assertEqual(hostname_for(cfg, cfg.env("staging"), "a"), "a.staging.acme.example.com")
+        self.assertEqual(hostname_for(cfg, cfg.env("production"), "b"), "b.acme.example.com")
+        # A single-environment project keeps the name its VMs already carry.
+        legacy = _config()
+        self.assertEqual(hostname_for(legacy, legacy.env(None), "a"), f"acme-a.{_DOMAIN}")
+
+    def test_nixos_name(self) -> None:
+        from stackbase.reconcile import nixos_name
+
+        cfg = _envs_config()
+        self.assertEqual(nixos_name(cfg.env("staging"), "a"), "staging-a")
+        self.assertEqual(nixos_name(cfg.env("production"), "b"), "production-b")
+        self.assertEqual(nixos_name(_config().env(None), "a"), "a")
+
+    def test_each_environment_has_its_own_firewall(self) -> None:
+        cfg = _envs_config()
+        self.assertEqual(firewall_name(cfg, cfg.env("staging")), "stackbase-acme-staging")
+        self.assertEqual(firewall_name(cfg, cfg.env("production")), "stackbase-acme-production")
+        self.assertEqual(firewall_name(_config()), "stackbase-acme")
+
+    def test_plan_without_an_environment_refuses_a_multi_env_config(self) -> None:
+        cfg = _envs_config()
+        with self.assertRaises(StackError) as caught:
+            plan(cfg, StackState(), _observed_fresh())
+        self.assertIn("--env", str(caught.exception))
+
+    def test_plan_looks_for_hardware_under_the_env_node_name(self) -> None:
+        cfg = _envs_config()
+        staging = cfg.env("staging")
+        state = _converged_state()
+        state.nodes["a"].vps_id = 1111111
+        base = dict(
+            nodes={"a": ObservedNode(vps_id=1111111, state="running", actions_lock="unlocked", ipv4=_IPV4,
+                                     firewall_group_id=1)},
+            public_key_ids={"matt": 1},
+            firewall_id=1,
+            firewall_rules_match=True,
+            zone_id="zone1",
+            record_id="record1",
+            record_matches=True,
+        )
+        state.hostinger.ssh_key_ids = {"matt": 1}
+        state.hostinger.firewall_id = 1
+        state.cloudflare.zone_id = "zone1"
+        state.cloudflare.record_id = "record1"
+
+        wrong = Observed(local=_local(has_origin_cert=True, pinned=(_IPV4,), captured=("a",)), **base)
+        right = Observed(local=_local(has_origin_cert=True, pinned=(_IPV4,), captured=("staging-a",)), **base)
+
+        self.assertIn(Step(Action.CAPTURE_HARDWARE, "a"), plan(cfg, state, wrong, env=staging))
+        self.assertEqual(plan(cfg, state, right, env=staging), [])
+
+
+class EnvironmentStepTests(unittest.TestCase):
+    def _env_ctx(self, infra_dir: Path, **kwargs):
+        cfg = _envs_config()
+        return _context(infra_dir, cfg=cfg, env=cfg.env("staging"), **kwargs)
+
+    def test_context_defaults_to_the_implicit_environment(self) -> None:
+        with Infra() as infra_dir:
+            ctx, _ = _context(infra_dir)
+            self.assertEqual(ctx.env.name, "")
+            self.assertEqual(ctx.secrets_file.name, "secrets.age")
+
+    def test_capture_hardware_writes_under_the_env_node_name(self) -> None:
+        def handler(argv, kwargs):
+            joined = " ".join(argv)
+            if "/etc/nixos" in joined and "basename" in joined:
+                return _cp(argv, stdout="hardware-configuration.nix\n")
+            if "cat --" in joined:
+                return _cp(argv, stdout=b'{ fileSystems."/" = {}; }\n')
+            return None
+
+        with Infra() as infra_dir:
+            state = StackState(nodes={"a": NodeState(vps_id=1, ipv4=_IPV4, host_key_pinned=True)})
+            ctx, lines = self._env_ctx(infra_dir, state=state, runner=FakeRunner(handler=handler))
+
+            apply([Step(Action.CAPTURE_HARDWARE, "a")], ctx, allow_purchase=False)
+
+            self.assertTrue((infra_dir / "nodes" / "staging-a" / "hardware-configuration.nix").exists())
+            self.assertFalse((infra_dir / "nodes" / "a").exists())
+            self.assertTrue((infra_dir / "stack.state.staging.json").exists())
+            self.assertFalse((infra_dir / "stack.state.json").exists())
+            self.assertTrue(any("infra/nodes/staging-a/" in line for line in lines))
+
+    def test_rebuild_targets_the_env_flake_attribute(self) -> None:
+        popen = FakePopen()
+        popen.script(0, "")
+        popen.script(0, "")
+        with Infra() as infra_dir:
+            state = StackState(nodes={"a": NodeState(vps_id=1, ipv4=_IPV4, host_key_pinned=True)})
+            ctx, _ = self._env_ctx(
+                infra_dir, state=state, popen=popen, runner=FakeRunner(default=_cp(["ssh"], stdout=""))
+            )
+
+            apply([Step(Action.REBUILD, "a")], ctx, allow_purchase=False)
+
+            self.assertTrue(all("/etc/nixos/stack#staging-a" in command for command in popen.argv_strings()))
+
+    def test_the_origin_certificate_is_for_the_env_domain_and_saved_to_its_secrets(self) -> None:
+        openssl_out = (
+            "-----BEGIN PRIVATE KEY-----\nMIIkey\n-----END PRIVATE KEY-----\n"
+            "-----BEGIN CERTIFICATE REQUEST-----\nMIIcsr\n-----END CERTIFICATE REQUEST-----\n"
+        )
+        with Infra() as infra_dir, FakeServer() as server:
+            server.script(
+                "POST", "/certificates", 200,
+                {"success": True, "errors": [], "result": {"certificate": _CERT_PEM}},
+            )
+            ctx, _ = self._env_ctx(infra_dir, server=server, runner=FakeRunner(default=_cp(["openssl"], stdout=openssl_out)))
+
+            with mock.patch("stackbase.steps.save_secrets") as save:
+                apply([Step(Action.ENSURE_ORIGIN_CERT)], ctx, allow_purchase=False)
+
+            self.assertEqual(server.requests[0]["body"]["hostnames"], ["staging.acme.example.com"])
+            self.assertEqual(save.call_args.kwargs["file"].name, "secrets.staging.age")
+
+
+def _env_plan_transcript(root: Path) -> tuple[str, list[str], list[Any]]:
+    """`--env production up --plan` for tests/fixtures/stack-envs.toml."""
+    import contextlib
+    import io
+
+    from stackbase.__main__ import main
+
+    infra_dir = root / "infra"
+    (infra_dir / "keys").mkdir(parents=True)
+    shutil.copy(_FIXTURES / "stack-envs.toml", infra_dir / "stack.toml")
+    (infra_dir / "keys" / "matt.pub").write_text(_KEY_MATT + "\n", encoding="utf-8")
+    (infra_dir / "flake.lock").write_text(json.dumps(_LOCK), encoding="utf-8")
+    secrets = {"hostinger_token": "h-token", "cloudflare_token": "c-token"}
+    meta = {"current_page": 1, "per_page": 20, "total": 0}
+    page = {"page": 1, "per_page": 20, "count": 1, "total_count": 1, "total_pages": 1}
+    domain = "acme.example.com"
+    loads: list[Any] = []
+
+    def fake_load_secrets(_infra_dir, file=None):
+        loads.append(file)
+        return dict(secrets)
+
+    with FakeServer() as server:
+        server.script(
+            "GET", "/api/vps/v1/virtual-machines", 200,
+            [{"id": 777, "hostname": "acme-b.acme.example.com"}, {"id": 778, "hostname": "b.acme.example.com"}],
+        )
+        for vps_id, state in ((2222222, "running"), (778, "initial")):
+            server.script(
+                "GET", f"/api/vps/v1/virtual-machines/{vps_id}", 200,
+                {"id": vps_id, "state": state, "actions_lock": "unlocked", "firewall_group_id": None,
+                 "ipv4": [{"id": 1, "address": _IPV4}], "ipv6": None},
+            )
+        server.script("GET", "/api/vps/v1/public-keys?page=1", 200, {"data": [], "meta": meta})
+        server.script("GET", "/api/vps/v1/firewall?page=1", 200, {"data": [], "meta": meta})
+        server.script(
+            "GET", f"/zones?name={domain}&page=1", 200,
+            {"success": True, "errors": [], "result": [{"id": "zone1", "name": domain}], "result_info": page},
+        )
+        server.script(
+            "GET", f"/zones/zone1/dns_records?type=A&name={domain}&page=1", 200,
+            {"success": True, "errors": [], "result": [], "result_info": page},
+        )
+        stdout = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {}, clear=False),
+            mock.patch("stackbase.__main__.load_secrets", fake_load_secrets),
+            mock.patch("stackbase.__main__.HostingerClient", lambda token: HostingerClient(token, base_url=server.url)),
+            mock.patch("stackbase.__main__.CloudflareClient", lambda token: CloudflareClient(token, base_url=server.url)),
+            mock.patch("stackbase.reconcile._cloudflare_ips_path", return_value=root / "no-such-file.nix"),
+            contextlib.redirect_stdout(stdout),
+        ):
+            os.environ.pop("STACKBASE_SRC", None)
+            main(["--infra-dir", str(infra_dir), "--env", "production", "up", "--plan"])
+        requests = [f"{request['method']} {request['path']}" for request in server.requests]
+
+    return stdout.getvalue(), requests, loads
+
+
+class EnvironmentPlanTests(unittest.TestCase):
+    def test_env_plan_uses_its_domain_nodes_hostnames_and_secrets(self) -> None:
+        with TemporaryDirectory() as tmp:
+            output, requests, loads = _env_plan_transcript(Path(tmp))
+
+        self.assertIn("would do in production:", output)
+        # b is adopted by its environment hostname (b.<env domain>), not the legacy one.
+        self.assertIn("GET /api/vps/v1/virtual-machines/778", requests)
+        self.assertNotIn("GET /api/vps/v1/virtual-machines/777", requests)
+        self.assertIn("node b: adopting an existing virtual machine", output)
+        self.assertIn("GET /zones?name=acme.example.com&page=1", requests)
+        self.assertEqual([file.name for file in loads], ["secrets.production.age"])
 
 
 if __name__ == "__main__":

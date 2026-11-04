@@ -165,28 +165,35 @@ def run_backup_now(
     runner: Any = subprocess.run,
     popen: Any = subprocess.Popen,
     emit: Callable[[str], None] = print,
+    env: str | None = None,
 ) -> None:
     """Run the backup unit on every selected node now, then list the bucket.
+
+    `env` names the environment (required once stack.toml has
+    `[environments]`): its nodes, its state, its bucket.
 
     Streams both commands so a multi-minute dump does not look like a hang.
     Stops at the first node whose unit fails -- an unnoticed failing backup
     is the whole thing this command exists to prevent.
     """
     cfg = load_config(infra_dir)
-    state = load_state(infra_dir)
+    environment = cfg.env(env)
+    state = load_state(infra_dir, environment)
+    backups = environment.backups
+    env_flag = f" --env {env}" if env else ""
 
-    if not cfg.backups.bucket:
+    if not backups.bucket:
         raise StackError(
             "this project has no backup bucket",
             'add a [backups] section to stack.toml with bucket = "<name>" and run `./infra/up` first',
         )
 
     if node is None:
-        names = list(cfg.nodes)
-    elif node in cfg.nodes:
+        names = list(environment.nodes)
+    elif node in environment.nodes:
         names = [node]
     else:
-        known = ", ".join(cfg.nodes) or "none"
+        known = ", ".join(environment.nodes) or "none"
         raise StackError(f"there is no node called '{node}' in stack.toml", f"known nodes: {known}")
 
     for name in names:
@@ -211,10 +218,10 @@ def run_backup_now(
             # message (bad credentials, missing recipients file, ...) is.
             raise StackError(
                 f"the backup unit failed on node {name} (exit {returncode})",
-                f"read the node's own log: ./infra/up ssh {name} -- journalctl -u stackbase-backup -n 50",
+                f"read the node's own log: ./infra/up{env_flag} ssh {name} -- journalctl -u stackbase-backup -n 50",
             )
 
-        emit(f"→ node {name}: contents of backup:{cfg.backups.bucket}")
+        emit(f"→ node {name}: contents of backup:{backups.bucket}")
         returncode, tail = ssh.run_stream(BACKUP_LS_COMMAND, emit=emit, check=False)
         if returncode != 0:
             raise StackError(
