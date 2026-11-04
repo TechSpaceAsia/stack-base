@@ -33,6 +33,8 @@
         self.nixosModules.logs
         # Same shape: off until stack.toml's [mesh] table says enabled = true.
         self.nixosModules.mesh
+        # Same shape: off until stack.toml's [alerts] table names recipients.
+        self.nixosModules.alerts
       ];
     in
     {
@@ -44,6 +46,7 @@
       nixosModules.backups = import ./nixos/backups.nix;
       nixosModules.logs = import ./nixos/logs.nix;
       nixosModules.mesh = import ./nixos/mesh.nix { inherit nixpkgs-warp; };
+      nixosModules.alerts = import ./nixos/alerts.nix;
       nixosModules.default = { imports = baseModules; };
 
       # `provider` selects the module that reproduces one hosting provider's
@@ -91,6 +94,7 @@
         vm = import ./tests/vm.nix { inherit self pkgs lib; };
         vm-deploy = import ./tests/vm-deploy.nix { inherit self pkgs lib; };
         vm-logs = import ./tests/vm-logs.nix { inherit self pkgs lib; };
+        vm-alerts = import ./tests/vm-alerts.nix { inherit self pkgs lib; };
       };
     };
 }

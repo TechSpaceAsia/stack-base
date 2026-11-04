@@ -131,6 +131,7 @@ class Action(Enum):
     ENSURE_APP_ENV = "ensure_app_env"
     ENSURE_BACKUP_ENV = "ensure_backup_env"
     ENSURE_LOGS_ENV = "ensure_logs_env"
+    ENSURE_ALERT_ENV = "ensure_alert_env"
     ENSURE_MESH = "ensure_mesh"
     UPSERT_DNS = "upsert_dns"
     ENSURE_R2_BUCKET = "ensure_r2_bucket"
@@ -156,6 +157,7 @@ _DOING: dict[Action, str] = {
     Action.ENSURE_APP_ENV: "updating the application's environment file",
     Action.ENSURE_BACKUP_ENV: "updating the backup credentials on the server",
     Action.ENSURE_LOGS_ENV: "updating the log shipping credentials on the server",
+    Action.ENSURE_ALERT_ENV: "updating the alert mail credentials on the server",
     Action.ENSURE_MESH: "joining Cloudflare Mesh",
     Action.UPSERT_DNS: "pointing the domain at the server in Cloudflare",
     Action.ENSURE_R2_BUCKET: "creating the R2 bucket",
@@ -256,6 +258,10 @@ class Local:
     # r2_endpoint), or None when any is missing. `plan()` only ever looks at
     # it for an environment whose logs are on -- see `_needs_logs_env`.
     logs_env_sha: str | None = None
+    # sha256 of the rendered alert.env (the environment's smtp_* keys), or
+    # None when any is missing. Only rendered for an environment whose
+    # [alerts] names recipients -- see `_needs_alert_env`.
+    alert_env_sha: str | None = None
 
 
 def local_facts(
@@ -274,6 +280,7 @@ def local_facts(
     # this module, so importing it at the top would be a cycle -- the same
     # trick `apply()` already uses for `stackbase.steps`.
     from stackbase.backups import backup_env_content, backup_env_digest
+    from stackbase.alerts import alert_env_content, alert_env_digest, alerts_enabled
     from stackbase.logs import logs_enabled, logs_env_content, logs_env_digest
 
     app_env_raw = secrets.get("app_env")
@@ -282,6 +289,8 @@ def local_facts(
     # and rendered: a project without [logs] is untouched by whatever odd
     # value such a key might hold.
     logs_env = logs_env_content(secrets) if env is not None and logs_enabled(env.logs) else None
+    # Same rule for alerts: no [alerts], no smtp_* validation at all.
+    alert_env = alert_env_content(secrets) if env is not None and alerts_enabled(env.alerts) else None
     return Local(
         desired_rev=compute_rev(infra_dir, stackbase_src=stackbase_src),
         has_origin_cert=bool(secrets.get("origin_cert")) and bool(secrets.get("origin_key")),
@@ -291,6 +300,7 @@ def local_facts(
         app_env_sha=app_env_digest(validate_app_env(app_env_raw)) if app_env_raw else None,
         backup_env_sha=backup_env_digest(backup_env) if backup_env else None,
         logs_env_sha=logs_env_digest(logs_env) if logs_env else None,
+        alert_env_sha=alert_env_digest(alert_env) if alert_env else None,
     )
 
 
@@ -1105,6 +1115,10 @@ def plan(cfg: StackConfig, state: StackState, observed: Observed, *, env: Enviro
         # provides. No [logs] (or an opt-out) plans nothing and removes nothing.
         if _needs_logs_env(state, observed, env, name):
             steps.append(Step(Action.ENSURE_LOGS_ENV, name))
+        # Before the rebuild for the same reason: nullmailer's remotes are
+        # rendered from alert.env as it starts, and the rebuild starts it.
+        if _needs_alert_env(state, observed, env, name):
+            steps.append(Step(Action.ENSURE_ALERT_ENV, name))
         if _needs_deploy(state, observed, name, cert_pending):
             steps.append(Step(Action.PUSH_CONFIG, name))
             steps.append(Step(Action.REBUILD, name))
@@ -1262,6 +1276,19 @@ def _needs_logs_env(state: StackState, observed: Observed, env: Environment, nam
         return False
     node_state = state.nodes.get(name) or NodeState()
     return node_state.logs_env_sha != desired
+
+
+def _needs_alert_env(state: StackState, observed: Observed, env: Environment, name: str) -> bool:
+    """True when [alerts] names recipients and the rendered alert.env differs
+    from what this node last had pushed. No [alerts] plans nothing, so a
+    project without it plans exactly what it always did."""
+    from stackbase.alerts import alerts_enabled
+
+    desired = observed.local.alert_env_sha
+    if desired is None or not alerts_enabled(env.alerts):
+        return False
+    node_state = state.nodes.get(name) or NodeState()
+    return node_state.alert_env_sha != desired
 
 
 def _dns_converged(state: StackState, observed: Observed) -> bool:

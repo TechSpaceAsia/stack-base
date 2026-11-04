@@ -895,6 +895,10 @@ class NodeState:
     # left out of the state file, so a project without [logs] keeps writing
     # exactly the bytes it always wrote.
     logs_env_sha: str | None = None
+    # sha256 of the alert.env content (the environment's smtp_* keys) most
+    # recently pushed to this node. None until the first push, and left out
+    # of the state file like logs_env_sha.
+    alert_env_sha: str | None = None
     # Set when a purchase answered HTTP 202 (payment still processing): the
     # subscription id the VM-to-be will carry. While set, the node is never
     # purchased again; it is adopted by this id once the VM shows up, and
@@ -959,9 +963,9 @@ def save_state(infra_dir: Path, env: Environment, state: StackState) -> None:
 def _save_state_file(state_path: Path, state: StackState) -> None:
     payload = asdict(state)
     # An unset marker is omitted so a state file that never saw a 202 purchase
-    # (or never shipped logs) is byte-identical to what earlier versions wrote.
+    # (or never shipped logs, or never mailed alerts) is byte-identical to what earlier versions wrote.
     for node in payload["nodes"].values():
-        for key in ("pending_subscription_id", "logs_env_sha"):
+        for key in ("pending_subscription_id", "logs_env_sha", "alert_env_sha"):
             if node.get(key) is None:
                 node.pop(key, None)
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"

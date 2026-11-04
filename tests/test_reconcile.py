@@ -3371,6 +3371,12 @@ def _env_plan_transcript(root: Path) -> tuple[str, list[str], list[Any]]:
         "logs_access_key_id": "LOGSKEY",
         "logs_secret_access_key": "logs-secret",
         "r2_endpoint": "https://acct123.r2.cloudflarestorage.com",
+        # production mails [alerts] to, so `up` refuses to plan without these.
+        "smtp_host": "mail.example.com",
+        "smtp_port": "465",
+        "smtp_user": "production-a@example.com",
+        "smtp_password": "smtp-secret",
+        "smtp_from": "production-a@example.com",
     }
     meta = {"current_page": 1, "per_page": 20, "total": 0}
     page = {"page": 1, "per_page": 20, "count": 1, "total_count": 1, "total_pages": 1}
@@ -3449,6 +3455,10 @@ class EnvironmentPlanTests(unittest.TestCase):
         self.assertIn("node a: updating the log shipping credentials on the server", output)
         self.assertLess(
             output.index("node a: updating the log shipping credentials"), output.index("node a: rebuilding NixOS")
+        )
+        # And the SMTP settings, for the same reason: nullmailer starts on it.
+        self.assertLess(
+            output.index("node a: updating the alert mail credentials"), output.index("node a: rebuilding NixOS")
         )
 
 

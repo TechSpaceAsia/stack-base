@@ -286,7 +286,7 @@ role = "primary"
   characters.
 - **`--env <name>` is required on every command** once `[environments]`
   exists: `up`, `up --plan`, `deploy`, `rollback`, `status`, `ssh`,
-  `backup-now`, `secrets`, `deploy-key` and `ci-setup`. There is no default,
+  `backup-now`, `alert-test`, `secrets`, `deploy-key` and `ci-setup`. There is no default,
   so a forgotten flag fails with the list of environments instead of touching
   production. It goes before or after the command
   (`./infra/up --env staging up --plan`, `./infra/up deploy v1.4.2 --env staging`);
@@ -972,6 +972,92 @@ curl -s http://127.0.0.1:9598/metrics | rg 'vector_component_sent_events_total|v
 has been unreachable for a while; `vector_component_sent_events_total` for
 `r2` should keep rising. Both endpoints listen on 127.0.0.1 only.
 
+## Alerts
+
+With `[alerts]`, **any** service that fails on a server emails the listed
+addresses — stack-base's own units, the app's, nixpkgs' and anything a project
+adds later. Nothing is listed unit by unit, so nothing can be forgotten.
+`alerts.to` may differ per environment.
+
+```toml
+# infra/stack.toml
+[alerts]
+to = ["ops@example.com"]
+
+[environments.staging]
+alerts.to = ["ops@example.com", "servers.acme.staging@example.com"]
+```
+
+The subject says where it happened: `[acme/staging/staging-a] app@blue.service
+failed` (`[acme/a] …` in a project without environments). The body is the
+unit's `systemctl status` and its last 60 journal lines (cut at 64 KiB). Each
+unit mails **at most once every 6 hours**, so a unit that keeps failing does
+not flood anyone.
+
+Mail goes out through **nullmailer**, which queues on the server's disk and
+retries: an alert raised while the relay (or Mesh, on the way to it) is down is
+delivered when it is back, not lost. The relay is your own: stack-base bakes no
+mail server in. Set five secrets per environment and run `up`:
+
+```bash
+SMTP_HOST=<the relay's host name, e.g. mail.example.com>
+SMTP_PORT=465
+SMTP_USER=<this environment's SMTP login>
+SMTP_PASSWORD=<its password>
+SMTP_FROM=<the address alerts come from>
+printf '%s' "$SMTP_HOST" | ./infra/up --env "$ENV" secrets set smtp_host
+printf '%s' "$SMTP_PORT" | ./infra/up --env "$ENV" secrets set smtp_port
+printf '%s' "$SMTP_USER" | ./infra/up --env "$ENV" secrets set smtp_user
+printf '%s' "$SMTP_PASSWORD" | ./infra/up --env "$ENV" secrets set smtp_password
+printf '%s' "$SMTP_FROM" | ./infra/up --env "$ENV" secrets set smtp_from
+./infra/up --env "$ENV"
+```
+
+(Drop `--env "$ENV"` in a project without environments.) The relay is reached
+with implicit TLS (`smtp_port` is normally 465) and `AUTH LOGIN`, and its
+certificate is checked against the server's CA bundle. A login and password are
+letters, digits and `. _ : / + = @ -` only. `up` writes the five values to
+`/var/lib/stackbase/alert.env` (0600, root) before the rebuild that starts the
+mailer; the password never enters the Nix store. With `[alerts]` set and any of
+the five missing, `up` stops before touching anything and names them. Without
+`[alerts]`, `up` works as before and prints one warning at the end of the run:
+nobody would be told about a failure.
+
+**A freshness watchdog** (`stackbase-freshness`, hourly) fails — and so
+mails — when:
+
+- backups are on and the newest successful backup is more than 36 hours old
+  (before the first one, counted from when backups were turned on);
+- logs are on and `vector.service` is not running;
+- Vector's R2 buffer holds more than 256 MiB, meaning R2 has been unreachable
+  for a while;
+- Vector has sent nothing to R2 for 2 hours although new entries came in.
+
+It checks nothing during the first hour after a boot, while Vector and the
+first backup catch up. A check whose feature is off (no `[logs]`,
+`[backups] enabled = false`) is skipped.
+
+**Check it end to end:**
+
+```bash
+./infra/up --env "$ENV" alert-test     # sent — check ops@example.com
+```
+
+It fails a throwaway unit on every server on purpose, waits until each one has
+queued its email, and prints where to look. "Sent" means accepted by
+nullmailer: with the relay down, the mail arrives when it is back. On the
+server (`./infra/up ssh a`):
+
+```bash
+systemctl list-timers stackbase-freshness   # when the watchdog runs next
+journalctl -u 'stackbase-alert@*' -n 20      # what was mailed, or skipped by the 6 h limit
+ls /var/spool/nullmailer/queue               # mail still waiting for the relay
+```
+
+**Not covered:** a unit with `Restart=always` that crash-loops and comes back
+never enters `failed`, so it is not mailed; and a server that is down sends
+nothing at all. Both need a monitor outside the server.
+
 ## Mesh
 
 With `[mesh]` on, every server joins [Cloudflare Mesh](https://developers.cloudflare.com/cloudflare-one/):
@@ -1123,6 +1209,10 @@ Every failure is one line: what went wrong, then what to check.
 | `[logs] bucket = "…" is set but … has no complete set of logs credentials` | Set `logs_access_key_id`, `logs_secret_access_key` and `r2_endpoint` as in [Logs](#logs) |
 | `Invalid record from journald, discarding … text=-- cursor: s=…` in `journalctl -u vector` | Harmless: right after a restart Vector reads journalctl's own cursor trailer line, which is not a log entry. Nothing is lost |
 | Nothing new in the logs bucket | `./infra/up ssh a -- systemctl status vector` and `-- journalctl -u vector -n 50`; the usual causes are a wrong token or a bucket that does not exist |
+| `[alerts] sends to … but … has no complete set of SMTP settings` | Set `smtp_host`, `smtp_port`, `smtp_user`, `smtp_password` and `smtp_from` as in [Alerts](#alerts), or remove `[alerts]` |
+| `the secret 'smtp_…' contains whitespace, a character a shell would reinterpret, or is not the right shape` | Set it again with `./infra/up secrets set smtp_…`; the message gives the allowed shape |
+| `the test alert was not queued on node a` | `./infra/up ssh a -- journalctl -u 'stackbase-alert@*' -u nullmailer -n 50`; run `up` first if the server predates `[alerts]` |
+| An alert was queued but never arrived | `./infra/up ssh a -- journalctl -u nullmailer -n 50`: a wrong login, a relay certificate the server does not trust, or a relay that is unreachable (mail waits in `/var/spool/nullmailer/queue`) |
 | `this project has no backup bucket` | Add `[backups] bucket = "..."` to `stack.toml` and run `./infra/up` |
 
 A failed run changes nothing further and can always simply be run again: it

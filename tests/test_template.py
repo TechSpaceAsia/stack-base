@@ -379,6 +379,8 @@ _ENV_FACTS = (
     " logsEnable = node.config.stackbase.logs.enable;"
     " logsBucket = node.config.stackbase.logs.bucket;"
     " vectorEnable = node.config.services.vector.enable;"
+    " alertsTo = node.config.stackbase.alerts.to;"
+    " nullmailerEnable = node.config.services.nullmailer.enable;"
     " deployKeys = node.config.stackbase.deploy.keys;"
     " }"
 )
@@ -453,6 +455,21 @@ class TemplateEnvironmentsTests(unittest.TestCase):
             self.assertFalse(facts["logsEnable"])
             self.assertFalse(facts["vectorEnable"])
 
+    def test_alerts_to_env_override(self) -> None:
+        """[environments.<env>] alerts.to wins over the shared [alerts] table,
+        and naming recipients is what turns nullmailer on."""
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_envs_template(directory)
+
+            staging = _nix_eval_attr(directory, 'nixosConfigurations."staging-a"', _ENV_FACTS)
+            production = _nix_eval_attr(directory, 'nixosConfigurations."production-a"', _ENV_FACTS)
+
+            self.assertEqual(staging["alertsTo"], ["ops@example.com", "servers.acme.staging@example.com"])
+            self.assertEqual(production["alertsTo"], ["ops@example.com"])
+            for facts in (staging, production):
+                self.assertTrue(facts["nullmailerEnable"])
+
     def test_mesh_enabled_turns_on_the_warp_connector(self) -> None:
         """[mesh] enabled = true -> headless cloudflare-warp, firewall closed,
         and only that one unfree package admitted."""
@@ -509,6 +526,9 @@ class TemplateEnvironmentsTests(unittest.TestCase):
             self.assertFalse(facts["logsEnable"])
             self.assertEqual(facts["logsBucket"], "")
             self.assertFalse(facts["vectorEnable"])
+            # No [alerts] table: no nullmailer, no drop-in, no watchdog.
+            self.assertEqual(facts["alertsTo"], [])
+            self.assertFalse(facts["nullmailerEnable"])
 
 
 @unittest.skipIf(_NIX is None, "nix is not installed")
@@ -781,6 +801,86 @@ class VectorSettingsTests(unittest.TestCase):
         self.assertIn("RateLimitInterval=30s", conf.splitlines())
         self.assertNotIn("SystemMaxUse=500M", conf)
         self.assertNotIn("ForwardToSyslog=yes", conf)
+
+
+@unittest.skipIf(_NIX is None, "nix is not installed")
+class AlertsSettingsTests(unittest.TestCase):
+    """nixos/alerts.nix wires the approved design (Brief F). The VM test
+    (tests/vm-alerts.nix) proves the behaviour; this pins the wiring, fast."""
+
+    _ON = 'stackbase.alerts.to = [ "ops@example.org" ];'
+
+    def _eval(self, apply_fn: str, extra: str = _ON) -> Any:
+        result = _eval_mk_node(apply_fn, provider="null", extra_config=f"stackbase.admins.matt = \"k\"; {extra}")
+        if result.returncode != 0:
+            raise AssertionError(f"nix eval failed:\n{result.stderr}")
+        return json.loads(result.stdout)
+
+    def test_no_recipients_means_no_mailer_no_drop_in_no_watchdog(self) -> None:
+        facts = self._eval(
+            "{"
+            " nullmailer = node.config.services.nullmailer.enable;"
+            " handler = node.config.systemd.services ? \"stackbase-alert@\";"
+            " freshness = node.config.systemd.timers ? stackbase-freshness;"
+            " packages = map (p: p.name) node.config.systemd.packages;"
+            " }",
+            "",
+        )
+        self.assertFalse(facts["nullmailer"])
+        self.assertFalse(facts["handler"])
+        self.assertFalse(facts["freshness"])
+        self.assertNotIn("stackbase-alert-dropins", facts["packages"])
+
+    def test_recipients_turn_on_the_whole_alert_path(self) -> None:
+        facts = self._eval(
+            "{"
+            " nullmailer = node.config.services.nullmailer.enable;"
+            " remotesFile = node.config.services.nullmailer.remotesFile;"
+            " packages = map (p: p.name) node.config.systemd.packages;"
+            " handlerStart = node.config.systemd.services.\"stackbase-alert@\".serviceConfig.ExecStart;"
+            " remotesEnv = node.config.systemd.services.stackbase-alert-remotes.serviceConfig.EnvironmentFile;"
+            " nullmailerRequires = node.config.systemd.services.nullmailer.requires;"
+            " timer = node.config.systemd.timers.stackbase-freshness.timerConfig.OnCalendar;"
+            " freshnessEnv = node.config.systemd.services.stackbase-freshness.environment;"
+            " }"
+        )
+        self.assertTrue(facts["nullmailer"])
+        self.assertEqual(facts["remotesFile"], "/run/stackbase-alert/remotes")
+        self.assertIn("stackbase-alert-dropins", facts["packages"])
+        self.assertTrue(facts["handlerStart"].endswith(" %i"), facts["handlerStart"])
+        self.assertEqual(facts["remotesEnv"], "/var/lib/stackbase/alert.env")
+        self.assertIn("stackbase-alert-remotes.service", facts["nullmailerRequires"])
+        self.assertEqual(facts["timer"], "hourly")
+        self.assertEqual(facts["freshnessEnv"]["GRACE_SECONDS"], "3600")
+        self.assertEqual(facts["freshnessEnv"]["BUFFER_ALERT_BYTES"], "268435456")
+        self.assertEqual(facts["freshnessEnv"]["BACKUP_MAX_AGE_SECONDS"], str(36 * 3600))
+        self.assertEqual(facts["freshnessEnv"]["SENT_STALL_SECONDS"], str(2 * 3600))
+        # Backups and logs are off on this node: neither check runs.
+        self.assertEqual(facts["freshnessEnv"]["CHECK_BACKUPS"], "0")
+        self.assertEqual(facts["freshnessEnv"]["CHECK_LOGS"], "0")
+
+    def test_the_watchdog_checks_what_the_node_has(self) -> None:
+        env = self._eval(
+            "node.config.systemd.services.stackbase-freshness.environment",
+            self._ON + ' stackbase.backups.bucket = "b"; stackbase.logs.bucket = "l";',
+        )
+        self.assertEqual(env["CHECK_BACKUPS"], "1")
+        self.assertEqual(env["CHECK_LOGS"], "1")
+        opted_out = self._eval(
+            "node.config.systemd.services.stackbase-freshness.environment",
+            self._ON + ' stackbase.backups.bucket = "b"; stackbase.backups.enable = false;',
+        )
+        self.assertEqual(opted_out["CHECK_BACKUPS"], "0")
+
+    def test_the_subject_names_project_environment_and_host(self) -> None:
+        """`[<project>/<env>/<hostname>]`, or `[<project>/<hostname>]` for a
+        project without [environments]."""
+        staging = self._eval(
+            "node.config.stackbase.alerts.subjectLabel",
+            self._ON + ' networking.hostName = "staging-a"; stackbase.environment = "staging";',
+        )
+        legacy = self._eval("node.config.stackbase.alerts.subjectLabel", self._ON + ' networking.hostName = "a";')
+        self.assertEqual((staging, legacy), ("t/staging/staging-a", "t/a"))
 
 
 @unittest.skipIf(_NIX is None, "nix is not installed")

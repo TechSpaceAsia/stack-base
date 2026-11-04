@@ -5,8 +5,8 @@
 # With [environments.<env>] tables (staging, production, ...), it builds one
 # machine per [environments.<env>.nodes.*] entry instead, named
 # "<env>-<node>" (nixosConfigurations."staging-a", infra/nodes/staging-a/),
-# each with its environment's domain, its [backups] and [logs] overrides
-# merged over the shared tables, and that environment's own deploy key
+# each with its environment's domain, its [backups], [logs] and [alerts]
+# overrides merged over the shared tables, and that environment's own deploy key
 # (keys/deploy.<env>.pub). A file with no [environments] is one implicit
 # environment: attributes, paths and options exactly as they always were.
 #
@@ -131,6 +131,14 @@
         (if logsConfig ? bucket then { bucket = logsConfig.bucket; } else { })
         // (if logsConfig ? enabled then { enable = logsConfig.enabled; } else { });
 
+      # The optional [alerts] table -> nixos/alerts.nix's stackbase.alerts.to,
+      # merged the same way. Naming recipients turns failure email on; no
+      # table (or an empty list) leaves the node exactly as before alerts.
+      alertsOptions = env:
+        let alertsConfig = (stack.alerts or { }) // (environments.${env}.alerts or { });
+        in
+        if alertsConfig ? to then { to = alertsConfig.to; } else { };
+
       nodeConfig = env: node:
         let
           name = nixosName env node;
@@ -149,6 +157,7 @@
               stackbase.app = appOptions;
               stackbase.backups = backupsOptions env;
               stackbase.logs = logsOptions env;
+              stackbase.alerts = alertsOptions env;
               # [mesh] is shared by every environment; absent means off.
               stackbase.mesh.enable = (stack.mesh or { }).enabled or false;
             }

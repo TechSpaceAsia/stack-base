@@ -2,6 +2,7 @@
 
     python3 -m stackbase [--infra-dir DIR] [--env NAME] up [--plan] [--allow-purchase] [--debug]
     python3 -m stackbase [--infra-dir DIR] [--env NAME] ssh <node> [-- command ...]
+    python3 -m stackbase [--infra-dir DIR] [--env NAME] alert-test
 
 `--env` may also come after the subcommand. It is REQUIRED for every command
 once stack.toml has `[environments]` -- there is no default environment, so
@@ -28,6 +29,7 @@ import traceback
 from pathlib import Path
 from typing import Callable
 
+from stackbase.alerts import alerts_warning, check_alert_credentials, run_alert_test
 from stackbase.backups import check_backup_credentials, run_backup_now
 from stackbase.logs import check_logs_credentials
 from stackbase.mesh import connector_token
@@ -140,6 +142,11 @@ def build_parser() -> argparse.ArgumentParser:
     backup_now_p.add_argument("--node", help="restrict to one node")
     backup_now_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
 
+    alert_test_p = commands.add_parser(
+        "alert-test", help="fail a throwaway unit on every node, so each one emails [alerts] to"
+    )
+    alert_test_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
+
     ci_setup_p = commands.add_parser(
         "ci-setup", help="provision an optional GitHub Actions deploy key for this project"
     )
@@ -182,7 +189,9 @@ def build_parser() -> argparse.ArgumentParser:
     secrets_edit_p.add_argument("key", help="the secret's name")
     secrets_edit_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
 
-    for command in (up, shell, deploy, rollback, status, backup_now_p, ci_setup_p, deploy_key_p, secrets_p):
+    for command in (
+        up, shell, deploy, rollback, status, backup_now_p, alert_test_p, ci_setup_p, deploy_key_p, secrets_p
+    ):
         _add_env(command, "env_cmd")
     for leaf in (deploy_key_init_p, deploy_key_show_p, secrets_keys_p, secrets_set_p, secrets_unset_p, secrets_edit_p):
         _add_env(leaf, "env_sub")
@@ -215,6 +224,8 @@ def main(argv: list[str] | None = None) -> None:
             _status(args, infra_dir, secrets, env)
         elif args.command == "backup-now":
             _backup_now(args, infra_dir, secrets, env)
+        elif args.command == "alert-test":
+            _alert_test(args, infra_dir, secrets, env)
         elif args.command == "ci-setup":
             _ci_setup(args, infra_dir, secrets, env)
         elif args.command == "deploy-key":
@@ -361,6 +372,8 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env_
     # Logs on with no credentials would fail the rebuild that starts Vector,
     # so it is refused here, before anything is touched.
     check_logs_credentials(env, local.logs_env_sha)
+    # Same for alerts: nullmailer cannot start without alert.env.
+    check_alert_credentials(env, local.alert_env_sha)
     # None (and no R2 request at all) unless [logs]/[files] names a bucket.
     r2 = r2_account_for(env, secrets)
     observed = observe(
@@ -376,10 +389,12 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env_
 
     if args.plan:
         _print_plan(steps, secrets, env)
+        _warn_no_alerts(env, secrets)
         return
 
     if not steps:
         print(nothing_to_do(env))
+        _warn_no_alerts(env, secrets)
         return
 
     ctx = Context(
@@ -396,6 +411,20 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env_
     )
     apply(steps, ctx, allow_purchase=args.allow_purchase)
     print("done")
+    _warn_no_alerts(env, secrets)
+
+
+def _warn_no_alerts(env: Environment, secrets: dict[str, str]) -> None:
+    """No [alerts] is allowed, but said once, as the last thing a run prints.
+
+    Last, so it is not scrolled away by the plan or the steps, and only on
+    a run that got that far: a failing run still ends in exactly one
+    `error:` line. On stderr, so the plan on stdout stays byte-identical
+    for a project that predates alerts.
+    """
+    warning = alerts_warning(env)
+    if warning:
+        print(redact(warning, redaction_values(secrets)), file=sys.stderr)
 
 
 def _print_plan(steps: list[Step], secrets: dict[str, str], env: Environment) -> None:
@@ -512,6 +541,15 @@ def _backup_now(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, st
     to have nothing to mask.
     """
     run_backup_now(infra_dir, node=args.node, emit=_emit_masked(secrets), env=env)
+
+
+def _alert_test(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env: str | None) -> None:
+    """Fail a throwaway unit on every node so each one mails [alerts] to.
+
+    Like `backup-now`, nothing is decrypted: the node already holds its SMTP
+    settings. Masked all the same, since the streamed output is the node's.
+    """
+    run_alert_test(infra_dir, emit=_emit_masked(secrets), env=env)
 
 
 def _secret_register_counter(secrets: dict[str, str]) -> Callable[[str], None]:

@@ -25,6 +25,7 @@ import subprocess
 from collections import deque
 from typing import Callable
 
+from stackbase.alerts import ALERT_REMOTES_UNIT, alert_env_content, alert_env_digest
 from stackbase.backups import backup_env_content, backup_env_digest
 from stackbase.logs import LOGS_UNIT, logs_env_content, logs_env_digest
 from stackbase.config import save_state
@@ -987,6 +988,49 @@ def _ensure_mesh(ctx: Context, step: Step) -> str:
 
 
 # --------------------------------------------------------------------------
+# Failure email: push alert.env, root-only, re-render nullmailer's remotes
+# --------------------------------------------------------------------------
+
+
+def _ensure_alert_env(ctx: Context, step: Step) -> str:
+    """Push the SMTP settings to /var/lib/stackbase/alert.env, 0600 root:root.
+
+    The same stdin-only, owner-and-mode-first model as `_ensure_logs_env`,
+    and planned before the rebuild for the same reason: the rebuild that
+    turns alerts on starts the oneshot that renders nullmailer's remotes
+    from this file, and that oneshot fails without it.
+
+    A running relay is re-rendered (nullmailer is PartOf that oneshot, so it
+    restarts with the new remotes); one that is not running yet (the first
+    push) is left for the rebuild. Mail already queued survives the restart.
+    """
+    node = _node(step)
+    content = alert_env_content(ctx.secrets)
+    if not content:
+        raise StackError(
+            f"infra/{ctx.secrets_file.name} has no complete set of SMTP settings to push",
+            "this is a bug in stack-base -- please report it",
+        )
+
+    ssh = ctx.ssh(node)
+    tmp_path = _cert_path("alert.env.new")
+    final_path = _cert_path("alert.env")
+    ssh.run(f"set -eu; install -d -m 0750 {shlex.quote(REMOTE_CERT_DIR)}")
+    ssh.run(f"set -eu; install -m 0600 -o root -g root /dev/null {tmp_path}")
+    ssh.run(f"set -eu; cat > {tmp_path}", input=content)
+    ssh.run(f"set -eu; mv -f {tmp_path} {final_path}")
+    ssh.run(
+        f"set -eu; if systemctl is-active --quiet {ALERT_REMOTES_UNIT}; "
+        f"then systemctl restart {ALERT_REMOTES_UNIT}; fi"
+    )
+
+    # Only after the re-render: a node whose relay could not take the new
+    # settings replans the step next run instead of being called converged.
+    ctx.node_state(node).alert_env_sha = alert_env_digest(content)
+    return f"node {node}: alert mail credentials updated"
+
+
+# --------------------------------------------------------------------------
 # Cloudflare R2: buckets, the logs retention rule, the files lock
 # --------------------------------------------------------------------------
 
@@ -1093,6 +1137,7 @@ _EXECUTORS: dict[Action, Callable[[Context, Step], str]] = {
     Action.ENSURE_APP_ENV: _ensure_app_env,
     Action.ENSURE_BACKUP_ENV: _ensure_backup_env,
     Action.ENSURE_LOGS_ENV: _ensure_logs_env,
+    Action.ENSURE_ALERT_ENV: _ensure_alert_env,
     Action.ENSURE_MESH: _ensure_mesh,
     Action.ENSURE_R2_BUCKET: _ensure_r2_bucket,
     Action.ENSURE_R2_LIFECYCLE: _ensure_r2_lifecycle,

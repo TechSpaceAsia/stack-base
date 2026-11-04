@@ -1116,6 +1116,7 @@ _ENV_COMMANDS = [
     ["status"],
     ["ssh", "a"],
     ["backup-now"],
+    ["alert-test"],
     ["secrets", "keys"],
     ["secrets", "set", "app_env"],
     ["secrets", "unset", "app_env"],
