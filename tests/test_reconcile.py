@@ -49,6 +49,7 @@ from stackbase.reconcile import (
     compute_rev,
     firewall_name,
     check_infra_clean,
+    check_baseline,
     hostname_for,
     local_facts,
     observe,
@@ -3468,3 +3469,106 @@ class EnvironmentPlanTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+# --------------------------------------------------------------------------
+# Backups and logs are required, or explicitly opted out (v0.2.0)
+# --------------------------------------------------------------------------
+
+
+def _baseline_env(*, backups=None, logs=None, name: str = ""):
+    from stackbase.config import BackupsConfig, Environment, LogsConfig
+
+    return Environment(
+        name=name,
+        domain=_DOMAIN,
+        plan="KVM 1",
+        price_item=None,
+        nodes={"a": Node(name="a", role="primary", vps_id=_VPS_ID)},
+        backups=backups or BackupsConfig(),
+        logs=logs or LogsConfig(),
+    )
+
+
+class BaselineRequiredTests(unittest.TestCase):
+    def _backups(self, **kw):
+        from stackbase.config import BackupsConfig
+
+        return BackupsConfig(**kw)
+
+    def _logs(self, **kw):
+        from stackbase.config import LogsConfig
+
+        return LogsConfig(**kw)
+
+    def test_up_refuses_without_backups_names_both_options(self) -> None:
+        env = _baseline_env(logs=self._logs(enabled=False))
+        with self.assertRaises(StackError) as caught:
+            check_baseline(env)
+        text = f"{caught.exception} {caught.exception.hint}"
+        self.assertIn("[backups]", text)
+        self.assertIn('bucket = "', text)
+        self.assertIn("enabled = false", text)
+
+    def test_up_refuses_without_logs_names_both_options(self) -> None:
+        env = _baseline_env(backups=self._backups(bucket="b"))
+        with self.assertRaises(StackError) as caught:
+            check_baseline(env)
+        text = f"{caught.exception} {caught.exception.hint}"
+        self.assertIn("[logs]", text)
+        self.assertIn('bucket = "', text)
+        self.assertIn("enabled = false", text)
+
+    def test_refusal_in_an_environment_names_its_override(self) -> None:
+        env = _baseline_env(name="staging", logs=self._logs(enabled=False))
+        with self.assertRaises(StackError) as caught:
+            check_baseline(env)
+        self.assertIn("staging", f"{caught.exception} {caught.exception.hint}")
+
+    def test_backups_opt_out_warns(self) -> None:
+        env = _baseline_env(backups=self._backups(enabled=False), logs=self._logs(bucket="l"))
+        warnings = check_baseline(env)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("backups", warnings[0])
+        self.assertTrue(warnings[0].startswith("!"))
+
+    def test_logs_opt_out_warns(self) -> None:
+        env = _baseline_env(backups=self._backups(bucket="b"), logs=self._logs(enabled=False))
+        warnings = check_baseline(env)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("logs", warnings[0])
+
+    def test_both_on_is_silent(self) -> None:
+        env = _baseline_env(backups=self._backups(bucket="b"), logs=self._logs(bucket="l"))
+        self.assertEqual(check_baseline(env), [])
+
+    def test_enabled_false_with_bucket_is_an_error(self) -> None:
+        for env, table in (
+            (_baseline_env(backups=self._backups(enabled=False, bucket="b"), logs=self._logs(bucket="l")), "[backups]"),
+            (_baseline_env(backups=self._backups(bucket="b"), logs=self._logs(enabled=False, bucket="l")), "[logs]"),
+        ):
+            with self.subTest(table=table), self.assertRaises(StackError) as caught:
+                check_baseline(env)
+            self.assertIn(table, str(caught.exception))
+
+    def test_check_runs_per_environment(self) -> None:
+        # staging opts out of backups, production does not: only staging warns.
+        shared_logs = self._logs(bucket="l")
+        staging = _baseline_env(name="staging", backups=self._backups(enabled=False), logs=shared_logs)
+        production = _baseline_env(name="production", backups=self._backups(bucket="b"), logs=shared_logs)
+        self.assertEqual(len(check_baseline(staging)), 1)
+        self.assertEqual(check_baseline(production), [])
+
+    def test_up_refuses_before_any_api_client_is_built(self) -> None:
+        from stackbase.__main__ import _up
+
+        env = _baseline_env()
+        cfg = mock.Mock()
+        cfg.env.return_value = env
+        args = mock.Mock(plan=True, allow_dirty=True)
+        with mock.patch("stackbase.__main__.load_config", return_value=cfg), mock.patch(
+            "stackbase.__main__.HostingerClient"
+        ) as hostinger, mock.patch("stackbase.__main__.load_state"), self.assertRaises(StackError):
+            _up(args, Path("/nonexistent"), {}, None)
+        hostinger.assert_not_called()

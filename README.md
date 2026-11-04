@@ -1189,6 +1189,42 @@ app must:
 
 platform-base's storage backend does both; see its storage documentation.
 
+## Upgrading to v0.2.0
+
+v0.2.0 changes one default: **backups and logs are required**. After
+upgrading, `./infra/up` (and `--plan`) refuses in any environment that has
+neither a `[backups]` / `[logs]` bucket nor an explicit opt-out. Per project,
+edit `infra/stack.toml` once:
+
+```toml
+[backups]
+bucket = "acme-backups"      # or: enabled = false  (warns on every run)
+
+[logs]
+bucket = "acme-logs"         # or: enabled = false  (warns on every run)
+```
+
+`enabled = false` together with a bucket is an error: say one or the other.
+The warning for an opt-out goes to stderr, once per run, so the plan on
+stdout is unchanged. A project that already has `[backups] bucket` only needs
+the `[logs]` choice.
+
+- **Environments are opt-in.** A `stack.toml` without `[environments]` keeps
+  working exactly as before (same file names, same hostnames, same plans);
+  nothing about staging and production applies until you add them.
+- **CI deploys staging only.** With environments, the GitHub Actions workflow
+  runs `./infra/up --env staging deploy` and nothing touches production; you
+  promote a tag from your own machine (see "Deploying from GitHub Actions").
+- **New secrets**, each only if you turn the feature on:
+  `logs_access_key_id` and `logs_secret_access_key` (an R2 token scoped to the
+  logs bucket), `cloudflare_account_id` (Cloudflare account access, used to
+  create buckets and set their lifecycle and lock rules, never to delete),
+  `smtp_host`, `smtp_port`, `smtp_user`, `smtp_password` and `smtp_from` for
+  `[alerts]`, `mesh_connector_token` for `[mesh]`, and
+  `files_access_key_id` / `files_secret_access_key` for `[files]`. Per
+  environment, set them with `./infra/up --env "$ENV" secrets set <key>`.
+  See "Logs", "Alerts", "Mesh" and "R2 buckets".
+
 ## Things to watch
 
 Three ways to hurt yourself that no amount of code can prevent.
@@ -1258,6 +1294,7 @@ Every failure is one line: what went wrong, then what to check.
 | `infra/ has uncommitted changes that would be pushed` | Commit them, or re-run with `--allow-dirty` if you are deliberately testing |
 | `the backup unit failed on node a` | `./infra/up ssh a -- journalctl -u stackbase-backup -n 50` — the usual causes are wrong R2 credentials or a bucket that does not exist |
 | `… turns logs on but names no [logs] bucket` | Set `bucket` in `[logs]` (or `logs.bucket` in that environment), or `enabled = false` to leave logs off — see [Logs](#logs) |
+| `backups are required but no [backups] bucket is set` (or the same for logs) | Set `bucket = "…"` in that table, or opt out with `enabled = false`; see [Upgrading to v0.2.0](#upgrading-to-v020) |
 | `[logs] bucket = "…" is set but … has no complete set of logs credentials` | Set `logs_access_key_id`, `logs_secret_access_key` and `r2_endpoint` as in [Logs](#logs) |
 | `Invalid record from journald, discarding … text=-- cursor: s=…` in `journalctl -u vector` | Harmless: right after a restart Vector reads journalctl's own cursor trailer line, which is not a log entry. Nothing is lost |
 | Nothing new in the logs bucket | `./infra/up ssh a -- systemctl status vector` and `-- journalctl -u vector -n 50`; the usual causes are a wrong token or a bucket that does not exist |

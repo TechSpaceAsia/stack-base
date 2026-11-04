@@ -43,6 +43,14 @@ datacenter = "kul"
 plan       = "KVM 1"
 admins     = ["matt"]
 
+# Backups and logs are required unless opted out (v0.2.0); these tests are
+# about other things, so they opt out.
+[backups]
+enabled = false
+
+[logs]
+enabled = false
+
 [nodes.a]
 role   = "primary"
 vps_id = {_VPS_ID}
@@ -191,8 +199,13 @@ class PlanTests(unittest.TestCase):
         start fails the rebuild -- so `up` refuses up front, --plan included."""
         with TemporaryDirectory() as tmp, FakeServer() as server:
             infra_dir, identity = _project(Path(tmp))
-            with (infra_dir / "stack.toml").open("a", encoding="utf-8") as f:
-                f.write('\n[logs]\nbucket = "acme-logs"\n')
+            toml_path = infra_dir / "stack.toml"
+            toml_path.write_text(
+                toml_path.read_text(encoding="utf-8").replace(
+                    "[logs]\nenabled = false", '[logs]\nbucket = "acme-logs"'
+                ),
+                encoding="utf-8",
+            )
             _script_observe(server)
             stderr = io.StringIO()
 
@@ -1291,3 +1304,21 @@ class EnvironmentFlagTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BaselineOptOutWarningTests(unittest.TestCase):
+    def test_opt_outs_warn_once_each_on_stderr_and_keep_stdout_clean(self) -> None:
+        with TemporaryDirectory() as tmp, FakeServer() as server:
+            infra_dir, identity = _project(Path(tmp))
+            _script_observe(server)
+            stdout, stderr = io.StringIO(), io.StringIO()
+
+            with _cli(server, identity) as (ssh_class, execute):
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    from stackbase.__main__ import main
+
+                    main(["--infra-dir", str(infra_dir), "up", "--plan"])
+
+            self.assertEqual(sum("backups are OFF" in line for line in stderr.getvalue().splitlines()), 1)
+            self.assertEqual(sum("logs are OFF" in line for line in stderr.getvalue().splitlines()), 1)
+            self.assertNotIn("are OFF", stdout.getvalue())

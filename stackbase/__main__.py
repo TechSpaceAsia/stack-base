@@ -45,6 +45,7 @@ from stackbase.reconcile import (
     Context,
     Step,
     apply,
+    check_baseline,
     check_infra_clean,
     local_facts,
     nothing_to_do,
@@ -326,6 +327,11 @@ _NO_CLOUDFLARE_WARNING = (
 def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env_name: str | None) -> None:
     cfg = load_config(infra_dir)
     env = cfg.env(env_name)
+    # Backups and logs are required (v0.2.0) unless explicitly opted out.
+    # Refused here, before any SSH or API call. Each opt-out is said on every
+    # run that gets to the end, next to the alerts warning (stderr, so the
+    # plan on stdout stays clean and a failing run still ends in one error).
+    opt_out_warnings = check_baseline(env)
     state = load_state(infra_dir, env)
     env_secrets = secrets_file(env)
     # Before anything reaches the network: a deploy-recipients.txt that has
@@ -389,12 +395,12 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env_
 
     if args.plan:
         _print_plan(steps, secrets, env)
-        _warn_no_alerts(env, secrets)
+        _warn_no_alerts(env, secrets, opt_out_warnings)
         return
 
     if not steps:
         print(nothing_to_do(env))
-        _warn_no_alerts(env, secrets)
+        _warn_no_alerts(env, secrets, opt_out_warnings)
         return
 
     ctx = Context(
@@ -411,10 +417,10 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env_
     )
     apply(steps, ctx, allow_purchase=args.allow_purchase)
     print("done")
-    _warn_no_alerts(env, secrets)
+    _warn_no_alerts(env, secrets, opt_out_warnings)
 
 
-def _warn_no_alerts(env: Environment, secrets: dict[str, str]) -> None:
+def _warn_no_alerts(env: Environment, secrets: dict[str, str], opt_out_warnings: list[str] | None = None) -> None:
     """No [alerts] is allowed, but said once, as the last thing a run prints.
 
     Last, so it is not scrolled away by the plan or the steps, and only on
@@ -422,6 +428,8 @@ def _warn_no_alerts(env: Environment, secrets: dict[str, str]) -> None:
     `error:` line. On stderr, so the plan on stdout stays byte-identical
     for a project that predates alerts.
     """
+    for line in opt_out_warnings or []:
+        print(redact(line, redaction_values(secrets)), file=sys.stderr)
     warning = alerts_warning(env)
     if warning:
         print(redact(warning, redaction_values(secrets)), file=sys.stderr)

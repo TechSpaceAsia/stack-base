@@ -718,6 +718,38 @@ class Observed:
     r2: tuple[R2Observation, ...] = ()
 
 
+def check_baseline(env: Environment) -> list[str]:
+    """Backups and logs are on unless the environment opts out, in words.
+
+    Returns the warning lines (one per opt-out) for the caller to print on
+    every run; raises StackError when an environment neither names a bucket
+    nor sets `enabled = false`, or does both. Pure config: it runs before any
+    SSH or API call, in whichever environment `up` / `--plan` acts on.
+    """
+    scope = "" if env.implicit else f" for {env.name}"
+    warnings: list[str] = []
+    for table, section in (("backups", env.backups), ("logs", env.logs)):
+        if section.enabled is False and section.bucket:
+            raise StackError(
+                f"[{table}] has both enabled = false and bucket = \"{section.bucket}\"{scope}",
+                f"remove one of them: delete enabled = false to keep {table} on, or delete the bucket "
+                f"to leave {table} off",
+            )
+        if section.enabled is False:
+            warnings.append(
+                f"! {table} are OFF{scope} ([{table}] enabled = false) -- "
+                + ("nothing is backed up off-box" if table == "backups" else "the journal is not shipped off-box")
+            )
+        elif not section.bucket:
+            where = f"[{table}]" if env.implicit else f"[{table}] (or [environments.{env.name}] {table}.bucket)"
+            raise StackError(
+                f"{table} are required but no {where} bucket is set{scope}",
+                f'either set bucket = "..." in {where} (an R2 bucket name), or opt out explicitly '
+                f"with enabled = false in [{table}]",
+            )
+    return warnings
+
+
 def firewall_name(cfg: StackConfig, env: Environment | None = None) -> str:
     """One firewall per environment, shared by all of its nodes.
 

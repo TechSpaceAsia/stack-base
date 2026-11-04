@@ -323,6 +323,12 @@ datacenter = "kul"
 plan       = "KVM 1"
 admins     = ["matt"]
 
+[backups]
+enabled = false
+
+[logs]
+enabled = false
+
 [alerts]
 to = ["ops@example.org", "servers.acme@example.org"]
 
