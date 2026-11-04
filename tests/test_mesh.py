@@ -166,7 +166,7 @@ class MeshObserveTests(unittest.TestCase):
 
 
 class EnsureMeshTests(unittest.TestCase):
-    def _ctx(self, infra_dir, *, secrets=None, statuses=(_CONNECTED,), enrol_rc=0, ip_out=None):
+    def _ctx(self, infra_dir, *, secrets=None, statuses=(_CONNECTED,), enrol_rc=0, ip_out=None, enrol_stderr=None):
         remaining = list(statuses)
 
         def handler(argv, kwargs):
@@ -177,7 +177,7 @@ class EnsureMeshTests(unittest.TestCase):
                 text = remaining.pop(0) if len(remaining) > 1 else remaining[0]
                 return _cp(argv, stdout=text)
             if cmd == _ENROL_CMD:
-                return _cp(argv, returncode=enrol_rc, stderr="token rejected\n" if enrol_rc else "")
+                return _cp(argv, returncode=enrol_rc, stderr=(enrol_stderr or "token rejected\n") if enrol_rc else "")
             if cmd == _CONNECT_CMD:
                 return _cp(argv)
             if cmd == _IP_CMD:
@@ -255,6 +255,21 @@ class EnsureMeshTests(unittest.TestCase):
             self.assertIn("token rejected", raised.exception.hint)
             self.assertNotIn(_TOKEN, str(raised.exception) + raised.exception.hint)
             self.assertIn(_CONNECT_CMD, [c["argv"][-1] for c in ctx.runner.calls])
+
+    def test_a_long_stderr_echoing_the_token_leaks_no_fragment_of_it(self) -> None:
+        """The 300-char tail used to be cut BEFORE redaction, so a token
+        straddling the cut survived as an unmatched fragment."""
+        with Infra() as infra_dir:
+            # Place the token so a 300-char tail starts inside it.
+            cut = len(_TOKEN) // 2
+            stderr = "x" * 50 + _TOKEN + "y" * (300 - (len(_TOKEN) - cut))
+            self.assertTrue(stderr[-300:].startswith(_TOKEN[cut:]))
+            ctx, _ = self._ctx(infra_dir, enrol_rc=1, statuses=(_DISCONNECTED,), enrol_stderr=stderr)
+            with self.assertRaises(StackError) as raised:
+                apply([Step(Action.ENSURE_MESH, "a")], ctx, allow_purchase=False)
+            shown = f"{raised.exception} {raised.exception.hint}"
+            for start in range(len(_TOKEN) - 7):
+                self.assertNotIn(_TOKEN[start:start + 8], shown)
 
     def test_an_odd_token_is_refused_before_any_ssh_call(self) -> None:
         with Infra() as infra_dir:

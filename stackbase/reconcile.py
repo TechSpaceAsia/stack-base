@@ -407,6 +407,9 @@ def _app_env_secret_values(raw: str) -> list[str]:
     return values
 
 
+_NOT_REDACTED_KEYS = frozenset({"smtp_host", "smtp_port"})
+
+
 def redaction_values(secrets: dict[str, str]) -> list[str]:
     """Every string that must never appear in printed output.
 
@@ -419,7 +422,9 @@ def redaction_values(secrets: dict[str, str]) -> list[str]:
     currently masks only via a plain `list(secrets.values())` and would need
     to switch to this function to get the same per-value app_env coverage.
     """
-    values = [value for value in secrets.values() if value]
+    # smtp_host and smtp_port live in the secrets file but are not secret, and
+    # a short value like "465" would mask unrelated output (byte counts, ...).
+    values = [value for key, value in secrets.items() if value and key not in _NOT_REDACTED_KEYS]
     values.extend(_app_env_secret_values(secrets.get("app_env") or ""))
     return values
 

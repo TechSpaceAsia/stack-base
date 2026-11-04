@@ -236,8 +236,11 @@ def ci_setup(
     if not env:
         # The template deploys `--env staging` on a tag and `--env production`
         # by hand; a project without [environments] runs the staging job only.
-        emit("     (the workflow deploys `--env staging`: without [environments], drop `--env staging`")
-        emit("     from its deploy step)")
+        # And it reads the staging secret, which this run did not write.
+        emit("     edit .github/workflows/deploy-stack.yml (this project has no [environments]):")
+        emit("       - drop `--env staging` from the deploy step")
+        emit("       - change `secrets.STACK_DEPLOY_KEY_STAGING` to `secrets.STACK_DEPLOY_KEY`")
+        emit("         (i.e. STACK_DEPLOY_KEY: ${{ secrets.STACK_DEPLOY_KEY }})")
     if env:
         emit("  Production is never deployed from CI: once staging looks right, promote the same tag")
         emit('  from your own machine: TAG=v1.2.3; ./infra/up --env production deploy "$TAG"')

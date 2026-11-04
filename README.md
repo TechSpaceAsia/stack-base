@@ -619,8 +619,10 @@ writes it). There is no production job and no production secret.
 `ci-setup --env production` refuses. Promote a tag that staging runs from
 your own machine with `./infra/up --env production deploy "$TAG"` (see
 "Staging and production" for why). A project without `[environments]`
-keeps the single `STACK_DEPLOY_KEY`; drop `--env staging` from the
-workflow's deploy step.
+keeps the single `STACK_DEPLOY_KEY`; after copying the workflow, edit it:
+drop `--env staging` from the deploy step, and change
+`secrets.STACK_DEPLOY_KEY_STAGING` to `secrets.STACK_DEPLOY_KEY` (`ci-setup`
+prints these same two edits).
 
 **Turn it off** (CI only — this does not remove the deploy key itself,
 since it's also your own):

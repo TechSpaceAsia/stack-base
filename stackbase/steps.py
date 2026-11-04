@@ -61,7 +61,7 @@ from stackbase.reconcile import (
     validate_app_env,
 )
 from stackbase.r2 import R2Account, ensure_lifecycle_rule, ensure_lock_rule, r2_targets, summarize_rule
-from stackbase.secrets import save_secrets
+from stackbase.secrets import redact, save_secrets
 from stackbase.ssh import HOST_KEY_CHANGED_MARKER, Ssh, host_key_mismatch_hint
 
 _HPANEL = "check the virtual machine in hPanel (https://hpanel.hostinger.com/)"
@@ -988,7 +988,10 @@ def _ensure_mesh(ctx: Context, step: Step) -> str:
             reason = ""
             if enrol.returncode != 0:
                 tail = enrol.stderr if isinstance(enrol.stderr, str) else ""
-                reason = f"enrolling failed first: {tail.strip()[-300:] or 'no output'}. "
+                # Redact the WHOLE stderr, then truncate: cutting first could
+                # leave the start of the token on screen, no longer matching.
+                shown = redact(tail.strip(), ctx.secret_values)[-300:]
+                reason = f"enrolling failed first: {shown or 'no output'}. "
             raise StackError(
                 f"node {node} did not join Cloudflare Mesh within {CONNECT_WAIT_SECONDS} seconds",
                 f"{reason}check the token is a current node token and the device profile is the "

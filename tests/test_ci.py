@@ -193,6 +193,18 @@ class CiSetupUsesTheProjectDeployKeyTests(unittest.TestCase):
             self.assertTrue((infra_dir / "deploy.age").exists())
             self.assertTrue((infra_dir / "keys" / "deploy.pub").is_file())
 
+    def test_the_implicit_environment_prints_the_exact_workflow_edits(self) -> None:
+        # The shipped template reads STACK_DEPLOY_KEY_STAGING and deploys
+        # `--env staging`; a single-environment ci-setup writes STACK_DEPLOY_KEY.
+        with _project_with_deploy_key() as (infra_dir, runner, _private_key):
+            lines: list[str] = []
+            ci_setup(infra_dir, emit=lines.append, runner=runner)
+
+            text = "\n".join(lines)
+            self.assertIn("drop `--env staging`", text)
+            self.assertIn("secrets.STACK_DEPLOY_KEY_STAGING", text)
+            self.assertIn("secrets.STACK_DEPLOY_KEY }}", text)
+
     def test_a_second_run_without_rotate_reuses_the_same_key(self) -> None:
         with _project_with_deploy_key() as (infra_dir, runner, private_key):
             ci_setup(infra_dir, emit=_silent, runner=runner)

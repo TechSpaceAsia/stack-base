@@ -2738,6 +2738,19 @@ class OutputTests(unittest.TestCase):
         self.assertNotIn("abc", values)  # too short (<8 chars) to redact on its own
         self.assertIn(secrets["app_env"], values)  # the whole blob is still masked too
 
+    def test_smtp_host_and_port_are_not_secret_and_are_not_masked(self) -> None:
+        """A port like 465 would mask unrelated output (a byte count, a line
+        number); the host is not secret either. The password still is."""
+        from stackbase.reconcile import redaction_values
+
+        values = redaction_values(
+            {"smtp_host": "smtp.example.com", "smtp_port": "465", "smtp_password": "hunter2hunter2"}
+        )
+
+        self.assertNotIn("465", values)
+        self.assertNotIn("smtp.example.com", values)
+        self.assertIn("hunter2hunter2", values)
+
     def test_ctx_emit_redacts_an_app_env_value(self) -> None:
         with Infra() as infra_dir:
             ctx, lines = _context(
