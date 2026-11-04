@@ -1,4 +1,4 @@
-! [backups] bucket = "acme-backups" is set but infra/secrets.age has no complete set of R2 credentials, so nothing is pushed -- the nightly backup timer is still installed on every node and will fail at 03:00 UTC with "no credentials in /var/lib/stackbase/backup.env". Set all three of r2_access_key_id, r2_secret_access_key, r2_endpoint (`./infra/up secrets set <key>`) and run `up` again, or remove `bucket` from stack.toml's [backups] table to leave backups off.
+! [backups] bucket = "acme-backups" is set but infra/secrets.age has no complete set of R2 credentials, so nothing is pushed -- the nightly backup timer is still installed on every node and will fail at 03:00 UTC with "no credentials in /var/lib/stackbase/backup.env". Set all three of r2_access_key_id, r2_secret_access_key, r2_endpoint (`./infra/up secrets set <key>`) and run `up` again, or set `enabled = false` in stack.toml's [backups] table to leave backups off.
 would do:
   1. registering the team's SSH keys with Hostinger
   2. node a: waiting for the server to come up
