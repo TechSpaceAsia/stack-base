@@ -1167,7 +1167,16 @@ printf '%s' "$FILES_SECRET_ACCESS_KEY" | ./infra/up secrets set files_secret_acc
 They are not part of `app_env`: a `STORAGE_*` line in `app_env` is refused
 (one owner per variable), incomplete files credentials are refused naming the
 missing keys, and rotating a files key alone re-pushes and restarts the app.
+`[files]` requires the `app_env` secret: stack-base appends the STORAGE_*
+lines to `app_env` and owns the whole `app.env` file, so `up` (and `--plan`)
+refuses with "[files] needs the app_env secret" rather than overwrite a
+hand-managed file; move the app's environment into it with
+`./infra/up --env "$ENV" secrets set app_env`.
 A project without `[files]` gets exactly the environment it had before.
+
+Removing `[files]` later re-pushes `app.env` without the STORAGE_* lines (a
+rewrite; the bucket and its objects are never touched) and prints a reminder to
+revoke the files R2 token, since the old credentials were on the node.
 
 **The bucket lock has consequences.** Every object is locked for `lock_days`,
 which forbids deleting **and overwriting** it until the lock expires. So the

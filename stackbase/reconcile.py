@@ -298,6 +298,15 @@ def local_facts(
     alert_env = alert_env_content(secrets) if env is not None and alerts_enabled(env.alerts) else None
     # Raises on incomplete credentials or a STORAGE_* collision in app_env,
     # so a bad [files] setup fails on every `up`, `--plan` included.
+    if env is not None and env.files.bucket and not app_env_raw:
+        # stack-base appends the STORAGE_* lines to app.env, so it must own the
+        # whole file: pushing them without app_env would clobber a hand-managed one.
+        raise StackError(
+            "[files] needs the app_env secret",
+            "move the app's environment into it with `./infra/up --env \"$ENV\" secrets set app_env` "
+            "(omit --env for a single-environment project); stack-base appends the STORAGE_* lines to "
+            "app_env, so it must own the file",
+        )
     storage_lines = storage_env_lines(env, secrets) if env is not None else []
     return Local(
         desired_rev=compute_rev(infra_dir, stackbase_src=stackbase_src),
@@ -1264,6 +1273,10 @@ def _needs_app_env(state: StackState, observed: Observed, name: str) -> bool:
         return True
     if desired is None:
         return False
+    # [files] removed but the node still has the STORAGE_* block: re-push to
+    # strip it (a rewrite of app.env, not a deletion of anything else).
+    if files_desired is None and node_state.files_env_sha is not None:
+        return True
     return node_state.app_env_sha != desired
 
 

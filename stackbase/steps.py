@@ -796,12 +796,18 @@ def _ensure_app_env(ctx: Context, step: Step) -> str:
     node_state = ctx.node_state(node)
     if raw:
         node_state.app_env_sha = app_env_digest(normalized)
-    if storage_lines:
-        node_state.files_env_sha = files_env_digest(block)
+    removed_storage = node_state.files_env_sha is not None and not storage_lines
+    node_state.files_env_sha = files_env_digest(block) if storage_lines else None
 
+    message = f"node {node}: application environment updated"
     if color:
-        return f"node {node}: application environment updated, {color} restarted"
-    return f"node {node}: application environment updated"
+        message += f", {color} restarted"
+    if removed_storage:
+        message += (
+            "; the STORAGE_* credentials were removed from app.env -- revoke the files R2 token "
+            "in the Cloudflare dashboard"
+        )
+    return message
 
 
 def _restart_active_color(ctx: Context, ssh: Ssh, node: str, project: str) -> str | None:

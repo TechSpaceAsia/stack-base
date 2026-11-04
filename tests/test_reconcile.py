@@ -3372,6 +3372,7 @@ def _env_plan_transcript(root: Path) -> tuple[str, list[str], list[Any]]:
         "logs_secret_access_key": "logs-secret",
         "r2_endpoint": "https://acct123.r2.cloudflarestorage.com",
         # production names a [files] bucket, so `up` refuses to plan without these.
+        "app_env": "FOO=bar\n",
         "files_access_key_id": "FILESKEY",
         "files_secret_access_key": "files-secret",
         # production mails [alerts] to, so `up` refuses to plan without these.

@@ -107,6 +107,14 @@ class LockDaysRangeTests(unittest.TestCase):
             self.assertEqual(self._load(good).env(None).files.lock_days, good)
 
 
+    def test_bool_lock_days_rejected(self) -> None:
+        with TempInfraDir() as infra_dir:
+            write_toml(infra_dir, VALID_TOML + '\n[files]\nbucket = "acme-files"\nlock_days = true\n')
+            write_key(infra_dir, "matt", VALID_ED25519_KEY)
+            with self.assertRaises(StackError):
+                load_config(infra_dir)
+
+
 class FilesBucketPlanTests(unittest.TestCase):
     def test_files_bucket_planned_with_lock_rule(self) -> None:
         env = _env(_ON)
@@ -138,6 +146,49 @@ class AppEnvPushTests(unittest.TestCase):
         self.assertEqual([s.action for s in plan(_config(), state, obs, env=env)], [Action.ENSURE_APP_ENV])
         state.nodes["a"].files_env_sha = "new"
         self.assertEqual(plan(_config(), state, obs, env=env), [])
+
+    def test_files_without_app_env_refused_before_any_ssh(self) -> None:
+        with Infra() as infra_dir:
+            with self.assertRaises(StackError) as caught:
+                local_facts(infra_dir, dict(_SECRETS), env=_env(_ON))
+        self.assertIn("[files] needs the app_env secret", str(caught.exception))
+        self.assertIn("secrets set app_env", caught.exception.hint)
+
+    def test_removing_files_replans_the_push_and_clears_the_sha(self) -> None:
+        state = _converged_state()
+        state.nodes["a"].app_env_sha = "same"
+        state.nodes["a"].files_env_sha = "old"
+        obs = self._observed(app_env_sha="same", files_env_sha=None)
+        self.assertEqual([s.action for s in plan(_config(), state, obs, env=_env())], [Action.ENSURE_APP_ENV])
+
+        secrets = {"hostinger_token": "htok-long", "cloudflare_token": "ctok-long", "app_env": "FOO=1\n"}
+
+        def handler(argv, kwargs):
+            if "active-color" in argv[-1] and "cat --" in argv[-1]:
+                return _cp(argv, returncode=0, stdout="blue\n")
+            return _cp(argv, returncode=0)
+
+        with Infra() as infra_dir:
+            ctx, lines = _context(
+                infra_dir,
+                state=StackState(nodes={"a": NodeState(
+                    vps_id=_VPS_ID, ipv4=_IPV4, host_key_pinned=True, files_env_sha="old")}),
+                secrets=secrets,
+                runner=FakeRunner(handler=handler),
+                env=_env(),
+            )
+            apply([Step(Action.ENSURE_APP_ENV, "a")], ctx, allow_purchase=False)
+            pushed = next(c["kwargs"]["input"] for c in ctx.runner.calls if c["kwargs"].get("input") is not None)
+            self.assertEqual(pushed, "FOO=1\n")
+            self.assertIsNone(ctx.state.nodes["a"].files_env_sha)
+            self.assertTrue(any("STORAGE_* credentials were removed" in l and "revoke" in l for l in lines), lines)
+
+    def test_readding_files_pushes_again(self) -> None:
+        state = _converged_state()
+        state.nodes["a"].app_env_sha = "same"
+        state.nodes["a"].files_env_sha = None  # cleared when [files] was removed
+        obs = self._observed(app_env_sha="same", files_env_sha="sha")
+        self.assertEqual([s.action for s in plan(_config(), state, obs, env=_env(_ON))], [Action.ENSURE_APP_ENV])
 
     def test_state_omits_unset_files_sha(self) -> None:
         with Infra() as infra_dir:
