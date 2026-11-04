@@ -3109,5 +3109,103 @@ class CheckInfraCleanRealGitTests(unittest.TestCase):
             check_infra_clean(infra_dir, emit=lambda _line: None)
 
 
+# --------------------------------------------------------------------------
+# Single-environment golden: today's format must plan byte-for-byte the same
+# --------------------------------------------------------------------------
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+_GOLDEN_PLAN = _FIXTURES / "stack.plan.golden"
+
+
+def _legacy_plan_transcript(root: Path) -> str:
+    """`up --plan` for tests/fixtures/stack.toml, against fakes: stdout, then
+    every request observe() made, in order.
+
+    The requests are part of the transcript on purpose: they carry the
+    Hostinger hostname/domain lookups, so a change to what a legacy project
+    LOOKS FOR shows up here even when the printed plan happens to match.
+    Secrets are patched in rather than age-encrypted, so the transcript never
+    depends on age being installed.
+    """
+    import contextlib
+    import io
+
+    from stackbase.__main__ import main
+
+    infra_dir = root / "infra"
+    (infra_dir / "keys").mkdir(parents=True)
+    shutil.copy(_FIXTURES / "stack.toml", infra_dir / "stack.toml")
+    (infra_dir / "keys" / "matt.pub").write_text(_KEY_MATT + "\n", encoding="utf-8")
+    lock = {
+        "nodes": {
+            "root": {"inputs": {"stack-base": "stack-base"}},
+            "stack-base": {"locked": {"type": "github", "owner": "o", "repo": "stack-base", "rev": "c0ffee" * 6}},
+        },
+        "root": "root",
+        "version": 7,
+    }
+    (infra_dir / "flake.lock").write_text(json.dumps(lock), encoding="utf-8")
+    secrets = {"hostinger_token": "h-token", "cloudflare_token": "c-token", "app_env": "FOO=bar\n"}
+    meta = {"current_page": 1, "per_page": 20, "total": 0}
+    page = {"page": 1, "per_page": 20, "count": 1, "total_count": 1, "total_pages": 1}
+
+    with FakeServer() as server:
+        # Node b has no vps_id: a VM under its legacy Hostinger hostname
+        # (`<project>-<node>.<domain>`) must still be found and adopted.
+        server.script(
+            "GET", "/api/vps/v1/virtual-machines", 200,
+            [{"id": 777, "hostname": f"acme-b.{_DOMAIN}"}, {"id": 778, "hostname": f"b.{_DOMAIN}"}],
+        )
+        server.script(
+            "GET", "/api/vps/v1/virtual-machines/777", 200,
+            {"id": 777, "state": "initial", "actions_lock": "unlocked", "firewall_group_id": None,
+             "ipv4": [{"id": 2, "address": "5.6.7.8"}], "ipv6": None},
+        )
+        server.script(
+            "GET",
+            f"/api/vps/v1/virtual-machines/{_VPS_ID}",
+            200,
+            {"id": _VPS_ID, "state": "running", "actions_lock": "unlocked", "firewall_group_id": None,
+             "ipv4": [{"id": 1, "address": _IPV4}], "ipv6": None},
+        )
+        server.script("GET", "/api/vps/v1/public-keys?page=1", 200, {"data": [], "meta": meta})
+        server.script("GET", "/api/vps/v1/firewall?page=1", 200, {"data": [], "meta": meta})
+        server.script(
+            "GET", f"/zones?name={_DOMAIN}&page=1", 200,
+            {"success": True, "errors": [], "result": [{"id": "zone1", "name": _DOMAIN}], "result_info": page},
+        )
+        server.script(
+            "GET", f"/zones/zone1/dns_records?type=A&name={_DOMAIN}&page=1", 200,
+            {"success": True, "errors": [], "result": [], "result_info": page},
+        )
+        stdout = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {}, clear=False),
+            mock.patch("stackbase.__main__.load_secrets", lambda *args, **kwargs: dict(secrets)),
+            mock.patch("stackbase.__main__.HostingerClient", lambda token: HostingerClient(token, base_url=server.url)),
+            mock.patch("stackbase.__main__.CloudflareClient", lambda token: CloudflareClient(token, base_url=server.url)),
+            mock.patch("stackbase.reconcile._cloudflare_ips_path", return_value=root / "no-such-file.nix"),
+            contextlib.redirect_stdout(stdout),
+        ):
+            os.environ.pop("STACKBASE_SRC", None)
+            main(["--infra-dir", str(infra_dir), "up", "--plan"])
+        requests = [f"{request['method']} {request['path']}" for request in server.requests]
+
+    return stdout.getvalue() + "--- requests ---\n" + "\n".join(requests) + "\n"
+
+
+class LegacyPlanGoldenTests(unittest.TestCase):
+    """A stack.toml with no [environments] is one implicit environment: the
+    plan it prints, and every request behind it, must match what stack-base
+    printed before environments existed (tests/fixtures/stack.plan.golden,
+    generated at 287246f)."""
+
+    def test_legacy_plan_output_unchanged(self) -> None:
+        with TemporaryDirectory() as tmp:
+            transcript = _legacy_plan_transcript(Path(tmp))
+
+        self.assertEqual(transcript, _GOLDEN_PLAN.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()
