@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import unittest
@@ -1272,6 +1273,46 @@ class TemplateFilesTests(unittest.TestCase):
                 hits.append(path.relative_to(_REPO_ROOT).as_posix())
 
         self.assertEqual(sorted(hits), ["README.md", "templates/infra/flake.nix"])
+
+
+_CI_TEMPLATE = _REPO_ROOT / "templates" / "github" / "deploy-stack.yml"
+_CHECKOUT_VERSION_COMMENT = re.compile(r"#\s*v(\d+)")
+
+
+def _node20_violations(text: str) -> list[str]:
+    """Non-comment lines that depend on something the self-hosted runner lacks.
+
+    The runner ships only the node24 action runtime, so the built-in
+    `hashFiles()` (hard-wired to node20), any `actions/cache` step, and a
+    checkout pinned below v5 would all fail there.
+    """
+    violations = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "hashFiles(" in line:
+            violations.append(line)
+        if re.search(r"uses:\s*actions/cache", line):
+            violations.append(line)
+        if re.search(r"uses:\s*actions/checkout@", line):
+            version = _CHECKOUT_VERSION_COMMENT.search(line)
+            if version is None or int(version.group(1)) < 5:
+                violations.append(line)
+    return violations
+
+
+class CiTemplateTests(unittest.TestCase):
+    def test_ci_template_has_no_node20_dependencies(self) -> None:
+        text = _CI_TEMPLATE.read_text(encoding="utf-8")
+
+        self.assertEqual(_node20_violations(text), [])
+
+    def test_node20_guard_flags_an_actions_cache_step(self) -> None:
+        self.assertEqual(
+            _node20_violations("      - uses: actions/cache@v4\n"),
+            ["- uses: actions/cache@v4"],
+        )
 
 
 if __name__ == "__main__":
