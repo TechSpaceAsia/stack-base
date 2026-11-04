@@ -243,7 +243,8 @@ class EnsureAlertEnvTests(unittest.TestCase):
     _CAT_CMD = "set -eu; cat > /var/lib/stackbase/alert.env.new"
     _MV_CMD = "set -eu; mv -f /var/lib/stackbase/alert.env.new /var/lib/stackbase/alert.env"
     _RESTART_CMD = (
-        "set -eu; if systemctl is-active --quiet stackbase-alert-remotes.service; "
+        "set -eu; if systemctl is-active --quiet stackbase-alert-remotes.service "
+        "|| systemctl is-failed --quiet stackbase-alert-remotes.service; "
         "then systemctl restart stackbase-alert-remotes.service; fi"
     )
     _COMMANDS = (_DIR_CMD, _TMP_CMD, _CAT_CMD, _MV_CMD, _RESTART_CMD)

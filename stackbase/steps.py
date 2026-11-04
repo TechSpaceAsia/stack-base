@@ -1001,8 +1001,9 @@ def _ensure_alert_env(ctx: Context, step: Step) -> str:
     from this file, and that oneshot fails without it.
 
     A running relay is re-rendered (nullmailer is PartOf that oneshot, so it
-    restarts with the new remotes); one that is not running yet (the first
-    push) is left for the rebuild. Mail already queued survives the restart.
+    restarts with the new remotes), and a failed one (say, after a bad
+    value) is repaired the same way; one never started yet (the first push)
+    is left for the rebuild. Mail already queued survives the restart.
     """
     node = _node(step)
     content = alert_env_content(ctx.secrets)
@@ -1020,7 +1021,8 @@ def _ensure_alert_env(ctx: Context, step: Step) -> str:
     ssh.run(f"set -eu; cat > {tmp_path}", input=content)
     ssh.run(f"set -eu; mv -f {tmp_path} {final_path}")
     ssh.run(
-        f"set -eu; if systemctl is-active --quiet {ALERT_REMOTES_UNIT}; "
+        f"set -eu; if systemctl is-active --quiet {ALERT_REMOTES_UNIT} "
+        f"|| systemctl is-failed --quiet {ALERT_REMOTES_UNIT}; "
         f"then systemctl restart {ALERT_REMOTES_UNIT}; fi"
     )
 

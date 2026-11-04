@@ -174,7 +174,9 @@ pkgs.testers.runNixOSTest {
         node.succeed("test \"$(stat -c '%U %a' /run/stackbase-alert/remotes)\" = 'nullmailer 600'")
         node.succeed("grep -q -- '--port=${toString smtpPort} --tls --auth-login' /run/stackbase-alert/remotes")
         node.succeed("grep -q -- '--x509cafile=/etc/ssl/certs/ca-certificates.crt' /run/stackbase-alert/remotes")
-        # The password is in neither the store nor nullmailer's environment.
+        # The password is in no other file under /etc/nullmailer (only the
+        # remotes symlink points at it), and not in the running nullmailer's
+        # environment.
         node.fail("grep -rqs ${smtpPassword} /etc/nullmailer/ --exclude=remotes")
         node.fail("tr '\\0' '\\n' < /proc/$(systemctl show -p MainPID --value nullmailer)/environ | grep -q ${smtpPassword}")
 
@@ -194,6 +196,10 @@ pkgs.testers.runNixOSTest {
         # ...and the handler itself does not.
         out = node.succeed("systemctl show -p OnFailure stackbase-alert@x.service").strip()
         assert out == "OnFailure=", out
+        # And it is never start-limited, so a burst of failures cannot
+        # silence the next real one.
+        out = node.succeed("systemctl show -p StartLimitIntervalUSec stackbase-alert@x.service").strip()
+        assert out == "StartLimitIntervalUSec=0", out
 
     with subtest("test_alert_queued_while_relay_down"):
         node.succeed("systemctl stop mailpit-sink.service")
@@ -235,8 +241,30 @@ pkgs.testers.runNixOSTest {
 
 
     def run_freshness():
-        """Start the watchdog once; True if it passed."""
+        """Start the watchdog once; True if it passed. reset-failed first, so
+        systemd's start limit never decides the outcome."""
+        node.succeed("systemctl reset-failed stackbase-freshness.service || true")
         return node.execute("systemctl start stackbase-freshness.service")[0] == 0
+
+
+    def wait_freshness_mail(text, timeout=60):
+        """Until a watchdog mail whose body contains `text` arrives."""
+        deadline = time.monotonic() + timeout
+        while True:
+            for m in mails():
+                if m["Subject"] == FRESHNESS and text in body(m):
+                    return
+            assert time.monotonic() < deadline, f"no watchdog mail saying '{text}'"
+            time.sleep(1)
+
+
+    def override(**env):
+        lines = "".join(f"Environment={k}={v}\\n" for k, v in env.items())
+        node.succeed(
+            "mkdir -p /run/systemd/system/stackbase-freshness.service.d && "
+            f"printf '[Service]\\n{lines}' > /run/systemd/system/stackbase-freshness.service.d/no-grace.conf && "
+            "systemctl daemon-reload"
+        )
 
 
     with subtest("test_watchdog_grace_after_boot"):
@@ -252,11 +280,7 @@ pkgs.testers.runNixOSTest {
         node.wait_for_open_port(9598)
 
     # From here the watchdog checks: what the grace would otherwise hide.
-    node.succeed(
-        "mkdir -p /run/systemd/system/stackbase-freshness.service.d && "
-        "printf '[Service]\\nEnvironment=GRACE_SECONDS=0\\n' > /run/systemd/system/stackbase-freshness.service.d/no-grace.conf && "
-        "systemctl daemon-reload"
-    )
+    override(GRACE_SECONDS=0)
 
     with subtest("the watchdog passes on a fresh node"):
         assert run_freshness(), node.succeed("journalctl -u stackbase-freshness -o cat --no-pager | tail -5")
@@ -301,5 +325,70 @@ pkgs.testers.runNixOSTest {
         )
         newest = next(m for m in mails() if m["Subject"] == FRESHNESS)
         assert "backups: the newest successful backup" in body(newest), body(newest)
+
+    with subtest("test_watchdog_alerts_on_sent_stall"):
+        # A 20 s stall window instead of 2 h, through the same runtime
+        # override as the grace; the backup is fresh, so only Vector can fail.
+        override(GRACE_SECONDS=0, SENT_STALL_SECONDS=20)
+        node.succeed("date +%s > /var/lib/stackbase-backup/last-success")
+        node.succeed("rm -f /var/lib/stackbase-freshness/r2-samples /var/lib/stackbase-alert/stackbase-freshness.service")
+        node.succeed("systemctl stop minio.service")
+
+
+        def r2_counter(name):
+            metrics = node.succeed("curl -sf http://127.0.0.1:9598/metrics")
+            return sum(
+                float(line.rsplit("}", 1)[1].split()[0])
+                for line in metrics.splitlines()
+                if line.startswith(name + "{") and 'component_id="r2"' in line
+            )
+
+
+        names = ("vector_component_sent_events_total", "vector_buffer_received_events_total",
+                 "vector_component_received_events_total")
+        # A request already in flight when MinIO stopped can still complete;
+        # take the baseline only once `sent` has held still for 10 s.
+        deadline = time.monotonic() + 120
+        last, since = r2_counter(names[0]), time.monotonic()
+        while time.monotonic() - since < 10:
+            assert time.monotonic() < deadline, "sent never settled with MinIO stopped"
+            time.sleep(1)
+            now_sent = r2_counter(names[0])
+            if now_sent != last:
+                last, since = now_sent, time.monotonic()
+        run_freshness()  # the baseline sample, taken with R2 down and sent flat
+        before = {n: r2_counter(n) for n in names}
+        node.succeed("for i in $(seq 1 200); do logger -t stall stall-probe-$i; done")
+        time.sleep(25)
+        # Recorded for the sink's own received counter: once sent has
+        # settled it stays flat with it (observed delta 0), which is why the
+        # watchdog reads the buffer's received counter instead -- with the
+        # sink's, the alert below would never fire.
+        print("r2 counter deltas during the outage: "
+              + ", ".join(f"{n}={r2_counter(n) - before[n]:.0f}" for n in names))
+        assert r2_counter(names[0]) == before[names[0]], "something reached R2 with MinIO stopped"
+        assert r2_counter(names[1]) > before[names[1]], "no new entries entered the R2 buffer"
+        assert not run_freshness(), "the watchdog passed with nothing sent for longer than the window"
+        wait_freshness_mail("Vector has sent nothing to R2 since")
+        node.succeed("systemctl start minio.service")
+        node.wait_for_open_port(${toString minio.port})
+        override(GRACE_SECONDS=0)
+
+    with subtest("test_watchdog_backup_clock_fails_closed"):
+        # Neither stamp: the watchdog starts the clock now instead of staying
+        # silent forever...
+        node.succeed("rm -f /var/lib/stackbase-backup/last-success /var/lib/stackbase-backup/enabled-at")
+        node.succeed("rm -f /var/lib/stackbase-freshness/r2-samples")
+        node.wait_until_succeeds(
+            "systemctl reset-failed stackbase-freshness.service; systemctl start stackbase-freshness.service",
+            timeout=180,
+        )
+        node.succeed("test -e /var/lib/stackbase-backup/enabled-at")
+        node.succeed("journalctl -u stackbase-freshness -o cat --no-pager | grep -q 'no backup stamp yet: counting from now'")
+        # ...and 36 h later, with still no success, it says so.
+        node.succeed("touch -d '37 hours ago' /var/lib/stackbase-backup/enabled-at")
+        node.succeed("rm -f /var/lib/stackbase-alert/stackbase-freshness.service")
+        assert not run_freshness(), "the watchdog passed with no backup in 37 h"
+        wait_freshness_mail("no backup has succeeded yet")
   '';
 }

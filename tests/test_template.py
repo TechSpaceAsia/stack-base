@@ -872,6 +872,16 @@ class AlertsSettingsTests(unittest.TestCase):
         )
         self.assertEqual(opted_out["CHECK_BACKUPS"], "0")
 
+    def test_a_recipient_must_be_one_address(self) -> None:
+        """`to` lands in a To: header: a newline there would inject another header."""
+        result = _eval_mk_node(
+            "node.config.stackbase.alerts.to",
+            provider="null",
+            extra_config='stackbase.admins.matt = "k"; stackbase.alerts.to = [ "ops@example.org\\nBcc: x@evil.test" ];',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stackbase.alerts.to", result.stderr)
+
     def test_the_subject_names_project_environment_and_host(self) -> None:
         """`[<project>/<env>/<hostname>]`, or `[<project>/<hostname>]` for a
         project without [environments]."""

@@ -1000,6 +1000,7 @@ delivered when it is back, not lost. The relay is your own: stack-base bakes no
 mail server in. Set five secrets per environment and run `up`:
 
 ```bash
+ENV=<the environment, e.g. staging>
 SMTP_HOST=<the relay's host name, e.g. mail.example.com>
 SMTP_PORT=465
 SMTP_USER=<this environment's SMTP login>

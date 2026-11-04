@@ -129,6 +129,8 @@ let
     printf '%s smtp --port=%s --tls --auth-login --user=%s --pass=%s --x509cafile=%s\n' \
       "$SMTP_HOST" "$SMTP_PORT" "$SMTP_USER" "$SMTP_PASSWORD" /etc/ssl/certs/ca-certificates.crt \
       > ${runtimeDir}/remotes.new
+    # Nothing below needs it: keep it out of every later child's environment.
+    unset SMTP_PASSWORD
     chown ${nullmailerUser}:${nullmailerGroup} ${runtimeDir}/remotes.new
     mv -f ${runtimeDir}/remotes.new ${runtimeDir}/remotes
 
@@ -153,6 +155,8 @@ let
       for _ in $(seq 1 60); do
         if [ -e ${stateDir}/"$unit.service" ]; then
           echo "the failure of $unit.service is queued for ${lib.concatStringsSep ", " cfg.to}"
+          # The test unit has done its job; do not leave it listed as failed.
+          systemctl reset-failed "$unit.service" || true
           exit 0
         fi
         if systemctl is-failed --quiet "$handler"; then
@@ -186,12 +190,20 @@ let
       if [ "$CHECK_BACKUPS" = 1 ]; then
         # last-success is written by the backup unit when it completes;
         # before the first one, the age is counted from when backups were
-        # turned on (enabled-at, created once by tmpfiles).
+        # turned on (enabled-at, created once by tmpfiles). Fail closed: if
+        # neither exists, enabled-at is created now, so the clock starts
+        # here and a node that never backs up is reported 36 h later --
+        # never silent forever.
         if [ -r /var/lib/stackbase-backup/last-success ]; then
           last=$(cat /var/lib/stackbase-backup/last-success)
           what="the newest successful backup"
         else
-          last=$(stat -c %Y /var/lib/stackbase-backup/enabled-at 2>/dev/null || echo "$now")
+          if [ ! -e /var/lib/stackbase-backup/enabled-at ]; then
+            mkdir -p /var/lib/stackbase-backup
+            touch /var/lib/stackbase-backup/enabled-at
+            echo "no backup stamp yet: counting from now ($(date -u -Is))"
+          fi
+          last=$(stat -c %Y /var/lib/stackbase-backup/enabled-at)
           what="no backup has succeeded yet; backups were turned on"
         fi
         if [[ ! "$last" =~ ^[0-9]+$ ]]; then last=0; fi
@@ -218,7 +230,10 @@ let
           }
           buffered=$(metric vector_buffer_byte_size)
           sent=$(metric vector_component_sent_events_total)
-          received=$(metric vector_component_received_events_total)
+          # What entered the R2 sink's buffer: it keeps rising during an R2
+          # outage (the disk buffer accepts while `sent` stays flat), unlike
+          # the sink's own received counter, which stalls together with sent.
+          received=$(metric vector_buffer_received_events_total)
 
           if (( buffered > BUFFER_ALERT_BYTES )); then
             problems+=("logs: $buffered bytes are waiting in Vector's R2 buffer (alert above $BUFFER_ALERT_BYTES) -- R2 has been unreachable for a while; see journalctl -u vector")
@@ -226,9 +241,12 @@ let
 
           # Counters reset when Vector restarts, so a sample is only
           # compared with one taken at least SENT_STALL_SECONDS ago in the
-          # same run of Vector (neither counter went down).
+          # same run of Vector: samples with a counter above today's value
+          # (from before a restart) are dropped first.
           samples=/var/lib/stackbase-freshness/r2-samples
           touch "$samples"
+          awk -v sent="$sent" -v received="$received" '$2 <= sent && $3 <= received' "$samples" > "$samples.same-run"
+          mv -f "$samples.same-run" "$samples"
           old=$(awk -v cutoff=$(( now - SENT_STALL_SECONDS )) '$1 <= cutoff { line = $0 } END { print line }' "$samples")
           if [ -n "$old" ]; then
             read -r old_ts old_sent old_received <<<"$old"
@@ -252,7 +270,9 @@ in
 {
   options.stackbase.alerts = {
     to = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
+      # One address each, the same shape as smtp_from: these land in a To:
+      # header, where a newline would inject another header.
+      type = lib.types.listOf (lib.types.strMatching "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+");
       default = [ ];
       description = ''
         Who is mailed when any service on the node fails (stack.toml's
@@ -380,6 +400,13 @@ in
     systemd.services."stackbase-alert@" = {
       description = "Email the failure of %i.service to [alerts] to";
       path = [ pkgs.coreutils pkgs.systemd ];
+      # Never start-limited: a unit failing many times in a few seconds
+      # would otherwise trip systemd's default limit (5 starts in 10 s) on
+      # its handler, and the next failure -- possibly a different one, after
+      # the stamp expired -- would go unmailed with 'start-limit-hit'. The
+      # handler limits itself (one mail per unit per intervalHours) and
+      # exits at once when it has nothing to send.
+      startLimitIntervalSec = 0;
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${handler} %i";
