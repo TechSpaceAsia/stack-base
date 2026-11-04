@@ -78,8 +78,8 @@ _ENV_RE = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
 # drift apart on anything but servers, domain, buckets and recipients.
 _ENV_KEYS = frozenset({"domain", "nodes", "plan", "price_item", "backups", "logs", "alerts", "files"})
 _ENV_SECTION_KEYS: dict[str, frozenset[str]] = {
-    "backups": frozenset({"bucket", "retention_days"}),
-    "logs": frozenset({"bucket", "retention_days"}),
+    "backups": frozenset({"bucket", "retention_days", "enabled"}),
+    "logs": frozenset({"bucket", "retention_days", "enabled"}),
     "alerts": frozenset({"to"}),
     "files": frozenset({"bucket", "lock_days"}),
 }
@@ -446,9 +446,12 @@ def _parse_environments(
             plan=plan,
             price_item=price_item,
             nodes=nodes,
-            backups=_merge(shared.backups, _parse_backups(table, toml_path, table=f"{label}.backups"),
-                           table.get("backups")),
-            logs=_merge(shared.logs, _parse_logs(table, toml_path, table=f"{label}.logs"), table.get("logs")),
+            backups=_opt_out(_merge(shared.backups, _parse_backups(table, toml_path, table=f"{label}.backups"),
+                           table.get("backups")), table.get("backups")),
+            logs=_opt_out(
+                _merge(shared.logs, _parse_logs(table, toml_path, table=f"{label}.logs"), table.get("logs")),
+                table.get("logs"),
+            ),
             alerts=_merge(shared.alerts, _parse_alerts(table, toml_path, table=f"{label}.alerts"),
                           table.get("alerts")),
             files=_merge(shared.files, _parse_files(table, toml_path, table=f"{label}.files"),
@@ -495,6 +498,24 @@ def _merge(shared: Any, override: Any, raw: dict[str, Any] | None) -> Any:
     if not raw:
         return shared
     return replace(shared, **{key: getattr(override, key) for key in raw})
+
+
+def _opt_out(merged: Any, raw: dict[str, Any] | None) -> Any:
+    """An environment that sets `enabled = false` (and no bucket of its own)
+    opts out cleanly: the bucket it inherited from the shared table is
+    dropped, so it needs none and gets no R2 or logs steps. Only one table
+    setting both keys is an error (see `_reject_opt_out_with_bucket`)."""
+    if raw and raw.get("enabled") is False and "bucket" not in raw:
+        return replace(merged, bucket=None)
+    return merged
+
+
+def _reject_opt_out_with_bucket(section: Any, toml_path: Path, table: str) -> None:
+    if section.enabled is False and section.bucket:
+        raise StackError(
+            f"{toml_path} [{table}] has both enabled = false and bucket = \"{section.bucket}\"",
+            f"remove one of them: delete enabled = false to keep it on, or delete the bucket to leave it off",
+        )
 
 
 def _require_str(data: dict[str, Any], key: str, toml_path: Path) -> str:
@@ -725,13 +746,15 @@ def _parse_backups(data: dict[str, Any], toml_path: Path, *, table: str = "backu
 
     enabled = _optional_section_bool(raw, "enabled", toml_path, table)
 
-    return BackupsConfig(
+    backups = BackupsConfig(
         bucket=bucket,
         retention_days=retention_days,
         extra_paths=extra_paths,
         on_calendar=on_calendar,
         enabled=enabled,
     )
+    _reject_opt_out_with_bucket(backups, toml_path, table)
+    return backups
 
 
 def _section(data: dict[str, Any], key: str, cls: type, toml_path: Path, table: str) -> dict[str, Any] | None:
@@ -778,11 +801,13 @@ def _parse_logs(data: dict[str, Any], toml_path: Path, *, table: str = "logs") -
     raw = _section(data, "logs", LogsConfig, toml_path, table)
     if raw is None:
         return LogsConfig()
-    return LogsConfig(
+    logs = LogsConfig(
         enabled=_optional_section_bool(raw, "enabled", toml_path, table),
         bucket=_optional_bucket(raw, toml_path, table),
         retention_days=_optional_int(raw, "retention_days", toml_path, table),
     )
+    _reject_opt_out_with_bucket(logs, toml_path, table)
+    return logs
 
 
 def _check_logs_bucket(logs: LogsConfig, present: bool, toml_path: Path, env: str | None) -> None:

@@ -69,13 +69,13 @@ role = "primary"
 # health_tries = 30
 # health_sleep = 2
 
-# REQUIRED (since v0.2.0; uncomment one choice): nightly off-box backups. The project's database,
-# plus any directories listed here, encrypted to infra/age-recipients.txt and
-# uploaded to Cloudflare R2. Name a bucket to turn them on (the credentials
-# live in secrets.age as r2_access_key_id, r2_secret_access_key and
-# r2_endpoint), or write `enabled = false` to opt out -- `up` then warns on
-# every run. With neither, `up` refuses. retention_days defaults to 30 and
-# on_calendar to "03:00" (UTC).
+# REQUIRED (since v0.2.0; uncomment one choice): nightly off-box backups.
+# The project's database, plus any directories listed here, encrypted to
+# infra/age-recipients.txt and uploaded to Cloudflare R2. Name a bucket to
+# turn them on (the credentials live in secrets.age as r2_access_key_id,
+# r2_secret_access_key and r2_endpoint), or write `enabled = false` to opt
+# out -- `up` then warns on every run. With neither, `up` refuses.
+# retention_days defaults to 30 and on_calendar to "03:00" (UTC).
 # [backups]
 # bucket = "acme-backups"
 # enabled = false
@@ -83,11 +83,11 @@ role = "primary"
 # extra_paths = ["/var/lib/acme/uploads"]
 # on_calendar = "03:00"
 
-# REQUIRED (since v0.2.0; uncomment one choice): the servers' journal, shipped off-box to R2 by
-# Vector. Name a bucket (its own R2 token: logs_access_key_id and
-# logs_secret_access_key in the secrets) or opt out with `enabled = false`.
-# Needs the cloudflare_account_id secret, to set the retention rule.
-# retention_days defaults to 90.
+# REQUIRED (since v0.2.0; uncomment one choice): the servers' journal,
+# shipped off-box to R2 by Vector. Name a bucket (its own R2 token:
+# logs_access_key_id and logs_secret_access_key in the secrets) or opt out
+# with `enabled = false`. Needs the cloudflare_account_id secret, to set the
+# retention rule. retention_days defaults to 90.
 # [logs]
 # bucket = "acme-logs"
 # enabled = false
@@ -118,7 +118,8 @@ role = "primary"
 # everything else in this file is then shared, so the two match. An
 # environment may set only its domain, its nodes, plan/price_item, and the
 # bucket/retention_days/to/lock_days keys of [backups], [logs], [alerts]
-# and [files]. Every command then needs --env (`./infra/up --env staging
+# and [files], plus `enabled = false` in [backups] / [logs] to opt that
+# environment out. Every command then needs --env (`./infra/up --env staging
 # up --plan`), and each environment keeps its own stack.state.<env>.json,
 # secrets.<env>.age and deploy.<env>.age. See the README's "Staging and
 # production" section.

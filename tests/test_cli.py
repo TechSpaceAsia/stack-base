@@ -1302,10 +1302,6 @@ class EnvironmentFlagTests(unittest.TestCase):
             self.assertIn("known nodes: a", output)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class BaselineOptOutWarningTests(unittest.TestCase):
     def test_opt_outs_warn_once_each_on_stderr_and_keep_stdout_clean(self) -> None:
         with TemporaryDirectory() as tmp, FakeServer() as server:
@@ -1322,3 +1318,7 @@ class BaselineOptOutWarningTests(unittest.TestCase):
             self.assertEqual(sum("backups are OFF" in line for line in stderr.getvalue().splitlines()), 1)
             self.assertEqual(sum("logs are OFF" in line for line in stderr.getvalue().splitlines()), 1)
             self.assertNotIn("are OFF", stdout.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -638,6 +638,68 @@ role = "primary"
 """
 
 
+_OPT_OUT_ENVS = """\
+project = "acme"
+owner = "octocat"
+datacenter = "kul"
+plan = "KVM 1"
+admins = ["matt"]
+
+[backups]
+bucket = "acme-backups"
+
+[logs]
+bucket = "acme-logs"
+
+[environments.staging]
+domain = "staging.acme.example.com"
+backups.enabled = false
+logs.enabled = false
+[environments.staging.nodes.a]
+role = "primary"
+
+[environments.production]
+domain = "acme.example.com"
+[environments.production.nodes.a]
+role = "primary"
+"""
+
+
+class EnvironmentOptOutTests(unittest.TestCase):
+    def _load(self, toml: str):
+        with TempInfraDir() as infra_dir:
+            _envs_project(infra_dir, toml)
+            return load_config(infra_dir)
+
+    def test_environment_opts_out_of_shared_buckets(self) -> None:
+        from stackbase.reconcile import check_baseline
+
+        config = self._load(_OPT_OUT_ENVS)
+        staging, production = config.env("staging"), config.env("production")
+
+        self.assertIsNone(staging.backups.bucket)
+        self.assertIsNone(staging.logs.bucket)
+        self.assertEqual(len(check_baseline(staging)), 2)
+        self.assertEqual(production.backups.bucket, "acme-backups")
+        self.assertEqual(production.logs.bucket, "acme-logs")
+        self.assertEqual(check_baseline(production), [])
+
+    def test_environment_table_with_both_keys_raises(self) -> None:
+        for table, bucket in (("backups", "acme-b"), ("logs", "acme-l")):
+            toml = _OPT_OUT_ENVS.replace(
+                f"{table}.enabled = false", f'{table}.enabled = false\n{table}.bucket = "{bucket}"'
+            )
+            with self.subTest(table=table), self.assertRaises(StackError) as caught:
+                self._load(toml)
+            self.assertIn("enabled = false", str(caught.exception))
+
+    def test_shared_table_with_both_keys_raises(self) -> None:
+        for table in ("backups", "logs"):
+            toml = _OPT_OUT_ENVS.replace(f"[{table}]\n", f"[{table}]\nenabled = false\n", 1)
+            with self.subTest(table=table), self.assertRaises(StackError):
+                self._load(toml)
+
+
 class EnvironmentsTests(unittest.TestCase):
     def test_legacy_file_is_one_implicit_env(self) -> None:
         with TempInfraDir() as infra_dir:
@@ -718,8 +780,6 @@ class EnvironmentsTests(unittest.TestCase):
             ("auto_patch = false", "auto_patch"),
             ('backups.extra_paths = ["/srv"]', "backups.extra_paths"),
             ('backups.on_calendar = "04:00"', "backups.on_calendar"),
-            ("backups.enabled = false", "backups.enabled"),
-            ("logs.enabled = false", "logs.enabled"),
             ('alerts.cc = ["x@example.com"]', "alerts.cc"),
             ("files.versioning = true", "files.versioning"),
         ):

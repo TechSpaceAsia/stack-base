@@ -3467,11 +3467,6 @@ class EnvironmentPlanTests(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-
 # --------------------------------------------------------------------------
 # Backups and logs are required, or explicitly opted out (v0.2.0)
 # --------------------------------------------------------------------------
@@ -3569,6 +3564,12 @@ class BaselineRequiredTests(unittest.TestCase):
         args = mock.Mock(plan=True, allow_dirty=True)
         with mock.patch("stackbase.__main__.load_config", return_value=cfg), mock.patch(
             "stackbase.__main__.HostingerClient"
-        ) as hostinger, mock.patch("stackbase.__main__.load_state"), self.assertRaises(StackError):
+        ) as hostinger, mock.patch("stackbase.__main__.load_state"), self.assertRaises(StackError) as caught:
             _up(args, Path("/nonexistent"), {}, None)
         hostinger.assert_not_called()
+        self.assertIn("backups are required but no [backups] bucket is set", str(caught.exception))
+        self.assertIn("enabled = false", caught.exception.hint)
+
+
+if __name__ == "__main__":
+    unittest.main()

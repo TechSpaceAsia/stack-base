@@ -280,8 +280,12 @@ role = "primary"
   `[environments.<env>.nodes.<n>]` (required, same shape as `[nodes.<n>]`),
   `plan` and `price_item`, and `backups.bucket`, `backups.retention_days`,
   `logs.bucket`, `logs.retention_days`, `alerts.to`, `files.bucket` and
-  `files.lock_days`, each overriding the shared value. Any other key there is
-  an error, and so is a top-level `[nodes]` next to `[environments]`.
+  `files.lock_days`, each overriding the shared value. `backups.enabled =
+  false` and `logs.enabled = false` are also allowed: that environment opts
+  out cleanly (it drops the shared bucket, warns on every run, gets no R2 or
+  logs steps) while the others keep using the shared one; setting both
+  `enabled = false` and a bucket in the same table is an error. Any other key
+  there is an error, and so is a top-level `[nodes]` next to `[environments]`.
   Environment names are lowercase letters, digits and `-`, at most 16
   characters.
 - **`--env <name>` is required on every command** once `[environments]`
