@@ -81,6 +81,14 @@ role = "primary"
 # extra_paths = ["/var/lib/acme/uploads"]
 # on_calendar = "03:00"
 
+# Optional. Uploaded files in R2, under a bucket lock: objects can be neither
+# deleted nor overwritten for lock_days (1-3650, default 30). The app gets
+# STORAGE_* variables; set files_access_key_id and files_secret_access_key
+# in the environment's secrets. See the README's "Uploaded files in R2".
+# [files]
+# bucket = "acme-files"
+# lock_days = 30
+
 # Optional. Staging and production from this one file. Replace the
 # top-level `domain` and [nodes.*] above with one table per environment;
 # everything else in this file is then shared, so the two match. An

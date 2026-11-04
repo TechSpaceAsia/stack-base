@@ -262,6 +262,10 @@ class Local:
     # None when any is missing. Only rendered for an environment whose
     # [alerts] names recipients -- see `_needs_alert_env`.
     alert_env_sha: str | None = None
+    # sha256 of the STORAGE_* block appended to the pushed app.env, or None
+    # when the environment has no [files] bucket. Kept out of app_env_sha on
+    # purpose: see stackbase/files.py and `_needs_app_env`.
+    files_env_sha: str | None = None
 
 
 def local_facts(
@@ -282,6 +286,7 @@ def local_facts(
     from stackbase.backups import backup_env_content, backup_env_digest
     from stackbase.alerts import alert_env_content, alert_env_digest, alerts_enabled
     from stackbase.logs import logs_enabled, logs_env_content, logs_env_digest
+    from stackbase.files import files_env_digest, storage_env_block, storage_env_lines
 
     app_env_raw = secrets.get("app_env")
     backup_env = backup_env_content(secrets)
@@ -291,6 +296,9 @@ def local_facts(
     logs_env = logs_env_content(secrets) if env is not None and logs_enabled(env.logs) else None
     # Same rule for alerts: no [alerts], no smtp_* validation at all.
     alert_env = alert_env_content(secrets) if env is not None and alerts_enabled(env.alerts) else None
+    # Raises on incomplete credentials or a STORAGE_* collision in app_env,
+    # so a bad [files] setup fails on every `up`, `--plan` included.
+    storage_lines = storage_env_lines(env, secrets) if env is not None else []
     return Local(
         desired_rev=compute_rev(infra_dir, stackbase_src=stackbase_src),
         has_origin_cert=bool(secrets.get("origin_cert")) and bool(secrets.get("origin_key")),
@@ -301,6 +309,7 @@ def local_facts(
         backup_env_sha=backup_env_digest(backup_env) if backup_env else None,
         logs_env_sha=logs_env_digest(logs_env) if logs_env else None,
         alert_env_sha=alert_env_digest(alert_env) if alert_env else None,
+        files_env_sha=files_env_digest(storage_env_block(storage_lines)) if storage_lines else None,
     )
 
 
@@ -1247,9 +1256,14 @@ def _needs_app_env(state: StackState, observed: Observed, name: str) -> bool:
     at all -- deliberately not a step, and deliberately not a removal (see
     `Local.app_env_sha`'s docstring and the README's "app_env" section)."""
     desired = observed.local.app_env_sha
+    node_state = state.nodes.get(name) or NodeState()
+    # The STORAGE_* block rides in the same file but has its own digest, so a
+    # rotated files key re-pushes even when app_env itself did not change.
+    files_desired = observed.local.files_env_sha
+    if files_desired is not None and node_state.files_env_sha != files_desired:
+        return True
     if desired is None:
         return False
-    node_state = state.nodes.get(name) or NodeState()
     return node_state.app_env_sha != desired
 
 

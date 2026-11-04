@@ -1138,6 +1138,48 @@ and a `cloudflare_token` that carries **Account → Workers R2 Storage → Edit*
 (the DNS token may simply carry that scope too). If a bucket is named and
 `cloudflare_account_id` is missing, `up` stops and says so.
 
+### Uploaded files in R2
+
+An app that takes uploads should put them in R2, not on the node's disk. A
+disk is per node (the blue and green releases and a second node would not see
+each other's files), it is only backed up nightly, and it dies with the
+server; R2 is shared by every node, outlives them, and costs no egress.
+(`[backups].extra_paths` stays for apps that still write files to disk.)
+
+```toml
+[files]
+bucket = "acme-files"   # per environment: "acme-files-staging" in [environments.staging]
+lock_days = 30          # optional, 1 to 3650, default 30
+```
+
+Set the bucket's own token (an R2 token scoped to the files bucket, not the
+backup or logs one) in the environment's secrets, next to the shared
+`r2_endpoint`:
+
+```bash
+printf '%s' "$FILES_ACCESS_KEY_ID" | ./infra/up secrets set files_access_key_id
+printf '%s' "$FILES_SECRET_ACCESS_KEY" | ./infra/up secrets set files_secret_access_key
+```
+
+`up` then appends these to the app's environment, after `app_env`:
+`STORAGE_BUCKET`, `STORAGE_ENDPOINT`, `STORAGE_REGION=auto`,
+`STORAGE_ACCESS_KEY_ID`, `STORAGE_SECRET_ACCESS_KEY` and `STORAGE_LOCK_DAYS`.
+They are not part of `app_env`: a `STORAGE_*` line in `app_env` is refused
+(one owner per variable), incomplete files credentials are refused naming the
+missing keys, and rotating a files key alone re-pushes and restarts the app.
+A project without `[files]` gets exactly the environment it had before.
+
+**The bucket lock has consequences.** Every object is locked for `lock_days`,
+which forbids deleting **and overwriting** it until the lock expires. So the
+app must:
+
+- write a unique key for every upload (never reuse a key to "replace" a file);
+- treat a refused delete as "delete later": a user's deletion (a GDPR erasure,
+  say) is queued and finishes once the lock has expired, so make that delay
+  part of your retention promise.
+
+platform-base's storage backend does both; see its storage documentation.
+
 ## Things to watch
 
 Three ways to hurt yourself that no amount of code can prevent.

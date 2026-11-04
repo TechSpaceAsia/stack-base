@@ -825,10 +825,15 @@ def _parse_files(data: dict[str, Any], toml_path: Path, *, table: str = "files")
     raw = _section(data, "files", FilesConfig, toml_path, table)
     if raw is None:
         return FilesConfig()
-    return FilesConfig(
-        bucket=_optional_bucket(raw, toml_path, table),
-        lock_days=_optional_int(raw, "lock_days", toml_path, table),
-    )
+    lock_days = _optional_int(raw, "lock_days", toml_path, table)
+    # The lock forbids deleting AND overwriting for this long; Cloudflare caps
+    # a rule's age far above ten years, and zero would lock nothing.
+    if lock_days is not None and not 1 <= lock_days <= 3650:
+        raise StackError(
+            f"{toml_path} has an invalid [{table}].lock_days {lock_days!r}",
+            f"[{table}].lock_days must be between 1 and 3650 (days); leave it out for the default of 30",
+        )
+    return FilesConfig(bucket=_optional_bucket(raw, toml_path, table), lock_days=lock_days)
 
 
 def _parse_mesh(data: dict[str, Any], toml_path: Path) -> MeshConfig:
@@ -899,6 +904,10 @@ class NodeState:
     # recently pushed to this node. None until the first push, and left out
     # of the state file like logs_env_sha.
     alert_env_sha: str | None = None
+    # sha256 of the STORAGE_* block appended to app.env (from [files] and the
+    # files_* secrets), tracked apart from app_env_sha so changing it alone
+    # still re-pushes. Left out of the state file when unset.
+    files_env_sha: str | None = None
     # Set when a purchase answered HTTP 202 (payment still processing): the
     # subscription id the VM-to-be will carry. While set, the node is never
     # purchased again; it is adopted by this id once the VM shows up, and
@@ -965,7 +974,7 @@ def _save_state_file(state_path: Path, state: StackState) -> None:
     # An unset marker is omitted so a state file that never saw a 202 purchase
     # (or never shipped logs, or never mailed alerts) is byte-identical to what earlier versions wrote.
     for node in payload["nodes"].values():
-        for key in ("pending_subscription_id", "logs_env_sha", "alert_env_sha"):
+        for key in ("pending_subscription_id", "logs_env_sha", "alert_env_sha", "files_env_sha"):
             if node.get(key) is None:
                 node.pop(key, None)
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"

@@ -27,6 +27,7 @@ from typing import Callable
 
 from stackbase.alerts import ALERT_REMOTES_UNIT, alert_env_content, alert_env_digest
 from stackbase.backups import backup_env_content, backup_env_digest
+from stackbase.files import files_env_digest, storage_env_block, storage_env_lines
 from stackbase.logs import LOGS_UNIT, logs_env_content, logs_env_digest
 from stackbase.config import save_state
 from stackbase.mesh import (
@@ -749,7 +750,10 @@ def _ensure_app_env(ctx: Context, step: Step) -> str:
     """
     node = _node(step)
     raw = ctx.secrets.get("app_env")
-    if not raw:
+    # The STORAGE_* block (empty without [files]) is validated before any ssh
+    # call too, and is appended after app_env without entering its digest.
+    storage_lines = storage_env_lines(ctx.environment, ctx.secrets)
+    if not raw and not storage_lines:
         raise StackError(
             f"infra/{ctx.secrets_file.name} has no 'app_env' to push",
             "this is a bug in stack-base -- please report it",
@@ -757,7 +761,9 @@ def _ensure_app_env(ctx: Context, step: Step) -> str:
     # Validated and normalised before any ssh call: a malformed app_env must
     # never open a connection, let alone reach the node -- and the message
     # never echoes any part of its content.
-    normalized = validate_app_env(raw)
+    normalized = validate_app_env(raw) if raw else ""
+    block = storage_env_block(storage_lines)
+    pushed = normalized + block
 
     project = ctx.cfg.project
     ssh = ctx.ssh(node)
@@ -773,7 +779,7 @@ def _ensure_app_env(ctx: Context, step: Step) -> str:
     tmp_path = _cert_path("app.env.new")
     final_path = _cert_path("app.env")
     ssh.run(f"set -eu; install -m 0640 -o root -g {shlex.quote(project)} /dev/null {tmp_path}")
-    ssh.run(f"set -eu; cat > {tmp_path}", input=normalized)
+    ssh.run(f"set -eu; cat > {tmp_path}", input=pushed)
     ssh.run(f"set -eu; mv -f {tmp_path} {final_path}")
 
     # The restart runs BEFORE app_env_sha is saved (Fix round, B2): the old
@@ -787,7 +793,11 @@ def _ensure_app_env(ctx: Context, step: Step) -> str:
     # here leaves state unchanged and the whole step (push + restart) retries
     # on the next `up`.
     color = _restart_active_color(ctx, ssh, node, project)
-    ctx.node_state(node).app_env_sha = app_env_digest(normalized)
+    node_state = ctx.node_state(node)
+    if raw:
+        node_state.app_env_sha = app_env_digest(normalized)
+    if storage_lines:
+        node_state.files_env_sha = files_env_digest(block)
 
     if color:
         return f"node {node}: application environment updated, {color} restarted"
