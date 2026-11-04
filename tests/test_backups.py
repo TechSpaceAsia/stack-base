@@ -285,6 +285,23 @@ class CheckBackupCredentialsTests(unittest.TestCase):
         for key in ("r2_access_key_id", "r2_secret_access_key", "r2_endpoint"):
             self.assertIn(key, line)
 
+    def test_the_advice_is_enabled_false_not_removing_the_bucket(self) -> None:
+        # Removing the bucket is now refused ("backups are required"); the
+        # supported way to leave backups off is an explicit opt-out.
+        line = self._warnings("acme-backups", None)[0]
+        self.assertIn("enabled = false", line)
+        self.assertNotIn("remove `bucket`", line)
+
+    def test_an_environment_names_its_own_secrets_file_and_env_flag(self) -> None:
+        emitted: list[str] = []
+        check_backup_credentials(
+            "acme-backups/staging", None, emit=emitted.append, secrets_name="secrets.staging.age", env="staging"
+        )
+        line = emitted[0]
+        self.assertIn("infra/secrets.staging.age", line)
+        self.assertNotIn("infra/secrets.age", line)
+        self.assertIn("./infra/up --env staging secrets set <key>", line)
+
     def test_an_incomplete_credential_set_warns_the_same_way(self) -> None:
         # backup_env_content() is all-or-nothing, so two of the three keys
         # render as None -- the same `backup_env_sha is None` this sees.

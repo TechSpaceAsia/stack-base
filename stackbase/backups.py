@@ -138,7 +138,14 @@ def backup_env_digest(content: str) -> str:
 _NIGHTLY_TIME = "03:00 UTC"
 
 
-def check_backup_credentials(bucket: str | None, backup_env_sha: str | None, *, emit: Callable[[str], None]) -> None:
+def check_backup_credentials(
+    bucket: str | None,
+    backup_env_sha: str | None,
+    *,
+    emit: Callable[[str], None],
+    secrets_name: str = "secrets.age",
+    env: str | None = None,
+) -> None:
     """Warn when a bucket is named but no credentials will be pushed.
 
     The two halves of "backups are on" are decided in two different places
@@ -154,16 +161,21 @@ def check_backup_credentials(bucket: str | None, backup_env_sha: str | None, *, 
     R2 token not issued yet) must still be able to run `up` for everything
     else. The line names all three keys because the failure mode that gets
     reported is usually "I set the ones I had".
+
+    `secrets_name` is the environment's own secrets file and `env` its name
+    (None for a single-environment project), so the advice names the right
+    file and command.
     """
     if not bucket or backup_env_sha is not None:
         return
     keys = ", ".join(key for key, _variable in _R2_KEYS)
+    env_flag = f" --env {env}" if env else ""
     emit(
-        f"! [backups] bucket = \"{bucket}\" is set but infra/secrets.age has no complete set of "
+        f"! [backups] bucket = \"{bucket}\" is set but infra/{secrets_name} has no complete set of "
         f"R2 credentials, so nothing is pushed -- the nightly backup timer is still installed on "
         f"every node and will fail at {_NIGHTLY_TIME} with \"no credentials in {BACKUP_ENV_PATH}\". "
-        f"Set all three of {keys} (`./infra/up secrets set <key>`) and run `up` again, or remove "
-        "`bucket` from stack.toml's [backups] table to leave backups off."
+        f"Set all three of {keys} (`./infra/up{env_flag} secrets set <key>`) and run `up` again, or "
+        "set `enabled = false` in stack.toml's [backups] table to leave backups off."
     )
 
 

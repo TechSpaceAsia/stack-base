@@ -374,7 +374,13 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env_
     # 03:00 -- say so now, next to the other pre-flight warnings. Emitted
     # under `--plan` too: it is a statement about the configuration, not
     # about what this particular run is going to push.
-    check_backup_credentials(env.backups.bucket, local.backup_env_sha, emit=_emit_masked(secrets))
+    check_backup_credentials(
+        env.backups.bucket,
+        local.backup_env_sha,
+        emit=_emit_masked(secrets),
+        secrets_name=env_secrets.name,
+        env=None if env.implicit else env.name,
+    )
     # Logs on with no credentials would fail the rebuild that starts Vector,
     # so it is refused here, before anything is touched.
     check_logs_credentials(env, local.logs_env_sha)

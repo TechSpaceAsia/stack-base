@@ -315,7 +315,10 @@ def r2_account_for(env: Environment, secrets: dict[str, str], *, base_url: str =
         raise StackError(
             "[logs] or [files] names an R2 bucket but the 'cloudflare_account_id' secret is not set",
             "set it: ACCOUNT_ID=<your Cloudflare account id>; "
-            "printf '%s' \"$ACCOUNT_ID\" | ./infra/up secrets set cloudflare_account_id",
+            + ("" if env.implicit else f"ENV={env.name}; ")
+            + "printf '%s' \"$ACCOUNT_ID\" | ./infra/up "
+            + ("" if env.implicit else '--env "$ENV" ')
+            + "secrets set cloudflare_account_id",
         )
     token = secrets.get("cloudflare_token")
     if not token:

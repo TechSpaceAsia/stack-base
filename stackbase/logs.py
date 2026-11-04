@@ -39,9 +39,10 @@ _LOGS_KEYS: tuple[tuple[str, str], ...] = (
 def logs_enabled(logs: LogsConfig) -> bool:
     """Logs ship when the environment names a bucket and has not opted out.
 
-    stackbase/config.py already refused a [logs] table with no bucket, so
-    "no bucket" here can only mean "no [logs] table at all" -- which keeps
-    such a project exactly as it was before logs existed.
+    "No bucket" here means logs are off: either an explicit
+    `enabled = false`, or no [logs] table at all -- which `check_baseline`
+    (stackbase/reconcile.py) refuses on `up` unless it opts out, so a
+    project that gets as far as planning has chosen.
     """
     return bool(logs.bucket) and logs.enabled is not False
 

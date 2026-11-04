@@ -231,6 +231,19 @@ class AccountIdTests(unittest.TestCase):
             r2_account_for(env, {"cloudflare_token": "tok"})
         self.assertIn("cloudflare_account_id", ctx.exception.message + ctx.exception.hint)
 
+    def test_the_account_id_hint_names_the_environment(self) -> None:
+        env = dataclasses.replace(_env(logs=LogsConfig(bucket="acme-logs")), name="staging")
+        with self.assertRaises(StackError) as ctx:
+            r2_account_for(env, {"cloudflare_token": "tok"})
+        self.assertIn('./infra/up --env "$ENV" secrets set cloudflare_account_id', ctx.exception.hint)
+        self.assertIn("ENV=staging", ctx.exception.hint)
+
+    def test_the_account_id_hint_has_no_env_flag_without_environments(self) -> None:
+        env = _env(logs=LogsConfig(bucket="acme-logs"))
+        with self.assertRaises(StackError) as ctx:
+            r2_account_for(env, {"cloudflare_token": "tok"})
+        self.assertNotIn("--env", ctx.exception.hint)
+
     def test_missing_token_names_secret(self) -> None:
         env = _env(files=FilesConfig(bucket="acme-files"))
         with self.assertRaises(StackError) as ctx:

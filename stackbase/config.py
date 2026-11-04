@@ -839,8 +839,8 @@ def _check_logs_bucket(logs: LogsConfig, present: bool, toml_path: Path, env: st
 
     Checked after the environment merge: a shared [logs] may set only
     retention_days and leave each environment to name its own bucket. A
-    project with no [logs] table at all is not refused here -- it keeps
-    working exactly as before logs existed.
+    project with no [logs] table at all is not refused here, but `up` refuses
+    it later (`check_baseline`) unless it sets `enabled = false`.
     """
     if not present or logs.enabled is False or logs.bucket:
         return

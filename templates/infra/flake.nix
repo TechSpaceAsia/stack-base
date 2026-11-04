@@ -40,8 +40,8 @@
 {
   description = "NixOS configuration for this project's servers";
 
-  # Where the shared stack-base modules come from. The third path segment
-  # (v0.1.0) is the pinned release -- every project stays on it until you
+  # Where the shared stack-base modules come from. The last path segment
+  # (the vX.Y.Z tag) is the pinned release -- every project stays on it until you
   # deliberately move. To upgrade: change it here, then delete flake.lock
   # (or run `nix flake lock --update-input stack-base` if you have Nix
   # installed locally) and run ./infra/up -- it re-resolves the new ref and

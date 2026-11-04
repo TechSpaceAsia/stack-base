@@ -760,8 +760,9 @@ combination on every run:
 ! [backups] bucket = "..." is set but infra/secrets.age has no complete set of R2 credentials, ...
 ```
 
-Finish the three `secrets set` commands, or drop `bucket` from the
-`[backups]` table to leave backups off.
+Finish the three `secrets set` commands (with `--env "$ENV"` in a project
+with environments), or set `enabled = false` in the `[backups]` table to
+leave backups off.
 
 What happens at 03:00 UTC on each node:
 
@@ -881,8 +882,9 @@ retention_days = 90
 With [environments](#staging-and-production), give each one its own bucket
 (`logs.bucket = "acme-logs-staging"` in `[environments.staging]`). A `[logs]`
 table that names no bucket after that merge is refused; `enabled = false` in
-`[logs]` turns logs off instead. A project with no `[logs]` table at all ships
-nothing and plans exactly what it did before.
+`[logs]` turns logs off instead. A project with no `[logs]` table at all is
+refused by `up` (v0.2.0 requires logs): add a bucket, or set `enabled = false`
+to leave them off.
 
 The node writes with its own R2 token, scoped to the logs bucket — not the
 backup one. `r2_endpoint` is shared with backups:
@@ -1044,7 +1046,7 @@ mails — when:
 - Vector has sent nothing to R2 for 2 hours although new entries came in.
 
 It checks nothing during the first hour after a boot, while Vector and the
-first backup catch up. A check whose feature is off (no `[logs]`,
+first backup catch up. A check whose feature is off (`[logs] enabled = false`,
 `[backups] enabled = false`) is skipped.
 
 **Check it end to end:**
@@ -1143,6 +1145,13 @@ ACCOUNT_ID=<your Cloudflare account id>
 printf '%s' "$ACCOUNT_ID" | ./infra/up secrets set cloudflare_account_id
 ```
 
+With [environments](#staging-and-production), set it for each one:
+
+```bash
+ENV=staging
+printf '%s' "$ACCOUNT_ID" | ./infra/up --env "$ENV" secrets set cloudflare_account_id
+```
+
 and a `cloudflare_token` that carries **Account → Workers R2 Storage → Edit**
 (the DNS token may simply carry that scope too). If a bucket is named and
 `cloudflare_account_id` is missing, `up` stops and says so.
@@ -1211,6 +1220,14 @@ bucket = "acme-backups"      # or: enabled = false  (warns on every run)
 
 [logs]
 bucket = "acme-logs"         # or: enabled = false  (warns on every run)
+```
+
+Move the pinned release too: bump `inputs.stack-base.url` in `infra/flake.nix`
+to `v0.2.0` and re-lock:
+
+```bash
+sed -i 's#stack-base/v0\.[0-9.]*"#stack-base/v0.2.0"#' infra/flake.nix
+cd infra && nix flake lock --update-input stack-base
 ```
 
 `enabled = false` together with a bucket is an error: say one or the other.
