@@ -19,6 +19,7 @@ bucket, an object or a rule (`tests/test_no_delete.py` pins that).
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -97,8 +98,15 @@ class R2Account:
         except ApiError as exc:
             # A missing bucket is HTTP 404 (error code 10006, "The specified
             # bucket does not exist"); anything else is a real failure.
-            if exc.status == 404 or "10006" in exc.body:
+            if exc.status == 404 and _is_missing_bucket(exc.body):
                 return False
+            if exc.status == 404:
+                # A 404 that is not "bucket does not exist" is a wrong
+                # account id or a token that cannot see this account.
+                raise StackError(
+                    f"R2 returned 404 for bucket '{name}' but not 'bucket does not exist'",
+                    "check that cloudflare_account_id is the right account and that the token can see it",
+                ) from exc
             raise
         return True
 
@@ -107,13 +115,13 @@ class R2Account:
         self._call("POST", f"/accounts/{self._account_id}/r2/buckets", json_body={"name": name})
 
     def get_lifecycle(self, name: str) -> list[dict]:
-        return _rules(self._call("GET", self._path(name, "/lifecycle")))
+        return _rules(self._call("GET", self._path(name, "/lifecycle")), name, "lifecycle")
 
     def put_lifecycle(self, name: str, rules: list[dict]) -> None:
         self._put_rules(self._path(name, "/lifecycle"), rules)
 
     def get_lock(self, name: str) -> list[dict]:
-        return _rules(self._call("GET", self._path(name, "/lock")))
+        return _rules(self._call("GET", self._path(name, "/lock")), name, "lock")
 
     def put_lock(self, name: str, rules: list[dict]) -> None:
         self._put_rules(self._path(name, "/lock"), rules)
@@ -128,10 +136,36 @@ class R2Account:
         self._call("PUT", path, json_body={"rules": rules})
 
 
-def _rules(parsed: dict[str, Any]) -> list[dict]:
+def _is_missing_bucket(body: str) -> bool:
+    """A body-less 404 is "absent"; a JSON one must carry error code 10006."""
+    if not body.strip():
+        return True
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return False
+    errors = parsed.get("errors") if isinstance(parsed, dict) else None
+    return isinstance(errors, list) and any(isinstance(e, dict) and e.get("code") == 10006 for e in errors)
+
+
+def _rules(parsed: dict[str, Any], bucket: str, what: str) -> list[dict]:
+    """The rule list from a GET. Only an explicit `"rules": []` means "no rules".
+
+    Both PUTs replace the whole list, so a GET we cannot read must never be
+    mistaken for an empty bucket: merging into `[]` would erase every foreign
+    rule (a legal-hold lock included). Anything unexpected refuses instead.
+    (Cloudflare's reference marks `rules` optional but does not say an empty
+    bucket omits it; the live API is believed to return `"rules": []`.)
+    """
     result = parsed.get("result")
     rules = result.get("rules") if isinstance(result, dict) else None
-    return [r for r in rules if isinstance(r, dict)] if isinstance(rules, list) else []
+    if not isinstance(rules, list) or not all(isinstance(r, dict) for r in rules):
+        raise StackError(
+            f"R2 returned an unreadable {what} rule list for bucket '{bucket}'",
+            "nothing was written -- stack-base will not replace rules it cannot read; "
+            "check the bucket in the Cloudflare dashboard and report this if it persists",
+        )
+    return rules
 
 
 # -- Rules ---------------------------------------------------------------------

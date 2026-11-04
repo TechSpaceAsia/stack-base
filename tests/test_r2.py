@@ -159,6 +159,51 @@ class AccountClientTests(unittest.TestCase):
             self.assertEqual([r["id"] for r in sent], ["someone-elses-rule", "stackbase-logs"])
 
 
+class UnreadableRulesTests(unittest.TestCase):
+    """A GET we cannot read must never lead to a PUT (a PUT replaces every rule)."""
+
+    _BAD = [
+        ("result null", 200, {"success": True, "errors": [], "result": None}),
+        ("result empty object", 200, {"success": True, "errors": [], "result": {}}),
+        ("rules a string", 200, {"success": True, "errors": [], "result": {"rules": "oops"}}),
+        ("non-dict entry", 200, {"success": True, "errors": [], "result": {"rules": [{"id": "a"}, "x"]}}),
+        ("http 500", 500, {"success": False, "errors": [{"code": 1, "message": "boom"}]}),
+    ]
+
+    def test_no_put_after_unreadable_get(self) -> None:
+        for kind, ensure, rule in (
+            ("lifecycle", ensure_lifecycle_rule, logs_lifecycle_rule(90)),
+            ("lock", ensure_lock_rule, files_lock_rule(30)),
+        ):
+            for label, status, body in self._BAD:
+                with self.subTest(kind=kind, case=label), FakeServer() as server:
+                    server.script("GET", f"{_B}/acme-b/{kind}", status, body)
+                    server.script("PUT", f"{_B}/acme-b/{kind}", 200, _fx("r2_put_ok.json"))
+                    acct = R2Account("tok", _ACCT, base_url=server.url)
+                    with self.assertRaises(StackError):
+                        ensure(acct, "acme-b", rule)
+                    self.assertEqual([r["method"] for r in server.requests], ["GET"])
+
+    def test_explicit_empty_rules_means_no_rules(self) -> None:
+        with FakeServer() as server:
+            server.script("GET", f"{_B}/acme-b/lock", 200, _fx("r2_rules_empty.json"))
+            server.script("PUT", f"{_B}/acme-b/lock", 200, _fx("r2_put_ok.json"))
+            ensure_lock_rule(R2Account("tok", _ACCT, base_url=server.url), "acme-b", files_lock_rule(30))
+            self.assertEqual([r["id"] for r in server.requests[1]["body"]["rules"]], ["stackbase-files"])
+
+    def test_404_with_other_error_code_is_not_absent(self) -> None:
+        with FakeServer() as server:
+            server.script("GET", f"{_B}/acme-b", 404, {"success": False, "errors": [{"code": 7003, "message": "no route"}]})
+            with self.assertRaises(StackError) as ctx:
+                R2Account("tok", _ACCT, base_url=server.url).bucket_exists("acme-b")
+            self.assertIn("cloudflare_account_id", ctx.exception.hint)
+
+    def test_bodyless_404_is_absent(self) -> None:
+        with FakeServer() as server:
+            server.script("GET", f"{_B}/acme-b", 404, None)
+            self.assertFalse(R2Account("tok", _ACCT, base_url=server.url).bucket_exists("acme-b"))
+
+
 class AccountIdTests(unittest.TestCase):
     def test_missing_account_id_names_secret(self) -> None:
         env = _env(logs=LogsConfig(bucket="acme-logs"))
@@ -282,7 +327,6 @@ class StepWiringTests(unittest.TestCase):
             sent = server.requests[1]["body"]["rules"]
             self.assertEqual(sent[1]["deleteObjectsTransition"]["condition"]["maxAge"], 90 * 86400)
             self.assertIn("acme-logs", message)
-
 
     def test_step_description_without_bucket_unchanged(self) -> None:
         self.assertEqual(Step(Action.REBUILD, "a").description, "node a: rebuilding NixOS (this can take a few minutes)")
