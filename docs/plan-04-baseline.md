@@ -51,13 +51,13 @@
   - **Naming:** the NixOS hostname and the flake attribute are `<env>-<node>` (e.g. `staging-a`). The Hostinger FQDN is `<node>.<env domain>`. The node module gets `stackbase.environment = "<env>"`, which alert subjects use.
   - **CI template:** a tag push deploys **staging**. Production is a `workflow_dispatch` that takes the tag and deploys the *same* release to production, using a GitHub Environment named `production` so reviewers can be required. Secrets are `STACK_DEPLOY_KEY_STAGING` and `STACK_DEPLOY_KEY_PRODUCTION`.
 - **D. Logs — Vector** (replaces the earlier hourly segment upload; no age encryption for logs, decided 2026-11-04).
-  - **journald** (`nixos/base.nix`): `Storage=persistent`, `Compress=yes`, `SystemMaxUse=2G`, `SystemKeepFree=4G`, `SystemMaxFileSize=128M`, `MaxRetentionSec=7day`, `MaxFileSec=1day`, `RateLimitIntervalSec=30s`, `RateLimitBurst=10000`, `ForwardToSyslog=no`. Seven days of local journal is the longest R2 outage survivable without loss.
+  - **journald** (`nixos/base.nix`): `Storage=persistent`, `Compress=yes`, `SystemMaxUse=2G`, `SystemKeepFree=4G`, `SystemMaxFileSize=128M`, `MaxRetentionSec=7day`, `MaxFileSec=1day`, `SyncIntervalSec=5s`, `RateLimitIntervalSec=30s`, `RateLimitBurst=10000`, `ForwardToSyslog=no`. Seven days of local journal is the longest R2 outage survivable without loss. `SyncIntervalSec=5s` (default 5 min) bounds what a power loss can take from the local journal.
   - **Vector, source:** journald with `current_boot_only = false`, `since_now = false`, `exclude_units = ["vector.service"]`.
   - **Vector, remap:** keep only `timestamp host unit ident pid priority message boot_id cursor` (`compact` drops nulls). `unit` = `_SYSTEMD_UNIT`, `ident` = `SYSLOG_IDENTIFIER`, `cursor` = `__CURSOR`, kept so at-least-once duplicates can be removed.
   - **Vector, R2 sink:**
     - `aws_s3`, `region = "auto"`, `force_path_style = true`;
     - `key_prefix = "journal/{{ host }}/%Y/%m/%d/%H/"`, `filename_append_uuid = true`, `filename_extension = "ndjson.gz"`, `compression = "gzip"`, JSON + newline-delimited;
-    - `batch.timeout_secs = 600`, `batch.max_bytes = 67108864`;
+    - `batch.timeout_secs = 15`, `batch.max_bytes = 67108864`. The off-host copy is what survives losing the server, so the batch timeout is the loss window; 15 s costs ~170k uploads per server per month (decided 2026-11-04; multipart uploads rejected: parts are invisible until completed and must be ≥5 MiB);
     - disk buffer `max_size = 1073741824`, `when_full = "block"`; `acknowledgements.enabled = true`; `request.concurrency = "adaptive"`; healthcheck on.
     - Never set `storage_class`, ACLs or server-side encryption options.
   - **Vector, local sink:** `file`, `/var/log/vector/%Y-%m-%d/%H.ndjson`, memory buffer `max_events = 10000`, `when_full = "drop_newest"`, so a full local disk never blocks R2. tmpfiles `d /var/log/vector 0750 vector vector 3d`.
@@ -238,7 +238,7 @@ Tests: `tests/test_config.py`, `tests/test_cli.py`, `tests/test_reconcile.py`, `
 **Files:** Create `nixos/logs.nix`, `stackbase/logs.py` (laptop side: `ENSURE_LOGS_ENV`, modelled on `stackbase/backups.py`) and `tests/vm-logs.nix` (registered in `flake.nix` checks). Modify the repo-root `flake.nix` (module list), `nixos/base.nix` (the journald block from Brief D replaces `SystemMaxUse=500M`), `templates/infra/flake.nix` (`[logs]` → `stackbase.logs.*`), `stackbase/reconcile.py`, `stackbase/steps.py`, `tests/test_config.py`, `tests/test_logs.py`, `tests/test_template.py` and `README.md`.
 
 **Interfaces:**
-- Options `stackbase.logs = { enable (bool); bucket (str); bufferBytes (ints.positive, 1073741824); batchSeconds (ints.positive, 600); localDays (ints.positive, 3) }`. Retention is not a node option; Task 5 owns it.
+- Options `stackbase.logs = { enable (bool); bucket (str); bufferBytes (ints.positive, 1073741824); batchSeconds (ints.positive, 15); localDays (ints.positive, 3) }`. Retention is not a node option; Task 5 owns it.
 - `services.vector = { enable = true; journaldAccess = true; settings = <Brief D, values from options>; }`. `systemd.services.vector.serviceConfig.EnvironmentFile = "/var/lib/stackbase/logs.env"`, with `ReadWritePaths` for `/var/log/vector`. Unfree packages: none.
 - `logs_env_content(secrets: dict[str, str]) -> str | None` renders `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `LOGS_ENDPOINT` from `logs_access_key_id`, `logs_secret_access_key` and `r2_endpoint`, using the same allowlist as `_R2_KEYS`.
 
@@ -254,7 +254,7 @@ Tests: `tests/test_config.py`, `tests/test_cli.py`, `tests/test_reconcile.py`, `
   - `test_vector_own_logs_excluded`
 - [ ] **Step 3–5:** FAIL → implement → suite + `nix flake check` PASS.
 - [ ] **Step 6:** README "Logs":
-  - what's shipped and when (≤ ~10 min);
+  - what's shipped and when (≤ ~15 s; what a destroyed server can lose);
   - the key layout;
   - searching: `aws s3 cp … - | zcat -f | rg`, local `rg /var/log/vector`, `journalctl` for 7 days;
   - the outage tolerance (7 days), at-least-once delivery and dedupe by `cursor`;
