@@ -49,7 +49,7 @@
   - **`--env <name>` is required once environments exist.** It applies to every command that touches servers or per-environment secrets (`up`, `--plan`, `deploy`, `rollback`, `status`, `ssh`, `backup-now`, `alert-test`, `secrets`, `deploy-key`, `ci-setup`). There is no default, so a typo or a forgotten flag never touches production. Without it, the command fails with a `StackError` listing the environment names.
   - **Per-environment files:** `stack.state.<env>.json`, `secrets.<env>.age` (recipients `age-recipients.<env>.txt` if present, else `age-recipients.txt`), and `deploy.<env>.age` with `keys/deploy.<env>.pub`. A staging deploy key cannot deploy production.
   - **Naming:** the NixOS hostname and the flake attribute are `<env>-<node>` (e.g. `staging-a`). The Hostinger FQDN is `<node>.<env domain>`. The node module gets `stackbase.environment = "<env>"`, which alert subjects use.
-  - **CI template:** a tag push deploys **staging**, with the repo secret `STACK_DEPLOY_KEY_STAGING`. Production is never deployed from CI (decided 2026-11-04: on GitHub Free, private repos have no Environments or required reviewers, and a repo secret is readable by any workflow). The operator promotes the same tag from their own machine with `./infra/up --env production deploy <tag>`; the age identity is the gate.
+  - **CI template:** a tag push deploys **staging** (repo secret `STACK_DEPLOY_KEY_STAGING`); if staging succeeds and the tagged commit is on the default branch, the same tag then deploys **production** (`STACK_DEPLOY_KEY_PRODUCTION`). Decided by Matt 2026-11-05, reversing a 2026-11-04 ruling that kept production out of CI. On GitHub Free both are repo secrets; the deploy door bounds what a leaked key can do. Manual promotion (`./infra/up --env production deploy <tag>`) still works.
 - **D. Logs — Vector** (replaces the earlier hourly segment upload; no age encryption for logs, decided 2026-11-04).
   - **journald** (`nixos/base.nix`): `Storage=persistent`, `Compress=yes`, `SystemMaxUse=2G`, `SystemKeepFree=4G`, `SystemMaxFileSize=128M`, `MaxRetentionSec=7day`, `MaxFileSec=1day`, `SyncIntervalSec=5s`, `RateLimitIntervalSec=30s`, `RateLimitBurst=10000`, `ForwardToSyslog=no`. Seven days of local journal is the longest R2 outage survivable without loss. `SyncIntervalSec=5s` (default 5 min) bounds what a power loss can take from the local journal.
   - **Vector, source:** journald with `current_boot_only = false`, `since_now = false`, `exclude_units = ["vector.service"]`.
@@ -186,7 +186,7 @@ Tests: `tests/test_config.py`, `tests/test_cli.py`, `tests/test_reconcile.py`, `
 - `hostname_for(cfg, env, node) -> str` = `f"{node}.{env.domain}"` (legacy: unchanged output). `nixos_name(env, node) -> str` = `node` (legacy) or `f"{env.name}-{node}"`.
 - The CLI accepts `--env` before or after the subcommand and threads `Environment` everywhere `cfg`/`state` were used.
 - The flake template's node module sets `networking.hostName = nixos_name` and `stackbase.environment = <env name or "">`. Per-environment overrides are merged over the shared tables, using the same field mapping as today.
-- CI: `ci-setup --env staging` writes repo secret `STACK_DEPLOY_KEY_STAGING`. `ci-setup --env production` refuses with a StackError whose hint is the promote command.
+- CI: `ci-setup --env <env>` writes repo secret `STACK_DEPLOY_KEY_<ENV>` (staging and production alike).
 
 - [ ] **Step 1: Tests (config):**
   - `test_envs_parse_overrides_only_allowed_keys`: `[environments.staging] app = {}` → StackError naming `app`.

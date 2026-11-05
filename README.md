@@ -346,24 +346,25 @@ role = "primary"
   After that, `./infra/up --env "$ENV" secrets set <key>` manages that
   environment's secrets one key at a time, as in "Managing secrets".
 
-- **Releasing: tag → staging → check → promote.** Pushing a `v*` tag
-  deploys it to staging. With the GitHub Actions workflow (below) that
-  happens in CI; without it, run `./infra/up --env staging deploy <tag>`
-  yourself. Check staging. Then promote the very same tag to production
-  **from your own machine**:
+- **Releasing: tag → staging → production.** With the GitHub Actions
+  workflow (below), pushing a `v*` tag deploys it to staging. If that
+  succeeds and the tagged commit is on the default branch (master), the same
+  tag then deploys to production. A tag cut from any other branch stops at
+  staging, which is how you try a release candidate there first. Without the
+  workflow, or to promote a tag yourself, run the same commands from your
+  own machine:
 
   ```bash
   TAG=v1.4.2
+  ./infra/up --env staging deploy "$TAG"
   ./infra/up --env production deploy "$TAG"
   ```
 
-  Production is never deployed from CI, and `ci-setup --env production`
-  refuses. On GitHub Free, a private repository has no Environments,
-  environment secrets or required reviewers, so nothing inside GitHub could
-  make a human approve a CI production deploy. A repo secret is also
-  readable by any workflow on any pushed branch or tag. So the production
-  deploy key never leaves `deploy.production.age`, and the gate is the age
-  identity that can open that file: only someone holding it can promote.
+  On GitHub Free a private repository has no environment-scoped secrets, so
+  both deploy keys are plain repo secrets, and anyone who can push a branch
+  could edit the workflow to read them. What bounds a leaked key is the
+  deploy door: it can upload, deploy or roll back a release, never open a
+  shell.
 
 A `stack.toml` without `[environments]` is one implicit environment: the
 files, hostnames, plans and commands above stay exactly what they were, and
@@ -615,17 +616,22 @@ Because it's the SAME key everywhere, rotating it also replaces what you
 and any build host deploy with — there is no "laptop deploys are
 unaffected" any more (Task 2 removed the separate `ci-deploy` key).
 
-**With staging and production**, the workflow deploys **staging only**: a
-`v*` tag push runs `./infra/up --env staging deploy` with the
-`STACK_DEPLOY_KEY_STAGING` repo secret (`./infra/up --env staging ci-setup`
-writes it). There is no production job and no production secret.
-`ci-setup --env production` refuses. Promote a tag that staging runs from
-your own machine with `./infra/up --env production deploy "$TAG"` (see
-"Staging and production" for why). A project without `[environments]`
-keeps the single `STACK_DEPLOY_KEY`; after copying the workflow, edit it:
-drop `--env staging` from the deploy step, and change
-`secrets.STACK_DEPLOY_KEY_STAGING` to `secrets.STACK_DEPLOY_KEY` (`ci-setup`
-prints these same two edits).
+**With staging and production**, a `v*` tag push runs
+`./infra/up --env staging deploy` with the `STACK_DEPLOY_KEY_STAGING` repo
+secret. Then, if staging succeeded and the tag is on the default branch, it
+runs `./infra/up --env production deploy` with `STACK_DEPLOY_KEY_PRODUCTION`.
+Write each secret with its own run:
+
+```bash
+./infra/up --env staging ci-setup
+./infra/up --env production ci-setup
+```
+
+A project without `[environments]` keeps the single `STACK_DEPLOY_KEY`.
+After copying the workflow, edit it: delete the `production` job (and the
+staging job's `outputs:` and default-branch step), drop `--env staging` from
+the deploy step, and change `secrets.STACK_DEPLOY_KEY_STAGING` to
+`secrets.STACK_DEPLOY_KEY` (`ci-setup` prints these same edits).
 
 **Turn it off** (CI only — this does not remove the deploy key itself,
 since it's also your own):
@@ -1238,9 +1244,9 @@ the `[logs]` choice.
 - **Environments are opt-in.** A `stack.toml` without `[environments]` keeps
   working exactly as before (same file names, same hostnames, same plans);
   nothing about staging and production applies until you add them.
-- **CI deploys staging only.** With environments, the GitHub Actions workflow
-  runs `./infra/up --env staging deploy` and nothing touches production; you
-  promote a tag from your own machine (see "Deploying from GitHub Actions").
+- **CI deploys staging, then production.** With environments, a tag deploys
+  staging; a tag on the default branch then deploys production too. Run
+  `ci-setup` once per environment (see "Deploying from GitHub Actions").
 - **New secrets**, each only if you turn the feature on:
   `logs_access_key_id` and `logs_secret_access_key` (an R2 token scoped to the
   logs bucket), `cloudflare_account_id` (Cloudflare account access, used to

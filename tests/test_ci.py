@@ -201,6 +201,7 @@ class CiSetupUsesTheProjectDeployKeyTests(unittest.TestCase):
             ci_setup(infra_dir, emit=lines.append, runner=runner)
 
             text = "\n".join(lines)
+            self.assertIn("delete the `production` job", text)
             self.assertIn("drop `--env staging`", text)
             self.assertIn("secrets.STACK_DEPLOY_KEY_STAGING", text)
             self.assertIn("secrets.STACK_DEPLOY_KEY }}", text)
@@ -477,19 +478,26 @@ class WorkflowTriggerAndPermissionsTests(unittest.TestCase):
 
 
 class WorkflowSecretsAndVarsTests(unittest.TestCase):
-    def test_only_the_staging_deploy_key_is_referenced(self) -> None:
+    def test_only_the_two_environment_deploy_keys_are_referenced(self) -> None:
         # The `${{ secrets.X }}` expression form only -- not every English
         # occurrence of the word "secrets." (this file's own header comment
         # talks about infra/secrets.age, which must not count).
         refs = set(re.findall(r"\$\{\{\s*secrets\.([A-Za-z0-9_]+)\s*\}\}", _WORKFLOW_TEXT))
 
-        self.assertEqual(refs, {"STACK_DEPLOY_KEY_STAGING"})
+        self.assertEqual(refs, {"STACK_DEPLOY_KEY_STAGING", "STACK_DEPLOY_KEY_PRODUCTION"})
+
+    def test_each_job_references_only_its_own_key(self) -> None:
+        jobs = _jobs()
+        self.assertIn("secrets.STACK_DEPLOY_KEY_STAGING", jobs["staging"])
+        self.assertNotIn("STACK_DEPLOY_KEY_PRODUCTION", jobs["staging"])
+        self.assertIn("secrets.STACK_DEPLOY_KEY_PRODUCTION", jobs["production"])
+        self.assertNotIn("STACK_DEPLOY_KEY_STAGING", jobs["production"])
 
     def test_no_vars_context_is_referenced(self) -> None:
         self.assertNotIn("vars.", _WORKFLOW_TEXT)
 
     def test_no_github_environment_is_used(self) -> None:
-        # GitHub Free has none for private repositories; production is promoted by hand.
+        # GitHub Free has none for private repositories: both keys are repo secrets.
         self.assertNotIn("environment:", _WORKFLOW_TEXT)
 
     def test_the_secret_interpolation_never_appears_inside_a_run_script_line(self) -> None:
@@ -504,7 +512,7 @@ class WorkflowSecretsAndVarsTests(unittest.TestCase):
                 stripped = line.strip()
                 self.assertTrue(
                     re.match(
-                        r"^STACK_DEPLOY_KEY:\s*\$\{\{\s*secrets\.STACK_DEPLOY_KEY_STAGING\s*\}\}$",
+                        r"^STACK_DEPLOY_KEY:\s*\$\{\{\s*secrets\.STACK_DEPLOY_KEY_(?:STAGING|PRODUCTION)\s*\}\}$",
                         stripped,
                     ),
                     f"line {number} interpolates a secret outside an env: mapping: {line!r}",
@@ -556,9 +564,9 @@ class WorkflowRunnerTests(unittest.TestCase):
         # built-in hashFiles() is hard-wired to node20 and fails there.
         self.assertNotIn("hashFiles(", _WORKFLOW_TEXT)
 
-    def test_there_is_exactly_one_job_staging(self) -> None:
-        self.assertEqual(list(_jobs()), ["staging"])
-        self.assertEqual(len(re.findall(r"^\s*runs-on:", _WORKFLOW_TEXT, re.MULTILINE)), 1)
+    def test_the_jobs_are_staging_then_production(self) -> None:
+        self.assertEqual(list(_jobs()), ["staging", "production"])
+        self.assertEqual(len(re.findall(r"^\s*runs-on:", _WORKFLOW_TEXT, re.MULTILINE)), 2)
 
     def test_nothing_installs_a_c_toolchain_at_job_time(self) -> None:
         # The runner is a NixOS machine that already carries the cross
@@ -612,20 +620,39 @@ class WorkflowKeyHandlingTests(unittest.TestCase):
 
 
 class WorkflowEnvironmentsTests(unittest.TestCase):
-    def test_ci_template_deploys_staging_only(self) -> None:
+    def test_every_tag_deploys_staging(self) -> None:
         on = _WORKFLOW_TEXT.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
         self.assertNotIn("workflow_dispatch", _WORKFLOW_TEXT)
         self.assertIn("tags:", on)
 
-        jobs = _jobs()
-        self.assertNotIn("production", jobs)
-        self.assertNotIn("STACK_DEPLOY_KEY_PRODUCTION", _WORKFLOW_TEXT)
-        self.assertNotIn("--env production deploy", _non_comment(_WORKFLOW_TEXT))
-        staging = _non_comment(jobs["staging"])
-        self.assertIn("secrets.STACK_DEPLOY_KEY_STAGING", staging)
+        staging = _non_comment(_jobs()["staging"])
+        self.assertNotIn("if:", staging.split("steps:", 1)[0])
         self.assertIn('./infra/up --env staging deploy "$GITHUB_REF_NAME"', staging)
         # A tag, never a branch named like one.
         self.assertIn('git show-ref --verify --quiet "refs/tags/$GITHUB_REF_NAME"', staging)
+
+    def test_production_follows_a_successful_staging_deploy_of_a_default_branch_tag(self) -> None:
+        jobs = _jobs()
+        staging = _non_comment(jobs["staging"])
+        production = _non_comment(jobs["production"])
+
+        self.assertIn("needs: staging", production)
+        self.assertIn("if: needs.staging.outputs.on_default_branch == 'true'", production)
+        self.assertIn("on_default_branch: ${{ steps.branch.outputs.on_default_branch }}", staging)
+        self.assertIn("DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}", staging)
+        self.assertIn('git merge-base --is-ancestor "$commit" "origin/$DEFAULT_BRANCH"', staging)
+        # An annotated tag names a tag object, not a commit.
+        self.assertIn('git rev-parse "$GITHUB_REF_NAME^{commit}"', staging)
+        # merge-base needs history; the default shallow checkout has none.
+        self.assertIn("fetch-depth: 0", staging)
+        self.assertIn('./infra/up --env production deploy "$GITHUB_REF_NAME"', production)
+        # The check sets the output on both paths, so "skipped" is a decision, not an accident.
+        self.assertIn('echo "on_default_branch=true" >> "$GITHUB_OUTPUT"', staging)
+        self.assertIn('echo "on_default_branch=false" >> "$GITHUB_OUTPUT"', staging)
+
+    def test_the_default_branch_check_runs_before_the_staging_deploy(self) -> None:
+        staging = _jobs()["staging"]
+        self.assertLess(staging.index("id: branch"), staging.index("name: Deploy to staging"))
 
     def test_the_job_checks_the_runner_and_cleans_up_the_key(self) -> None:
         for name, text in _jobs().items():
@@ -683,21 +710,18 @@ class CiSetupEnvironmentTests(unittest.TestCase):
         self.assertFalse((infra_dir / "deploy.age").exists())
         self.assertFalse((infra_dir / "keys" / "deploy.pub").exists())
         self.assertTrue(any("--env staging" in line for line in lines))
-        self.assertTrue(any('./infra/up --env production deploy "$TAG"' in line for line in lines))
+        self.assertTrue(any("./infra/up --env production ci-setup" in line for line in lines))
 
-    def test_production_is_refused_with_the_promote_command(self) -> None:
-        with Project() as infra_dir:
-            (infra_dir / "stack.toml").write_text(_ENVS_TOML, encoding="utf-8")
-            runner = FakeRunner(handler=_happy_path_handler())
+    def test_production_writes_its_own_repo_secret_from_its_own_key(self) -> None:
+        infra_dir, runner, _lines, private_key = self._run("production")
 
-            with self.assertRaises(StackError) as caught:
-                ci_setup(infra_dir, env="production", emit=_silent, runner=runner)
-
-            self.assertIn("production deploys are not run from CI", caught.exception.message)
-            self.assertIn('TAG=v1.2.3; ./infra/up --env production deploy "$TAG"', caught.exception.hint)
-            # Refused before anything ran: no gh call, no key generated or pushed.
-            self.assertEqual(runner.calls, [])
-            self.assertFalse((infra_dir / "deploy.production.age").exists())
+        secret_calls = [c for c in runner.calls if c["argv"][:3] == ["gh", "secret", "set"]]
+        self.assertEqual(len(secret_calls), 1)
+        self.assertEqual(secret_calls[0]["argv"][3], "STACK_DEPLOY_KEY_PRODUCTION")
+        self.assertEqual(secret_calls[0]["kwargs"]["input"], private_key.encode("utf-8"))
+        self.assertTrue((infra_dir / "deploy.production.age").exists())
+        self.assertTrue((infra_dir / "keys" / "deploy.production.pub").is_file())
+        self.assertFalse((infra_dir / "deploy.staging.age").exists())
 
     def test_no_env_on_a_project_with_environments_is_refused_before_anything_runs(self) -> None:
         with Project() as infra_dir:
