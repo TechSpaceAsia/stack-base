@@ -1,5 +1,5 @@
 # Hardening common to every stackbase node: admin accounts, key-only SSH,
-# fail2ban, a journald cap, Nix flakes + weekly GC, and the base firewall
+# fail2ban, a 7-day persistent journal, Nix flakes + weekly GC, and the base firewall
 # (22 + 443 only -- app-host.nix relies on nothing more being open here).
 #
 # Declares `stackbase.project`, the one option every other stackbase module
@@ -21,6 +21,18 @@ in
       description = ''
         Project slug (matches stack.toml's `project`). Used to name the
         Postgres database/role and the app's unix socket directory.
+      '';
+    };
+
+    environment = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      example = "staging";
+      description = ''
+        The stack.toml environment this node belongs to ("staging",
+        "production", ...), or "" for a project without [environments].
+        Set by the project's flake; alert subjects use it to say which
+        environment a failure is in.
       '';
     };
 
@@ -143,9 +155,29 @@ in
 
     services.fail2ban.enable = true; # ships a default sshd jail; defaults are fine here
 
-    services.journald.extraConfig = ''
-      SystemMaxUse=500M
-    '';
+    # The local journal is the overflow for logs.nix's shipping: seven days
+    # of it is the longest R2 outage a node survives without losing a line,
+    # and it is what `journalctl` searches on the box. SyncIntervalSec=5s
+    # (default 5 min) bounds what a power loss can take from it. The caps
+    # keep a chatty app from filling the disk regardless (SystemKeepFree
+    # wins over the 7 days). RateLimitInterval is written by NixOS's own
+    # option -- journald's older spelling of RateLimitIntervalSec.
+    services.journald = {
+      storage = "persistent";
+      rateLimitInterval = "30s";
+      rateLimitBurst = 10000;
+      forwardToSyslog = false;
+      extraConfig = ''
+        Compress=yes
+        SystemMaxUse=2G
+        SystemKeepFree=4G
+        SystemMaxFileSize=128M
+        MaxRetentionSec=7day
+        MaxFileSec=1day
+        SyncIntervalSec=5s
+        ForwardToSyslog=no
+      '';
+    };
 
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
     nix.gc = {

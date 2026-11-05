@@ -21,6 +21,7 @@ import unittest
 from pathlib import Path
 
 _HOSTINGER_PATH = Path(__file__).resolve().parent.parent / "stackbase" / "hostinger.py"
+_R2_PATH = Path(__file__).resolve().parent.parent / "stackbase" / "r2.py"
 _BANNED_SUBSTRINGS = ("virtual-machines", "billing")
 _FORBIDDEN_ACTION_WORDS = ("DELETE", "DESTROY", "CANCEL")
 
@@ -101,6 +102,21 @@ class HostingerSourceHasNoDeleteViolationsTests(unittest.TestCase):
         source = _HOSTINGER_PATH.read_text(encoding="utf-8")
         violations = find_delete_violations(source)
         self.assertEqual(violations, [], f"hostinger.py must never DELETE a VM or touch billing: {violations}")
+
+
+class R2SourceHasNoDeleteTests(unittest.TestCase):
+    """stackbase/r2.py creates buckets and writes rules; it never deletes anything."""
+
+    def test_r2_module_never_sends_delete(self) -> None:
+        source = _R2_PATH.read_text(encoding="utf-8")
+        self.assertNotIn('"DELETE"', source)
+        self.assertNotIn("'DELETE'", source)
+
+    def test_r2_account_has_no_delete_method(self) -> None:
+        from stackbase.r2 import R2Account
+
+        names = [n for n in dir(R2Account) if any(w in n.lower() for w in ("delete", "remove", "destroy"))]
+        self.assertEqual(names, [])
 
 
 class ReconcileActionGuardTests(unittest.TestCase):

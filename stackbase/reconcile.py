@@ -8,8 +8,14 @@ Three phases, deliberately kept apart:
   what `observe()` saw, it returns an ordered list of `Step`s and touches
   nothing. Every step is check-then-act, so a converged stack plans `[]` and
   a run that failed half way through re-plans exactly the remainder.
-- `apply()` acts. It runs the steps in order, saving `stack.state.json`
-  after each one, so an interrupted run never loses what it already did.
+- `apply()` acts. It runs the steps in order, saving the environment's
+  `stack.state[.<env>].json` after each one, so an interrupted run never
+  loses what it already did.
+
+Every phase works on ONE environment (`config.Environment`): its nodes, its
+domain, its state. The `env` arguments default to the implicit environment
+of a single-environment project; on a project with `[environments]` that
+default raises, so nothing ever falls back to "the first one".
 
 Facts that only exist at apply time (a node's IP address, which is only
 known after `WAIT_RUNNING`) are NOT baked into the plan: a step carries the
@@ -29,17 +35,19 @@ import re
 import socket
 import subprocess
 import sys
+import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from stackbase.cloudflare import CloudflareClient
-from stackbase.config import Node, NodeState, StackConfig, StackState, save_state
+from stackbase.config import Environment, Node, NodeState, StackConfig, StackState, save_state
 from stackbase.errors import StackError
 from stackbase.hostinger import HostingerClient
-from stackbase.secrets import redact
+from stackbase.r2 import R2Account, R2Observation, observe_r2, r2_steps
+from stackbase.secrets import SecretsFile, redact, secrets_file
 from stackbase.ssh import Ssh
 
 # nixos/cloudflare-ips.nix, located relative to this package -- present in
@@ -95,7 +103,9 @@ SRC_EXCLUDES = (".git", ".superpowers", "__pycache__", "result")
 # stack.state.json is pushed (it costs nothing and keeps the node's copy of
 # infra/ complete) but deliberately does not feed the applied-rev hash: it
 # changes on every single step, and a rebuild per state write would be absurd.
-_REV_SKIP = ("stack.state.json",)
+# The same goes for each environment's `stack.state.<env>.json`. Matched with
+# fnmatch, so the literal first entry behaves exactly as before.
+_REV_SKIP = ("stack.state.json", "stack.state.*.json")
 
 
 class Action(Enum):
@@ -108,6 +118,7 @@ class Action(Enum):
 
     PURCHASE = "purchase"
     ADOPT = "adopt"
+    WAIT_PURCHASE = "wait_purchase"
     SETUP = "setup"
     WAIT_RUNNING = "wait_running"
     ENSURE_KEYS = "ensure_keys"
@@ -119,7 +130,13 @@ class Action(Enum):
     REBUILD = "rebuild"
     ENSURE_APP_ENV = "ensure_app_env"
     ENSURE_BACKUP_ENV = "ensure_backup_env"
+    ENSURE_LOGS_ENV = "ensure_logs_env"
+    ENSURE_ALERT_ENV = "ensure_alert_env"
+    ENSURE_MESH = "ensure_mesh"
     UPSERT_DNS = "upsert_dns"
+    ENSURE_R2_BUCKET = "ensure_r2_bucket"
+    ENSURE_R2_LIFECYCLE = "ensure_r2_lifecycle"
+    ENSURE_R2_LOCK = "ensure_r2_lock"
 
 
 # What each step is doing, in the words of someone who does not run
@@ -127,6 +144,7 @@ class Action(Enum):
 _DOING: dict[Action, str] = {
     Action.PURCHASE: "buying and setting up a new virtual machine",
     Action.ADOPT: "adopting an existing virtual machine already found in Hostinger",
+    Action.WAIT_PURCHASE: "waiting for Hostinger to finish processing the payment",
     Action.SETUP: "installing NixOS on the virtual machine",
     Action.WAIT_RUNNING: "waiting for the server to come up",
     Action.ENSURE_KEYS: "registering the team's SSH keys with Hostinger",
@@ -138,7 +156,13 @@ _DOING: dict[Action, str] = {
     Action.REBUILD: "rebuilding NixOS (this can take a few minutes)",
     Action.ENSURE_APP_ENV: "updating the application's environment file",
     Action.ENSURE_BACKUP_ENV: "updating the backup credentials on the server",
+    Action.ENSURE_LOGS_ENV: "updating the log shipping credentials on the server",
+    Action.ENSURE_ALERT_ENV: "updating the alert mail credentials on the server",
+    Action.ENSURE_MESH: "joining Cloudflare Mesh",
     Action.UPSERT_DNS: "pointing the domain at the server in Cloudflare",
+    Action.ENSURE_R2_BUCKET: "creating the R2 bucket",
+    Action.ENSURE_R2_LIFECYCLE: "setting the retention rule",
+    Action.ENSURE_R2_LOCK: "setting the bucket-lock rule",
 }
 
 # Steps worth announcing before they start, because the operator would
@@ -154,15 +178,33 @@ class Step:
 
     action: Action
     node: str | None = None
+    # R2 steps are scoped to a bucket, not a node; `detail` is the exact rule
+    # change `--plan` shows (see stackbase/r2.py).
+    bucket: str | None = None
+    detail: str | None = None
 
     @property
     def description(self) -> str:
         doing = _DOING[self.action]
+        if self.bucket:
+            text = f"R2 bucket {self.bucket}: {doing}"
+            return f"{text} ({self.detail})" if self.detail else text
         return f"node {self.node}: {doing}" if self.node else doing
 
     @property
     def is_slow(self) -> bool:
         return self.action in _SLOW
+
+
+def plan_header(env: Environment) -> str:
+    """The line `--plan` prints above its steps. A single-environment
+    project's is unchanged; an environment's names it, so a plan for
+    production can never be mistaken for one for staging."""
+    return "would do:" if env.implicit else f"would do in {env.name}:"
+
+
+def nothing_to_do(env: Environment) -> str:
+    return "nothing to do" if env.implicit else f"nothing to do in {env.name}"
 
 
 def render_description(step: Step, *, has_cloudflare_token: bool) -> str:
@@ -212,9 +254,27 @@ class Local:
     # None when the project has no R2 credentials. Compared against each
     # node's recorded `NodeState.backup_env_sha` -- see `_needs_backup_env`.
     backup_env_sha: str | None = None
+    # sha256 of the rendered logs.env (the environment's logs_* keys plus
+    # r2_endpoint), or None when any is missing. `plan()` only ever looks at
+    # it for an environment whose logs are on -- see `_needs_logs_env`.
+    logs_env_sha: str | None = None
+    # sha256 of the rendered alert.env (the environment's smtp_* keys), or
+    # None when any is missing. Only rendered for an environment whose
+    # [alerts] names recipients -- see `_needs_alert_env`.
+    alert_env_sha: str | None = None
+    # sha256 of the STORAGE_* block appended to the pushed app.env, or None
+    # when the environment has no [files] bucket. Kept out of app_env_sha on
+    # purpose: see stackbase/files.py and `_needs_app_env`.
+    files_env_sha: str | None = None
 
 
-def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str | None = None) -> Local:
+def local_facts(
+    infra_dir: Path,
+    secrets: dict[str, str],
+    *,
+    stackbase_src: str | None = None,
+    env: Environment | None = None,
+) -> Local:
     """Gather everything `plan()` needs that lives on the operator's disk.
 
     `desired_rev` is the fingerprint a node records once it has successfully
@@ -224,9 +284,30 @@ def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str 
     # this module, so importing it at the top would be a cycle -- the same
     # trick `apply()` already uses for `stackbase.steps`.
     from stackbase.backups import backup_env_content, backup_env_digest
+    from stackbase.alerts import alert_env_content, alert_env_digest, alerts_enabled
+    from stackbase.logs import logs_enabled, logs_env_content, logs_env_digest
+    from stackbase.files import files_env_digest, storage_env_block, storage_env_lines
 
     app_env_raw = secrets.get("app_env")
     backup_env = backup_env_content(secrets)
+    # Only an environment that ships logs has its logs_* secrets validated
+    # and rendered: a project without [logs] is untouched by whatever odd
+    # value such a key might hold.
+    logs_env = logs_env_content(secrets) if env is not None and logs_enabled(env.logs) else None
+    # Same rule for alerts: no [alerts], no smtp_* validation at all.
+    alert_env = alert_env_content(secrets) if env is not None and alerts_enabled(env.alerts) else None
+    # Raises on incomplete credentials or a STORAGE_* collision in app_env,
+    # so a bad [files] setup fails on every `up`, `--plan` included.
+    if env is not None and env.files.bucket and not app_env_raw:
+        # stack-base appends the STORAGE_* lines to app.env, so it must own the
+        # whole file: pushing them without app_env would clobber a hand-managed one.
+        raise StackError(
+            "[files] needs the app_env secret",
+            "move the app's environment into it with `./infra/up --env \"$ENV\" secrets set app_env` "
+            "(omit --env for a single-environment project); stack-base appends the STORAGE_* lines to "
+            "app_env, so it must own the file",
+        )
+    storage_lines = storage_env_lines(env, secrets) if env is not None else []
     return Local(
         desired_rev=compute_rev(infra_dir, stackbase_src=stackbase_src),
         has_origin_cert=bool(secrets.get("origin_cert")) and bool(secrets.get("origin_key")),
@@ -235,6 +316,9 @@ def local_facts(infra_dir: Path, secrets: dict[str, str], *, stackbase_src: str 
         has_cloudflare_token=bool(secrets.get("cloudflare_token")),
         app_env_sha=app_env_digest(validate_app_env(app_env_raw)) if app_env_raw else None,
         backup_env_sha=backup_env_digest(backup_env) if backup_env else None,
+        logs_env_sha=logs_env_digest(logs_env) if logs_env else None,
+        alert_env_sha=alert_env_digest(alert_env) if alert_env else None,
+        files_env_sha=files_env_digest(storage_env_block(storage_lines)) if storage_lines else None,
     )
 
 
@@ -323,6 +407,9 @@ def _app_env_secret_values(raw: str) -> list[str]:
     return values
 
 
+_NOT_REDACTED_KEYS = frozenset({"smtp_host", "smtp_port"})
+
+
 def redaction_values(secrets: dict[str, str]) -> list[str]:
     """Every string that must never appear in printed output.
 
@@ -335,7 +422,9 @@ def redaction_values(secrets: dict[str, str]) -> list[str]:
     currently masks only via a plain `list(secrets.values())` and would need
     to switch to this function to get the same per-value app_env coverage.
     """
-    values = [value for value in secrets.values() if value]
+    # smtp_host and smtp_port live in the secrets file but are not secret, and
+    # a short value like "465" would mask unrelated output (byte counts, ...).
+    values = [value for key, value in secrets.items() if value and key not in _NOT_REDACTED_KEYS]
     values.extend(_app_env_secret_values(secrets.get("app_env") or ""))
     return values
 
@@ -442,11 +531,11 @@ def _matches_any_exclude(name: str, patterns: list[str]) -> bool:
 
 
 def _tree_digest(root: Path, excludes: Iterable[str], *, skip: Iterable[str] = ()) -> str:
-    skipped = set(skip)
+    skipped = list(skip)
     digest = hashlib.sha256()
     for path in tree_files(root, excludes):
         relative = path.relative_to(root).as_posix()
-        if relative in skipped:
+        if _matches_any_exclude(relative, skipped):
             continue
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
@@ -491,6 +580,7 @@ TOOL_WRITTEN_PATHS = (
     "nodes/*/hardware-configuration.nix",
     "flake.lock",
     "stack.state.json",
+    "stack.state.*.json",
     "known_hosts",
     "keys/*.pub",
     "*.age",
@@ -608,6 +698,9 @@ class ObservedNode:
     # discovered on Hostinger by hostname -- see `_find_adoptable_vms`. This
     # is what tells `plan()` to emit ADOPT instead of PURCHASE.
     adopted: bool = False
+    # What `warp-cli status` said over root SSH: True Connected, False not,
+    # None never asked (Mesh is off, or the node has no pinned address yet).
+    mesh_connected: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -625,11 +718,66 @@ class Observed:
     # ranges and the snapshot in nixos/cloudflare-ips.nix. Never fatal --
     # see `_cloudflare_ip_warnings`.
     cloudflare_ip_warnings: list[str] = field(default_factory=list)
+    # What R2 holds for each bucket the environment manages (`[logs]`,
+    # `[files]`); empty when it names none -- see stackbase/r2.py.
+    r2: tuple[R2Observation, ...] = ()
 
 
-def firewall_name(cfg: StackConfig) -> str:
-    """One firewall per project, shared by all of its nodes."""
-    return f"stackbase-{cfg.project}"
+def check_baseline(env: Environment) -> list[str]:
+    """Backups and logs are on unless the environment opts out, in words.
+
+    Returns the warning lines (one per opt-out) for the caller to print on
+    every run; raises StackError when an environment neither names a bucket
+    nor sets `enabled = false`, or does both. Pure config: it runs before any
+    SSH or API call, in whichever environment `up` / `--plan` acts on.
+    """
+    scope = "" if env.implicit else f" for {env.name}"
+    warnings: list[str] = []
+    for table, section in (("backups", env.backups), ("logs", env.logs)):
+        if section.enabled is False and section.bucket:
+            if env.implicit:
+                together = f"[{table}] has both enabled = false and bucket = \"{section.bucket}\""
+            else:
+                # Two tables: the shared one says enabled = false, the
+                # environment's names a bucket (one table alone is refused
+                # while parsing).
+                together = (
+                    f"[{table}] says enabled = false but [environments.{env.name}.{table}] names "
+                    f"the bucket \"{section.bucket}\""
+                )
+            raise StackError(
+                f"{together}{scope}",
+                f"remove one of them: delete enabled = false to keep {table} on, or delete the bucket "
+                f"to leave {table} off",
+            )
+        if section.enabled is False:
+            warnings.append(
+                f"! {table} are OFF{scope} ([{table}] enabled = false) -- "
+                + ("nothing is backed up off-box" if table == "backups" else "the journal is not shipped off-box")
+            )
+        elif not section.bucket:
+            # With environments the bucket belongs in the environment's own
+            # table: a shared one would be refused as soon as two share it.
+            where = f"[{table}]" if env.implicit else f"[environments.{env.name}.{table}]"
+            raise StackError(
+                f"{table} are required but no {where} bucket is set{scope}",
+                f'either set {where} bucket = "..." (an R2 bucket name), or opt out explicitly '
+                f"with enabled = false in {where}",
+            )
+    return warnings
+
+
+def firewall_name(cfg: StackConfig, env: Environment | None = None) -> str:
+    """One firewall per environment, shared by all of its nodes.
+
+    A single-environment project keeps the name it always had,
+    `stackbase-<project>`; an environment's is `stackbase-<project>-<env>`,
+    so applying staging never touches the object production's servers use.
+    """
+    env = env if env is not None else cfg.env(None)
+    if env.implicit:
+        return f"stackbase-{cfg.project}"
+    return f"stackbase-{cfg.project}-{env.name}"
 
 
 def desired_firewall_rules() -> list[dict[str, str]]:
@@ -647,7 +795,7 @@ def desired_firewall_rules() -> list[dict[str, str]]:
     ]
 
 
-def hostname_for(cfg: StackConfig, node: str) -> str:
+def hostname_for(cfg: StackConfig, env: Environment, node: str) -> str:
     """The hostname Hostinger records for a node -- must be an FQDN.
 
     Learned live (L5): the OpenAPI doc's example `hostname` happens to be an
@@ -660,15 +808,33 @@ def hostname_for(cfg: StackConfig, node: str) -> str:
     This is the Hostinger-side hostname only, used for setup/purchase and
     for matching an already-existing VM during ADOPT (`_find_adoptable_vms`
     below). It is unrelated to the NixOS `networking.hostName` the template
-    flake sets from the node's bare table key (e.g. "a") -- that stays
-    short and is not changed by this.
+    flake sets (`nixos_name`).
+
+    In an environment it is `<node>.<env domain>` (e.g.
+    `a.staging.acme.example.com`): the domain already names the project and
+    the environment. The implicit environment keeps `<project>-<node>.<domain>`,
+    the name every existing VM already carries -- adoption matches on it.
     """
-    return f"{cfg.project}-{node}.{cfg.domain}"
+    if env.implicit:
+        return f"{cfg.project}-{node}.{env.domain}"
+    return f"{node}.{env.domain}"
 
 
-def primary_node(cfg: StackConfig) -> str:
+def nixos_name(env: Environment, node: str) -> str:
+    """The NixOS hostname and flake attribute (`nixosConfigurations.<name>`),
+    which is also the node's directory under `infra/nodes/`.
+
+    `<env>-<node>` (e.g. `staging-a`), so two environments' node `a` never
+    share a hardware file or a flake attribute; the bare node name for the
+    implicit environment, exactly as before.
+    """
+    return node if env.implicit else f"{env.name}-{node}"
+
+
+def primary_node(cfg: StackConfig, env: Environment | None = None) -> str:
     """The node the public domain points at. `load_config` guarantees exactly one."""
-    for name, node in cfg.nodes.items():
+    env = env if env is not None else cfg.env(None)
+    for name, node in env.nodes.items():
         if node.role == "primary":
             return name
     raise StackError(
@@ -738,8 +904,15 @@ def observe(
     cloudflare: CloudflareClient | None,
     *,
     local: Local,
+    env: Environment | None = None,
+    r2: R2Account | None = None,
+    ssh_factory: Callable[[str], Ssh] | None = None,
 ) -> Observed:
     """Read the current state of the world. GET requests only.
+
+    With `[mesh]` on and an `ssh_factory`, each node already pinned in
+    known_hosts is also asked (read-only, over root SSH) whether it is on
+    Mesh. With `[mesh]` off no SSH call is made at all.
 
     `local` carries the facts that come from the operator's own disk (see
     `local_facts`); it is passed in rather than gathered here so that
@@ -751,19 +924,31 @@ def observe(
     the Cloudflare-shaped fields on the returned `Observed` are left at their
     "nothing configured yet" defaults.
     """
+    env = env if env is not None else cfg.env(None)
     unresolved_nodes = [
         name
-        for name, node in cfg.nodes.items()
+        for name, node in env.nodes.items()
         if node.vps_id is None and (state.nodes.get(name) is None or state.nodes[name].vps_id is None)
     ]
-    adoptable = _find_adoptable_vms(hostinger, cfg, unresolved_nodes) if unresolved_nodes else {}
+    pending = {
+        name: state.nodes[name].pending_subscription_id
+        for name in unresolved_nodes
+        if name in state.nodes and state.nodes[name].pending_subscription_id
+    }
+    adoptable = _find_adoptable_vms(hostinger, cfg, env, unresolved_nodes, pending) if unresolved_nodes else {}
 
     nodes: dict[str, ObservedNode] = {}
-    for name, node in cfg.nodes.items():
+    for name, node in env.nodes.items():
         nodes[name] = _observe_node(node, state.nodes.get(name), hostinger, adopt_vps_id=adoptable.get(name))
+        if cfg.mesh.enabled and ssh_factory is not None:
+            ip = (state.nodes.get(name) or NodeState()).ipv4
+            if ip and ip in local.pinned_hosts:
+                from stackbase.mesh import observe_mesh
+
+                nodes[name] = replace(nodes[name], mesh_connected=observe_mesh(ssh_factory(ip)))
 
     public_key_ids = _observe_public_keys(cfg, hostinger)
-    firewall = _find_named(hostinger.list_firewalls(), firewall_name(cfg))
+    firewall = _find_named(hostinger.list_firewalls(), firewall_name(cfg, env))
     firewall_id = firewall.get("id") if firewall else None
     rules_match = bool(firewall) and _rule_keys(firewall.get("rules") or []) == _rule_keys(desired_firewall_rules())
 
@@ -772,9 +957,9 @@ def observe(
         record_matches = False
         cloudflare_ip_warnings: list[str] = []
     else:
-        zone_id, zone_name = cloudflare.zone_for(cfg.domain)
-        expected_ip = _expected_primary_ip(cfg, state, nodes)
-        record_id, record_matches = _observe_record(cloudflare, zone_id, cfg.domain, expected_ip)
+        zone_id, zone_name = cloudflare.zone_for(env.domain)
+        expected_ip = _expected_primary_ip(cfg, env, state, nodes)
+        record_id, record_matches = _observe_record(cloudflare, zone_id, env.domain, expected_ip)
         cloudflare_ip_warnings = _cloudflare_ip_warnings(cloudflare)
 
     return Observed(
@@ -788,11 +973,16 @@ def observe(
         record_id=record_id,
         record_matches=record_matches,
         cloudflare_ip_warnings=cloudflare_ip_warnings,
+        r2=observe_r2(r2, env) if r2 is not None else (),
     )
 
 
 def _find_adoptable_vms(
-    hostinger: HostingerClient, cfg: StackConfig, node_names: list[str]
+    hostinger: HostingerClient,
+    cfg: StackConfig,
+    env: Environment,
+    node_names: list[str],
+    pending: dict[str, str],
 ) -> dict[str, int]:
     """For nodes with no `vps_id` anywhere, look for an already-existing
     Hostinger VM whose hostname matches what stack-base would have named it
@@ -802,19 +992,40 @@ def _find_adoptable_vms(
     emit ADOPT instead of PURCHASE. More than one match is ambiguous --
     stack-base will not guess which one belongs to this project, and raises
     (this is still a GET-only read, not a write).
+
+    A node in `pending` (a 202 purchase, see `NodeState.pending_subscription_id`)
+    matches ONLY the VM whose `subscription_id` equals it, ignoring hostname:
+    Hostinger names a freshly provisioned VM `srv<N>.hstgr.cloud` until setup
+    runs, and a hostname match could grab someone else's server.
     """
-    wanted = {hostname_for(cfg, name): name for name in node_names}
-    if not wanted:
+    wanted = {hostname_for(cfg, env, name): name for name in node_names if name not in pending}
+    pending_by_sub = {sub: name for name, sub in pending.items() if name in node_names}
+    if not wanted and not pending_by_sub:
         return {}
 
     by_hostname: dict[str, list[int]] = {}
+    by_sub: dict[str, list[int]] = {}
     for vm in hostinger.list_vms():
         hostname = vm.get("hostname")
         vps_id = vm.get("id")
-        if isinstance(hostname, str) and isinstance(vps_id, int) and hostname in wanted:
+        subscription_id = vm.get("subscription_id")
+        if not isinstance(vps_id, int):
+            continue
+        if isinstance(hostname, str) and hostname in wanted:
             by_hostname.setdefault(hostname, []).append(vps_id)
+        if isinstance(subscription_id, str) and subscription_id in pending_by_sub:
+            by_sub.setdefault(subscription_id, []).append(vps_id)
 
     found: dict[str, int] = {}
+    for subscription_id, ids in by_sub.items():
+        name = pending_by_sub[subscription_id]
+        if len(ids) > 1:
+            raise StackError(
+                f"found {len(ids)} existing virtual machines for subscription '{subscription_id}' in Hostinger",
+                f"put the right one's id in stack.toml as vps_id for node '{name}' -- stack-base "
+                "will not guess which one to adopt",
+            )
+        found[name] = ids[0]
     for hostname, ids in by_hostname.items():
         name = wanted[hostname]
         if len(ids) > 1:
@@ -887,9 +1098,9 @@ def _observe_record(
 
 
 def _expected_primary_ip(
-    cfg: StackConfig, state: StackState, nodes: dict[str, ObservedNode]
+    cfg: StackConfig, env: Environment, state: StackState, nodes: dict[str, ObservedNode]
 ) -> str | None:
-    name = primary_node(cfg)
+    name = primary_node(cfg, env)
     observed = nodes.get(name)
     if observed and observed.ipv4:
         return observed.ipv4
@@ -932,7 +1143,7 @@ def _rule_keys(rules: list[dict[str, Any]]) -> set[tuple[str, str, str, str]]:
 # --------------------------------------------------------------------------
 
 
-def plan(cfg: StackConfig, state: StackState, observed: Observed) -> list[Step]:
+def plan(cfg: StackConfig, state: StackState, observed: Observed, *, env: Environment | None = None) -> list[Step]:
     """Decide what still has to happen. No I/O, no mutation, no surprises.
 
     Ordering: every node is fully provisioned (bought/installed, running,
@@ -942,13 +1153,14 @@ def plan(cfg: StackConfig, state: StackState, observed: Observed) -> list[Step]:
     the primary node -- so the name never resolves to a box that isn't
     serving yet.
     """
+    env = env if env is not None else cfg.env(None)
     steps: list[Step] = []
 
     if not _keys_converged(cfg, state, observed):
         steps.append(Step(Action.ENSURE_KEYS))
 
-    for name, node in cfg.nodes.items():
-        steps.extend(_provisioning_steps(state, observed, name, node))
+    for name, node in env.nodes.items():
+        steps.extend(_provisioning_steps(state, observed, name, node, nixos_name(env, name)))
 
     # Cloudflare is optional (Task 7b): with no token, `observed.local` says
     # so and neither the origin cert nor DNS is ever planned -- the node
@@ -958,7 +1170,22 @@ def plan(cfg: StackConfig, state: StackState, observed: Observed) -> list[Step]:
     if cert_pending:
         steps.append(Step(Action.ENSURE_ORIGIN_CERT))
 
-    for name in cfg.nodes:
+    # Buckets and their rules exist before any node is rebuilt: the logs
+    # shipper starts on the first rebuild and needs somewhere to write.
+    steps.extend(r2_steps(observed.r2))
+
+    for name in env.nodes:
+        # BEFORE the rebuild, unlike the other two env files: the rebuild is
+        # what starts Vector, Vector cannot start without ${LOGS_ENDPOINT},
+        # and a unit that fails to start fails the whole `switch`. The step
+        # creates /var/lib/stackbase itself, so it needs nothing the rebuild
+        # provides. No [logs] (or an opt-out) plans nothing and removes nothing.
+        if _needs_logs_env(state, observed, env, name):
+            steps.append(Step(Action.ENSURE_LOGS_ENV, name))
+        # Before the rebuild for the same reason: nullmailer's remotes are
+        # rendered from alert.env as it starts, and the rebuild starts it.
+        if _needs_alert_env(state, observed, env, name):
+            steps.append(Step(Action.ENSURE_ALERT_ENV, name))
         if _needs_deploy(state, observed, name, cert_pending):
             steps.append(Step(Action.PUSH_CONFIG, name))
             steps.append(Step(Action.REBUILD, name))
@@ -974,9 +1201,17 @@ def plan(cfg: StackConfig, state: StackState, observed: Observed) -> list[Step]:
         # remove nothing.
         if _needs_backup_env(state, observed, name):
             steps.append(Step(Action.ENSURE_BACKUP_ENV, name))
+        # Last for the node: warp-cli exists only once the rebuild has made
+        # the mesh module active. A reinstall (SETUP) wiped any earlier
+        # enrolment, whatever the pre-run observation saw.
+        if cfg.mesh.enabled and (
+            (observed.nodes.get(name) or ObservedNode()).mesh_connected is not True
+            or any(s.action is Action.SETUP and s.node == name for s in steps)
+        ):
+            steps.append(Step(Action.ENSURE_MESH, name))
 
     if has_cloudflare and not _dns_converged(state, observed):
-        steps.append(Step(Action.UPSERT_DNS, primary_node(cfg)))
+        steps.append(Step(Action.UPSERT_DNS, primary_node(cfg, env)))
 
     return steps
 
@@ -989,7 +1224,9 @@ def _keys_converged(cfg: StackConfig, state: StackState, observed: Observed) -> 
     )
 
 
-def _provisioning_steps(state: StackState, observed: Observed, name: str, node: Node) -> list[Step]:
+def _provisioning_steps(
+    state: StackState, observed: Observed, name: str, node: Node, hardware_dir: str
+) -> list[Step]:
     node_state = state.nodes.get(name) or NodeState()
     seen = observed.nodes.get(name) or ObservedNode()
     steps: list[Step] = []
@@ -1019,6 +1256,11 @@ def _provisioning_steps(state: StackState, observed: Observed, name: str, node: 
                 # never happen without SETUP.
                 steps.append(Step(Action.SETUP, name))
                 setup_planned = True
+        elif node_state.pending_subscription_id:
+            # A 202 purchase is still processing: its VM has not shown up
+            # under that subscription yet. Buying again would double-charge,
+            # and nothing else for this node can run without a VM.
+            return [Step(Action.WAIT_PURCHASE, name)]
         else:
             steps.append(Step(Action.PURCHASE, name))
     elif seen.state == "initial":
@@ -1053,7 +1295,9 @@ def _provisioning_steps(state: StackState, observed: Observed, name: str, node: 
     ):
         steps.append(Step(Action.PIN_HOST_KEY, name))
 
-    if not node_state.hardware_captured or setup_planned or name not in observed.local.captured_nodes:
+    # `hardware_dir` is the node's directory under infra/nodes/ -- `nixos_name`,
+    # so staging's node a looks for nodes/staging-a, never production's file.
+    if not node_state.hardware_captured or setup_planned or hardware_dir not in observed.local.captured_nodes:
         steps.append(Step(Action.CAPTURE_HARDWARE, name))
 
     return steps
@@ -1070,9 +1314,18 @@ def _needs_app_env(state: StackState, observed: Observed, name: str) -> bool:
     at all -- deliberately not a step, and deliberately not a removal (see
     `Local.app_env_sha`'s docstring and the README's "app_env" section)."""
     desired = observed.local.app_env_sha
+    node_state = state.nodes.get(name) or NodeState()
+    # The STORAGE_* block rides in the same file but has its own digest, so a
+    # rotated files key re-pushes even when app_env itself did not change.
+    files_desired = observed.local.files_env_sha
+    if files_desired is not None and node_state.files_env_sha != files_desired:
+        return True
     if desired is None:
         return False
-    node_state = state.nodes.get(name) or NodeState()
+    # [files] removed but the node still has the STORAGE_* block: re-push to
+    # strip it (a rewrite of app.env, not a deletion of anything else).
+    if files_desired is None and node_state.files_env_sha is not None:
+        return True
     return node_state.app_env_sha != desired
 
 
@@ -1086,6 +1339,32 @@ def _needs_backup_env(state: StackState, observed: Observed, name: str) -> bool:
         return False
     node_state = state.nodes.get(name) or NodeState()
     return node_state.backup_env_sha != desired
+
+
+def _needs_logs_env(state: StackState, observed: Observed, env: Environment, name: str) -> bool:
+    """True when logs are on for `env` and the rendered logs.env differs from
+    what this node last had pushed. Credentials with logs off plan nothing,
+    so a project without [logs] plans exactly what it always did."""
+    from stackbase.logs import logs_enabled
+
+    desired = observed.local.logs_env_sha
+    if desired is None or not logs_enabled(env.logs):
+        return False
+    node_state = state.nodes.get(name) or NodeState()
+    return node_state.logs_env_sha != desired
+
+
+def _needs_alert_env(state: StackState, observed: Observed, env: Environment, name: str) -> bool:
+    """True when [alerts] names recipients and the rendered alert.env differs
+    from what this node last had pushed. No [alerts] plans nothing, so a
+    project without it plans exactly what it always did."""
+    from stackbase.alerts import alerts_enabled
+
+    desired = observed.local.alert_env_sha
+    if desired is None or not alerts_enabled(env.alerts):
+        return False
+    node_state = state.nodes.get(name) or NodeState()
+    return node_state.alert_env_sha != desired
 
 
 def _dns_converged(state: StackState, observed: Observed) -> bool:
@@ -1122,11 +1401,37 @@ class Context:
     cloudflare: CloudflareClient | None
     observed: Observed
     stackbase_src: str | None = None
+    # None unless the environment names an R2 bucket (see stackbase/r2.py).
+    r2: R2Account | None = None
     runner: Any = subprocess.run
     popen: Any = subprocess.Popen
+    # Waits between polls (Mesh connecting); tests replace it so none sleep.
+    sleep: Callable[[float], None] = time.sleep
     connector: Any = socket.create_connection
     out: Callable[[str], None] = print
     isatty: Callable[[], bool] = field(default=lambda: sys.stdin.isatty())
+    # The environment this run applies to; `None` means the implicit one of
+    # a single-environment project (and raises on a project with
+    # environments -- see `StackConfig.env`).
+    env: Environment | None = None
+
+    def __post_init__(self) -> None:
+        if self.env is None:
+            self.env = self.cfg.env(None)
+
+    @property
+    def environment(self) -> Environment:
+        if self.env is None:  # __post_init__ always sets it; only a later `ctx.env = None` gets here
+            raise StackError(
+                "the run's environment was cleared after it started",
+                "this is a bug in stack-base -- please report it",
+            )
+        return self.env
+
+    @property
+    def secrets_file(self) -> SecretsFile:
+        """Where this environment's secrets live (`secrets.age` / `secrets.<env>.age`)."""
+        return secrets_file(self.environment)
 
     @property
     def local(self) -> Local:
@@ -1178,7 +1483,7 @@ def apply(
         if step.is_slow:
             ctx.emit(f"→ {render_description(step, has_cloudflare_token=ctx.local.has_cloudflare_token)}…")
         message = step_executors.execute(ctx, step)
-        save_state(ctx.infra_dir, ctx.state)
+        save_state(ctx.infra_dir, ctx.environment, ctx.state)
         ctx.emit(f"✓ {message}")
 
     return ctx.state
@@ -1206,7 +1511,7 @@ def _authorise_purchase(
             "cancel a server -- do that in hPanel)",
         )
 
-    if not ctx.cfg.price_item:
+    if not ctx.environment.price_item:
         raise StackError(
             "buying a server needs a price_item in stack.toml",
             "copy the Hostinger catalog price-item id (e.g. hostingercom-vps-kvm1-usd-1m) into "
@@ -1219,8 +1524,10 @@ def _authorise_purchase(
             "run this by hand in a terminal -- stack-base will not spend money from a script or CI job",
         )
 
-    phrase = f"buy {ctx.cfg.plan} x{count}"
-    ctx.emit(f"About to buy {count} x {ctx.cfg.plan} from Hostinger for node(s) {names}.")
+    plan_name = ctx.environment.plan
+    phrase = f"buy {plan_name} x{count}"
+    where = "" if ctx.environment.implicit else f" in {ctx.environment.name}"
+    ctx.emit(f"About to buy {count} x {plan_name} from Hostinger for node(s) {names}{where}.")
     ctx.emit("This charges the account on file and cannot be undone by stack-base.")
     answer = confirm(f"Type exactly '{phrase}' to go ahead: ")
     if answer.strip() != phrase:

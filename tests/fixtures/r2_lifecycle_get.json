@@ -1,0 +1,6 @@
+{"success": true, "errors": [], "messages": [], "result": {"rules": [
+  {"id": "someone-elses-rule", "enabled": true, "conditions": {"prefix": "tmp/"},
+   "abortMultipartUploadsTransition": {"condition": {"type": "Age", "maxAge": 604800}}},
+  {"id": "stackbase-logs", "enabled": true, "conditions": {"prefix": "journal/"},
+   "deleteObjectsTransition": {"condition": {"type": "Age", "maxAge": 2592000}}}
+]}}

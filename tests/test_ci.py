@@ -19,7 +19,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-from stackbase.ci import SECRET_NAME, ci_setup, parse_github_repo
+from stackbase.ci import SECRET_NAME, ci_secret_name, ci_setup, parse_github_repo
 from stackbase.errors import StackError
 from stackbase.secrets import DEPLOY_FILE, DEPLOY_KEY_NAME, load_secrets
 from stackbase.secrets_cli import deploy_key_init
@@ -192,6 +192,19 @@ class CiSetupUsesTheProjectDeployKeyTests(unittest.TestCase):
 
             self.assertTrue((infra_dir / "deploy.age").exists())
             self.assertTrue((infra_dir / "keys" / "deploy.pub").is_file())
+
+    def test_the_implicit_environment_prints_the_exact_workflow_edits(self) -> None:
+        # The shipped template reads STACK_DEPLOY_KEY_STAGING and deploys
+        # `--env staging`; a single-environment ci-setup writes STACK_DEPLOY_KEY.
+        with _project_with_deploy_key() as (infra_dir, runner, _private_key):
+            lines: list[str] = []
+            ci_setup(infra_dir, emit=lines.append, runner=runner)
+
+            text = "\n".join(lines)
+            self.assertIn("delete the `production` job", text)
+            self.assertIn("drop `--env staging`", text)
+            self.assertIn("secrets.STACK_DEPLOY_KEY_STAGING", text)
+            self.assertIn("secrets.STACK_DEPLOY_KEY }}", text)
 
     def test_a_second_run_without_rotate_reuses_the_same_key(self) -> None:
         with _project_with_deploy_key() as (infra_dir, runner, private_key):
@@ -425,6 +438,25 @@ def _reference_actions() -> set[str]:
     return names
 
 
+def _jobs() -> dict[str, str]:
+    """`jobs:` split into {job id: its text}, by the two-space-indented ids."""
+    body = _WORKFLOW_TEXT.split("\njobs:\n", 1)[1]
+    found: dict[str, list[str]] = {}
+    current = None
+    for line in body.splitlines():
+        match = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        if match:
+            current = match.group(1)
+            found[current] = []
+        elif current is not None:
+            found[current].append(line)
+    return {name: "\n".join(lines) for name, lines in found.items()}
+
+
+def _non_comment(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if not line.strip().startswith("#"))
+
+
 class WorkflowExistsTests(unittest.TestCase):
     def test_the_file_exists_and_is_non_empty(self) -> None:
         self.assertTrue(_WORKFLOW_PATH.is_file())
@@ -446,18 +478,26 @@ class WorkflowTriggerAndPermissionsTests(unittest.TestCase):
 
 
 class WorkflowSecretsAndVarsTests(unittest.TestCase):
-    def test_exactly_one_distinct_secret_is_referenced_and_it_is_stack_deploy_key(self) -> None:
+    def test_only_the_two_environment_deploy_keys_are_referenced(self) -> None:
         # The `${{ secrets.X }}` expression form only -- not every English
         # occurrence of the word "secrets." (this file's own header comment
         # talks about infra/secrets.age, which must not count).
         refs = set(re.findall(r"\$\{\{\s*secrets\.([A-Za-z0-9_]+)\s*\}\}", _WORKFLOW_TEXT))
 
-        self.assertEqual(refs, {SECRET_NAME})
+        self.assertEqual(refs, {"STACK_DEPLOY_KEY_STAGING", "STACK_DEPLOY_KEY_PRODUCTION"})
+
+    def test_each_job_references_only_its_own_key(self) -> None:
+        jobs = _jobs()
+        self.assertIn("secrets.STACK_DEPLOY_KEY_STAGING", jobs["staging"])
+        self.assertNotIn("STACK_DEPLOY_KEY_PRODUCTION", jobs["staging"])
+        self.assertIn("secrets.STACK_DEPLOY_KEY_PRODUCTION", jobs["production"])
+        self.assertNotIn("STACK_DEPLOY_KEY_STAGING", jobs["production"])
 
     def test_no_vars_context_is_referenced(self) -> None:
         self.assertNotIn("vars.", _WORKFLOW_TEXT)
 
-    def test_no_environment_context_is_referenced(self) -> None:
+    def test_no_github_environment_is_used(self) -> None:
+        # GitHub Free has none for private repositories: both keys are repo secrets.
         self.assertNotIn("environment:", _WORKFLOW_TEXT)
 
     def test_the_secret_interpolation_never_appears_inside_a_run_script_line(self) -> None:
@@ -471,7 +511,10 @@ class WorkflowSecretsAndVarsTests(unittest.TestCase):
             if "${{ secrets" in line:
                 stripped = line.strip()
                 self.assertTrue(
-                    re.match(r"^STACK_DEPLOY_KEY:\s*\$\{\{\s*secrets\.STACK_DEPLOY_KEY\s*\}\}$", stripped),
+                    re.match(
+                        r"^STACK_DEPLOY_KEY:\s*\$\{\{\s*secrets\.STACK_DEPLOY_KEY_(?:STAGING|PRODUCTION)\s*\}\}$",
+                        stripped,
+                    ),
                     f"line {number} interpolates a secret outside an env: mapping: {line!r}",
                 )
 
@@ -511,18 +554,19 @@ class WorkflowRunnerTests(unittest.TestCase):
     def test_it_runs_on_the_self_hosted_production_runner(self) -> None:
         # `production`, and NOT `x86_64-linux`: the release runner is reserved
         # for tag deploys so they never queue behind pull-request CI.
-        match = re.search(r"^\s*runs-on:\s*(.+)$", _WORKFLOW_TEXT, re.MULTILINE)
+        runners = re.findall(r"^\s*runs-on:\s*(.+)$", _WORKFLOW_TEXT, re.MULTILINE)
 
-        self.assertIsNotNone(match, "expected a runs-on: line")
-        self.assertEqual(match.group(1).strip(), "[self-hosted, production]")
+        self.assertTrue(runners, "expected a runs-on: line")
+        self.assertEqual({runner.strip() for runner in runners}, {"[self-hosted, production]"})
 
     def test_it_never_uses_the_runner_builtin_hashfiles(self) -> None:
         # The self-hosted runners ship only the node24 runtime; the runner's
         # built-in hashFiles() is hard-wired to node20 and fails there.
         self.assertNotIn("hashFiles(", _WORKFLOW_TEXT)
 
-    def test_there_is_exactly_one_job_and_one_runner(self) -> None:
-        self.assertEqual(len(re.findall(r"^\s*runs-on:", _WORKFLOW_TEXT, re.MULTILINE)), 1)
+    def test_the_jobs_are_staging_then_production(self) -> None:
+        self.assertEqual(list(_jobs()), ["staging", "production"])
+        self.assertEqual(len(re.findall(r"^\s*runs-on:", _WORKFLOW_TEXT, re.MULTILINE)), 2)
 
     def test_nothing_installs_a_c_toolchain_at_job_time(self) -> None:
         # The runner is a NixOS machine that already carries the cross
@@ -572,6 +616,145 @@ class WorkflowKeyHandlingTests(unittest.TestCase):
     def test_the_deploy_step_invokes_infra_up_deploy_with_the_tag_ref(self) -> None:
         self.assertIn("./infra/up deploy", _WORKFLOW_TEXT)
         self.assertIn("$GITHUB_REF_NAME", _WORKFLOW_TEXT)
+
+
+
+class WorkflowEnvironmentsTests(unittest.TestCase):
+    def test_every_tag_deploys_staging(self) -> None:
+        on = _WORKFLOW_TEXT.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertNotIn("workflow_dispatch", _WORKFLOW_TEXT)
+        self.assertIn("tags:", on)
+
+        staging = _non_comment(_jobs()["staging"])
+        self.assertNotIn("if:", staging.split("steps:", 1)[0])
+        self.assertIn('./infra/up --env staging deploy "$GITHUB_REF_NAME"', staging)
+        # A tag, never a branch named like one.
+        self.assertIn('git show-ref --verify --quiet "refs/tags/$GITHUB_REF_NAME"', staging)
+
+    def test_production_follows_a_successful_staging_deploy_of_a_default_branch_tag(self) -> None:
+        jobs = _jobs()
+        staging = _non_comment(jobs["staging"])
+        production = _non_comment(jobs["production"])
+
+        self.assertIn("needs: staging", production)
+        self.assertIn("if: needs.staging.outputs.on_default_branch == 'true'", production)
+        self.assertIn("on_default_branch: ${{ steps.branch.outputs.on_default_branch }}", staging)
+        self.assertIn("DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}", staging)
+        self.assertIn('git merge-base --is-ancestor "$commit" "origin/$DEFAULT_BRANCH"', staging)
+        # An annotated tag names a tag object, not a commit.
+        self.assertIn('git rev-parse "$GITHUB_REF_NAME^{commit}"', staging)
+        # merge-base needs history; the default shallow checkout has none.
+        self.assertIn("fetch-depth: 0", staging)
+        self.assertIn('./infra/up --env production deploy "$GITHUB_REF_NAME"', production)
+        # The check sets the output on both paths, so "skipped" is a decision, not an accident.
+        self.assertIn('echo "on_default_branch=true" >> "$GITHUB_OUTPUT"', staging)
+        self.assertIn('echo "on_default_branch=false" >> "$GITHUB_OUTPUT"', staging)
+
+    def test_each_job_smoke_tests_after_deploying_and_before_removing_the_key(self) -> None:
+        for env in ("staging", "production"):
+            with self.subTest(job=env):
+                text = _jobs()[env]
+                deploy = text.index(f'./infra/up --env {env} deploy "$GITHUB_REF_NAME"')
+                smoke = text.index(f'./infra/up --env {env} smoke "$GITHUB_REF_NAME"')
+                cleanup = text.index("if: always()")
+                self.assertLess(deploy, smoke)
+                self.assertLess(smoke, cleanup)
+                # The smoke step must not be skippable: a failure fails the job.
+                block = text[smoke - 200 : smoke]
+                self.assertNotIn("continue-on-error", block)
+        self.assertNotIn("continue-on-error", _WORKFLOW_TEXT)
+
+    def test_the_default_branch_check_runs_before_the_staging_deploy(self) -> None:
+        staging = _jobs()["staging"]
+        self.assertLess(staging.index("id: branch"), staging.index("name: Deploy to staging"))
+
+    def test_the_job_checks_the_runner_and_cleans_up_the_key(self) -> None:
+        for name, text in _jobs().items():
+            with self.subTest(job=name):
+                self.assertIn("name: Check the runner has stack-base's tools", text)
+                self.assertIn("if: always()", text)
+                self.assertIn('rm -f "$RUNNER_TEMP/deploy_key"', text.split("if: always()", 1)[1])
+
+    def test_the_rustup_comment_is_accurate(self) -> None:
+        # GitHub's Ubuntu images ship rustup; only the self-hosted tools matter.
+        self.assertNotIn("no tailwindcss or rustup", _WORKFLOW_TEXT)
+
+
+_ENVS_TOML = (Path(__file__).resolve().parent / "fixtures" / "stack-envs.toml").read_text(encoding="utf-8")
+
+
+class CiSecretNameTests(unittest.TestCase):
+    def test_names(self) -> None:
+        self.assertEqual(ci_secret_name(None), "STACK_DEPLOY_KEY")
+        self.assertEqual(ci_secret_name("staging"), "STACK_DEPLOY_KEY_STAGING")
+        self.assertEqual(ci_secret_name("production"), "STACK_DEPLOY_KEY_PRODUCTION")
+        self.assertEqual(ci_secret_name("qa-2"), "STACK_DEPLOY_KEY_QA_2")
+
+
+class CiSetupEnvironmentTests(unittest.TestCase):
+    def _run(self, env: str) -> tuple[Path, FakeRunner, list[str], str]:
+        if not _DEPLOY_TOOLS:
+            raise unittest.SkipTest("age / age-keygen / ssh-keygen not installed")
+        lines: list[str] = []
+        project = Project()
+        infra_dir = project.__enter__()
+        self.addCleanup(project.__exit__, None, None, None)
+        (infra_dir / "stack.toml").write_text(_ENVS_TOML, encoding="utf-8")
+        identity_path, public_key = _generate_age_identity(infra_dir.parent)
+        (infra_dir / "age-recipients.txt").write_text(public_key + "\n", encoding="utf-8")
+        (infra_dir / "deploy-recipients.txt").write_text(public_key + "\n", encoding="utf-8")
+        runner = FakeRunner(handler=_happy_path_handler(secret_list_names=[ci_secret_name(env)]))
+        with mock.patch.dict(os.environ, {"STACKBASE_AGE_IDENTITY": str(identity_path)}):
+            ci_setup(infra_dir, env=env, emit=lines.append, runner=runner)
+            private_key = load_secrets(infra_dir, file=_deploy_file(infra_dir, env))[DEPLOY_KEY_NAME]
+        return infra_dir, runner, lines, private_key
+
+    def test_staging_writes_its_own_repo_secret_from_its_own_key(self) -> None:
+        infra_dir, runner, lines, private_key = self._run("staging")
+
+        secret_calls = [c for c in runner.calls if c["argv"][:3] == ["gh", "secret", "set"]]
+        self.assertEqual(len(secret_calls), 1)
+        self.assertEqual(secret_calls[0]["argv"][3], "STACK_DEPLOY_KEY_STAGING")
+        # Staging is a plain repo secret, and no GitHub Environment is touched.
+        self.assertNotIn("--env", secret_calls[0]["argv"])
+        self.assertFalse(any(c["argv"][:2] == ["gh", "api"] for c in runner.calls))
+        self.assertEqual(secret_calls[0]["kwargs"]["input"], private_key.encode("utf-8"))
+        self.assertTrue((infra_dir / "deploy.staging.age").exists())
+        self.assertTrue((infra_dir / "keys" / "deploy.staging.pub").is_file())
+        self.assertFalse((infra_dir / "deploy.age").exists())
+        self.assertFalse((infra_dir / "keys" / "deploy.pub").exists())
+        self.assertTrue(any("--env staging" in line for line in lines))
+        self.assertTrue(any("./infra/up --env production ci-setup" in line for line in lines))
+
+    def test_production_writes_its_own_repo_secret_from_its_own_key(self) -> None:
+        infra_dir, runner, _lines, private_key = self._run("production")
+
+        secret_calls = [c for c in runner.calls if c["argv"][:3] == ["gh", "secret", "set"]]
+        self.assertEqual(len(secret_calls), 1)
+        self.assertEqual(secret_calls[0]["argv"][3], "STACK_DEPLOY_KEY_PRODUCTION")
+        self.assertEqual(secret_calls[0]["kwargs"]["input"], private_key.encode("utf-8"))
+        self.assertTrue((infra_dir / "deploy.production.age").exists())
+        self.assertTrue((infra_dir / "keys" / "deploy.production.pub").is_file())
+        self.assertFalse((infra_dir / "deploy.staging.age").exists())
+
+    def test_no_env_on_a_project_with_environments_is_refused_before_anything_runs(self) -> None:
+        with Project() as infra_dir:
+            (infra_dir / "stack.toml").write_text(_ENVS_TOML, encoding="utf-8")
+            runner = FakeRunner(handler=_happy_path_handler())
+
+            with self.assertRaises(StackError) as caught:
+                ci_setup(infra_dir, emit=_silent, runner=runner)
+
+            self.assertIn("--env", str(caught.exception))
+            self.assertEqual(runner.calls, [])
+            self.assertFalse((infra_dir / "deploy.age").exists())
+
+
+def _deploy_file(infra_dir: Path, env: str):
+    from stackbase.config import load_config
+    from stackbase.secrets import deploy_file
+
+    return deploy_file(load_config(infra_dir).env(env))
 
 
 if __name__ == "__main__":

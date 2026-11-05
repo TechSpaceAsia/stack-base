@@ -318,7 +318,7 @@ class PurchaseVmTests(unittest.TestCase):
             server.script("POST", "/api/vps/v1/public-keys/attach/555", 200, {"id": 1, "name": "attach", "state": "success"})
             client = HostingerClient("tok", base_url=server.url)
 
-            vps_id, warnings = client.purchase_vm(
+            result = client.purchase_vm(
                 price_item="hostingercom-vps-kvm2-usd-1m",
                 template_id=1226,
                 data_center_id=21,
@@ -326,6 +326,7 @@ class PurchaseVmTests(unittest.TestCase):
                 public_key=_KEY,
                 public_key_ids=[42],
             )
+            vps_id, warnings = result.vps_id, result.warnings
 
             self.assertEqual(vps_id, 555)
             self.assertEqual(warnings, [])
@@ -348,9 +349,10 @@ class PurchaseVmTests(unittest.TestCase):
             server.script("POST", "/api/vps/v1/virtual-machines", 200, order_response)
             client = HostingerClient("tok", base_url=server.url)
 
-            vps_id, warnings = client.purchase_vm(
+            result = client.purchase_vm(
                 price_item="x", template_id=1, data_center_id=1, hostname="a", public_key=_KEY
             )
+            vps_id, warnings = result.vps_id, result.warnings
 
             self.assertEqual(vps_id, 555)
             self.assertEqual(warnings, [])
@@ -374,6 +376,46 @@ class PurchaseVmTests(unittest.TestCase):
 
             # Exactly the one purchase request -- no retry, no attach attempt.
             self.assertEqual(len(server.requests), 1)
+
+    def test_purchase_202_returns_subscription_id(self) -> None:
+        # HTTP 202: payment still processing. The body carries the
+        # subscription id -- the only handle we get on the VM-to-be.
+        body = {"id": 2957086, "subscription_id": "Azz353Uhl1xC54pR0", "status": "payment_initiated"}
+        with FakeServer() as server:
+            server.script("POST", "/api/vps/v1/virtual-machines", 202, body)
+            client = HostingerClient("tok", base_url=server.url)
+
+            result = client.purchase_vm(
+                price_item="x", template_id=1, data_center_id=1, hostname="a", public_key=_KEY, public_key_ids=[42]
+            )
+
+            self.assertIsNone(result.vps_id)
+            self.assertEqual(result.subscription_id, "Azz353Uhl1xC54pR0")
+            self.assertEqual(result.warnings, [])
+            # No VM yet, so no key attach either.
+            self.assertEqual(len(server.requests), 1)
+
+    def test_purchase_202_with_null_subscription_id_is_still_the_stack_error(self) -> None:
+        body = {"id": 2957086, "subscription_id": None, "status": "payment_initiated"}
+        with FakeServer() as server:
+            server.script("POST", "/api/vps/v1/virtual-machines", 202, body)
+            client = HostingerClient("tok", base_url=server.url)
+
+            with self.assertRaises(StackError) as caught:
+                client.purchase_vm(price_item="x", template_id=1, data_center_id=1, hostname="a", public_key=_KEY)
+
+            self.assertIn("do not retry", str(caught.exception).lower())
+
+    def test_a_200_purchase_has_no_subscription_id_requirement(self) -> None:
+        order_response = {"order": {"id": "order-1"}, "virtual_machine": _vm(555, state="initial")}
+        with FakeServer() as server:
+            server.script("POST", "/api/vps/v1/virtual-machines", 200, order_response)
+            client = HostingerClient("tok", base_url=server.url)
+
+            result = client.purchase_vm(price_item="x", template_id=1, data_center_id=1, hostname="a", public_key=_KEY)
+
+            self.assertEqual(result.vps_id, 555)
+            self.assertIsNone(result.subscription_id)
 
     def test_a_network_level_failure_warns_the_purchase_may_have_gone_through(self) -> None:
         network_error = ApiError(
@@ -416,7 +458,7 @@ class PurchaseVmTests(unittest.TestCase):
 
             # Must not raise, and the new vps id must still come back -- the purchase
             # already succeeded and must not be thrown away over an optional extra.
-            vps_id, warnings = client.purchase_vm(
+            result = client.purchase_vm(
                 price_item="x",
                 template_id=1,
                 data_center_id=1,
@@ -424,6 +466,7 @@ class PurchaseVmTests(unittest.TestCase):
                 public_key=_KEY,
                 public_key_ids=[999],
             )
+            vps_id, warnings = result.vps_id, result.warnings
 
             self.assertEqual(vps_id, 555)
             self.assertEqual(len(warnings), 1)

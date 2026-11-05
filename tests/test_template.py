@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest import mock
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -338,6 +340,224 @@ class TemplateFlakeEvaluatesTests(unittest.TestCase):
             self.assertEqual(_nix_eval(directory)["grubDevice"], "/dev/sdz")
 
 
+
+def _instantiate_envs_template(directory: Path) -> None:
+    """The template laid out for tests/fixtures/stack-envs.toml: one
+    hardware file per `<env>-<node>`, as CAPTURE_HARDWARE writes them."""
+    _instantiate_template(directory)
+    shutil.rmtree(directory / "nodes")
+    shutil.copy(_REPO_ROOT / "tests" / "fixtures" / "stack-envs.toml", directory / "stack.toml")
+    for name in ("staging-a", "production-a", "production-b"):
+        (directory / "nodes" / name).mkdir(parents=True)
+        (directory / "nodes" / name / "hardware-configuration.nix").write_text(_HOSTINGER_HARDWARE, encoding="utf-8")
+
+
+def _nix_eval_attr(directory: Path, attr: str, apply_fn: str) -> Any:
+    result = subprocess.run(
+        [
+            _NIX or "nix", "eval", "--json",
+            f"path:{directory}#{attr}",
+            "--apply", apply_fn,
+            "--override-input", "stack-base", f"path:{_REPO_ROOT}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"nix eval failed:\n{result.stderr}")
+    return json.loads(result.stdout)
+
+
+_ENV_FACTS = (
+    "node: {"
+    " hostName = node.config.networking.hostName;"
+    " environment = node.config.stackbase.environment;"
+    " domain = node.config.stackbase.domain;"
+    " backupsBucket = node.config.stackbase.backups.bucket;"
+    " backupsRetentionDays = node.config.stackbase.backups.retentionDays;"
+    " logsEnable = node.config.stackbase.logs.enable;"
+    " logsBucket = node.config.stackbase.logs.bucket;"
+    " vectorEnable = node.config.services.vector.enable;"
+    " alertsTo = node.config.stackbase.alerts.to;"
+    " nullmailerEnable = node.config.services.nullmailer.enable;"
+    " deployKeys = node.config.stackbase.deploy.keys;"
+    " }"
+)
+
+
+@unittest.skipIf(_NIX is None, "nix is not installed")
+class TemplateEnvironmentsTests(unittest.TestCase):
+    """One nixosConfigurations."<env>-<node>" per environment node, each
+    with its environment's own domain, overrides and deploy key."""
+
+    def test_one_configuration_per_environment_node(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_envs_template(directory)
+
+            names = _nix_eval_attr(directory, "nixosConfigurations", "builtins.attrNames")
+
+            self.assertEqual(sorted(names), ["production-a", "production-b", "staging-a"])
+
+    def test_hostname_environment_and_overrides(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_envs_template(directory)
+            (directory / "keys" / "deploy.staging.pub").write_text(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAACIExampleStagingDeploy deploy@acme\n", encoding="utf-8"
+            )
+
+            staging = _nix_eval_attr(directory, 'nixosConfigurations."staging-a"', _ENV_FACTS)
+            production = _nix_eval_attr(directory, 'nixosConfigurations."production-a"', _ENV_FACTS)
+
+            self.assertEqual(staging["hostName"], "staging-a")
+            self.assertEqual(staging["environment"], "staging")
+            self.assertEqual(staging["domain"], "staging.acme.example.com")
+            self.assertEqual(staging["backupsBucket"], "acme-backups-staging")
+            self.assertEqual(staging["backupsRetentionDays"], 30)
+            self.assertIn("deploy", staging["deployKeys"])
+
+            self.assertEqual(production["hostName"], "production-a")
+            self.assertEqual(production["environment"], "production")
+            self.assertEqual(production["domain"], "acme.example.com")
+            self.assertEqual(production["backupsBucket"], "acme-backups")
+            self.assertEqual(production["backupsRetentionDays"], 365)
+            # A staging deploy key cannot deploy production.
+            self.assertNotIn("deploy", production["deployKeys"])
+
+    def test_logs_bucket_env_override(self) -> None:
+        """[environments.<env>] logs.bucket wins over the shared [logs] table,
+        and naming a bucket is what turns Vector on."""
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_envs_template(directory)
+
+            staging = _nix_eval_attr(directory, 'nixosConfigurations."staging-a"', _ENV_FACTS)
+            production = _nix_eval_attr(directory, 'nixosConfigurations."production-a"', _ENV_FACTS)
+
+            self.assertEqual(staging["logsBucket"], "acme-logs-staging")
+            self.assertEqual(production["logsBucket"], "acme-logs")
+            for facts in (staging, production):
+                self.assertTrue(facts["logsEnable"])
+                self.assertTrue(facts["vectorEnable"])
+
+    def test_environment_opt_out_beats_the_shared_buckets(self) -> None:
+        """staging sets backups.enabled / logs.enabled = false and no bucket
+        of its own: it must evaluate to backups off and logs off despite the
+        shared buckets, while production keeps both."""
+        facts_fn = _ENV_FACTS[:-2] + " backupsEnable = node.config.stackbase.backups.enable; }"
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_envs_template(directory)
+            toml = (directory / "stack.toml").read_text(encoding="utf-8")
+            for line in ('backups.bucket = "acme-backups-staging"', 'logs.bucket = "acme-logs-staging"'):
+                self.assertIn(line, toml)
+            toml = toml.replace('backups.bucket = "acme-backups-staging"', "backups.enabled = false")
+            toml = toml.replace('logs.bucket = "acme-logs-staging"', "logs.enabled = false")
+            (directory / "stack.toml").write_text(toml, encoding="utf-8")
+
+            staging = _nix_eval_attr(directory, 'nixosConfigurations."staging-a"', facts_fn)
+            production = _nix_eval_attr(directory, 'nixosConfigurations."production-a"', facts_fn)
+
+            self.assertFalse(staging["backupsEnable"])
+            self.assertEqual(staging["backupsBucket"], "")
+            self.assertFalse(staging["logsEnable"])
+            self.assertFalse(staging["vectorEnable"])
+            self.assertTrue(production["backupsEnable"])
+            self.assertEqual(production["backupsBucket"], "acme-backups")
+            self.assertTrue(production["logsEnable"])
+            self.assertEqual(production["logsBucket"], "acme-logs")
+
+    def test_logs_enabled_false_turns_vector_off_even_with_a_bucket(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+            (directory / "stack.toml").write_text(
+                _SAMPLE_STACK_TOML + '\n[logs]\nenabled = false\nbucket = "acme-logs"\n', encoding="utf-8"
+            )
+
+            facts = _nix_eval_attr(directory, "nixosConfigurations.a", _ENV_FACTS)
+
+            self.assertFalse(facts["logsEnable"])
+            self.assertFalse(facts["vectorEnable"])
+
+    def test_alerts_to_env_override(self) -> None:
+        """[environments.<env>] alerts.to wins over the shared [alerts] table,
+        and naming recipients is what turns nullmailer on."""
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_envs_template(directory)
+
+            staging = _nix_eval_attr(directory, 'nixosConfigurations."staging-a"', _ENV_FACTS)
+            production = _nix_eval_attr(directory, 'nixosConfigurations."production-a"', _ENV_FACTS)
+
+            self.assertEqual(staging["alertsTo"], ["ops@example.com", "servers.acme.staging@example.com"])
+            self.assertEqual(production["alertsTo"], ["ops@example.com"])
+            for facts in (staging, production):
+                self.assertTrue(facts["nullmailerEnable"])
+
+    def test_mesh_enabled_turns_on_the_warp_connector(self) -> None:
+        """[mesh] enabled = true -> headless cloudflare-warp, firewall closed,
+        and only that one unfree package admitted."""
+        facts_fn = (
+            "node: { enable = node.config.services.cloudflare-warp.enable;"
+            " openFirewall = node.config.services.cloudflare-warp.openFirewall;"
+            " unit = node.config.systemd.services ? cloudflare-warp;"
+            " warp = node.config.nixpkgs.config.allowUnfreePredicate { pname = \"cloudflare-warp\"; };"
+            " version = node.config.services.cloudflare-warp.package.version;"
+            " nft = node.config.systemd.services.cloudflare-warp.serviceConfig.BindReadOnlyPaths;"
+            " other = node.config.nixpkgs.config.allowUnfreePredicate { pname = \"vscode\"; }; }"
+        )
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+            (directory / "stack.toml").write_text(
+                _SAMPLE_STACK_TOML + "\n[mesh]\nenabled = true\n", encoding="utf-8"
+            )
+
+            facts = _nix_eval_attr(directory, "nixosConfigurations.a", facts_fn)
+
+            self.assertTrue(facts["enable"])
+            self.assertFalse(facts["openFirewall"])
+            self.assertTrue(facts["unit"])
+            self.assertTrue(facts["warp"])
+            # The 2026-10-20 certificate-chain hotfix build, not 26.05's 2026.3.
+            version = tuple(int(part) for part in facts["version"].split("."))
+            self.assertGreaterEqual(version, (2026, 8), facts["version"])
+            self.assertTrue(any(m.endswith(":/usr/sbin/nft") for m in facts["nft"]), facts["nft"])
+            self.assertFalse(facts["other"])
+
+    def test_no_mesh_table_leaves_the_warp_connector_off(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+
+            facts = _nix_eval_attr(
+                directory, "nixosConfigurations.a", "node: node.config.services.cloudflare-warp.enable"
+            )
+
+            self.assertFalse(facts)
+
+    def test_a_legacy_project_has_an_empty_environment(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _instantiate_template(directory)
+
+            facts = _nix_eval_attr(directory, "nixosConfigurations.a", _ENV_FACTS)
+
+            self.assertEqual(facts["hostName"], "a")
+            self.assertEqual(facts["environment"], "")
+            self.assertEqual(facts["domain"], "acme.example.com")
+            # No [logs] table: no Vector, exactly as before logs existed.
+            self.assertFalse(facts["logsEnable"])
+            self.assertEqual(facts["logsBucket"], "")
+            self.assertFalse(facts["vectorEnable"])
+            # No [alerts] table: no nullmailer, no drop-in, no watchdog.
+            self.assertEqual(facts["alertsTo"], [])
+            self.assertFalse(facts["nullmailerEnable"])
+
+
 @unittest.skipIf(_NIX is None, "nix is not installed")
 class ConfdTests(unittest.TestCase):
     """infra/conf.d/*.nix applies to EVERY node; infra/nodes/<n>/extra.nix to one."""
@@ -505,6 +725,199 @@ class ProjectDeployKeyTests(unittest.TestCase):
                 all(line.startswith("restrict,command=") for line in facts["deployAuthorizedKeys"]),
                 facts["deployAuthorizedKeys"],
             )
+
+
+@unittest.skipIf(_NIX is None, "nix is not installed")
+class VectorSettingsTests(unittest.TestCase):
+    """nixos/logs.nix renders the approved Vector design verbatim (Brief D).
+    The VM test (tests/vm-logs.nix) proves the behaviour; this pins the
+    values, fast, so a drive-by edit to one of them is caught."""
+
+    def _eval(self, apply_fn: str, extra: str = 'stackbase.logs.bucket = "acme-logs";') -> Any:
+        result = _eval_mk_node(apply_fn, provider="null", extra_config=f"stackbase.admins.matt = \"k\"; {extra}")
+        if result.returncode != 0:
+            raise AssertionError(f"nix eval failed:\n{result.stderr}")
+        return json.loads(result.stdout)
+
+    def test_vector_settings_match_the_spec(self) -> None:
+        settings = self._eval("node.config.services.vector.settings")
+
+        self.assertEqual(settings["data_dir"], "/var/lib/vector")
+        self.assertEqual(settings["api"], {"enabled": True, "address": "127.0.0.1:8686"})
+        journal = settings["sources"]["journal"]
+        self.assertEqual(journal["type"], "journald")
+        self.assertIs(journal["current_boot_only"], False)
+        self.assertIs(journal["since_now"], False)
+        self.assertEqual(journal["exclude_units"], ["vector.service"])
+        self.assertIs(journal["emit_cursor"], True)
+
+        remap = settings["transforms"]["slim"]
+        self.assertEqual(remap["inputs"], ["journal"])
+        for field in ("timestamp", "host", "unit", "ident", "pid", "priority", "message", "boot_id", "cursor"):
+            self.assertIn(f'"{field}"', remap["source"])
+        self.assertIn("compact(", remap["source"])
+
+        r2 = settings["sinks"]["r2"]
+        self.assertEqual(r2["type"], "aws_s3")
+        self.assertEqual(r2["bucket"], "acme-logs")
+        self.assertEqual(r2["region"], "auto")
+        self.assertEqual(r2["endpoint"], "${LOGS_ENDPOINT}")
+        self.assertIs(r2["force_path_style"], True)
+        self.assertEqual(r2["key_prefix"], "journal/{{ host }}/%Y/%m/%d/%H/")
+        self.assertIs(r2["filename_append_uuid"], True)
+        self.assertEqual(r2["filename_extension"], "ndjson.gz")
+        self.assertEqual(r2["compression"], "gzip")
+        self.assertEqual(r2["encoding"], {"codec": "json"})
+        self.assertEqual(r2["framing"], {"method": "newline_delimited"})
+        self.assertEqual(r2["batch"], {"timeout_secs": 15, "max_bytes": 67108864})
+        self.assertEqual(r2["buffer"], {"type": "disk", "max_size": 1073741824, "when_full": "block"})
+        self.assertEqual(r2["acknowledgements"], {"enabled": True})
+        self.assertEqual(r2["request"], {"concurrency": "adaptive"})
+        self.assertEqual(r2["healthcheck"], {"enabled": True})
+        for forbidden in ("storage_class", "acl", "server_side_encryption", "ssekms_key_id", "grant_full_control"):
+            self.assertNotIn(forbidden, r2)
+
+        local = settings["sinks"]["local"]
+        self.assertEqual(local["type"], "file")
+        self.assertEqual(local["path"], "/var/log/vector/%Y-%m-%d/%H.ndjson")
+        self.assertEqual(local["buffer"], {"type": "memory", "max_events": 10000, "when_full": "drop_newest"})
+
+        self.assertEqual(settings["sources"]["vector_metrics"], {"type": "internal_metrics"})
+        self.assertEqual(
+            settings["sinks"]["metrics"],
+            {"type": "prometheus_exporter", "inputs": ["vector_metrics"], "address": "127.0.0.1:9598"},
+        )
+
+    def test_the_unit_reads_the_credentials_file_and_the_local_copy_ages_out(self) -> None:
+        facts = self._eval(
+            "{"
+            " env = node.config.systemd.services.vector.serviceConfig.EnvironmentFile;"
+            " rw = node.config.systemd.services.vector.serviceConfig.ReadWritePaths;"
+            " rules = node.config.systemd.tmpfiles.rules;"
+            " journaldAccess = node.config.services.vector.journaldAccess;"
+            " }"
+        )
+        self.assertEqual(facts["env"], "/var/lib/stackbase/logs.env")
+        self.assertIn("/var/log/vector", facts["rw"])
+        self.assertIn("d /var/log/vector 0750 vector vector 3d", facts["rules"])
+        self.assertTrue(facts["journaldAccess"])
+
+    def test_batch_seconds_and_buffer_bytes_are_options(self) -> None:
+        r2 = self._eval(
+            "node.config.services.vector.settings.sinks.r2",
+            'stackbase.logs.bucket = "b2"; stackbase.logs.batchSeconds = 5; stackbase.logs.bufferBytes = 268435488;',
+        )
+        self.assertEqual(r2["batch"]["timeout_secs"], 5)
+        self.assertEqual(r2["buffer"]["max_size"], 268435488)
+
+    def test_journald_keeps_seven_days_and_syncs_every_five_seconds(self) -> None:
+        conf = self._eval('node.config.environment.etc."systemd/journald.conf".text', "")
+        for line in (
+            "Storage=persistent",
+            "Compress=yes",
+            "SystemMaxUse=2G",
+            "SystemKeepFree=4G",
+            "SystemMaxFileSize=128M",
+            "MaxRetentionSec=7day",
+            "MaxFileSec=1day",
+            "SyncIntervalSec=5s",
+            "RateLimitBurst=10000",
+            "ForwardToSyslog=no",
+        ):
+            self.assertIn(line, conf.splitlines())
+        self.assertIn("RateLimitInterval=30s", conf.splitlines())
+        self.assertNotIn("SystemMaxUse=500M", conf)
+        self.assertNotIn("ForwardToSyslog=yes", conf)
+
+
+@unittest.skipIf(_NIX is None, "nix is not installed")
+class AlertsSettingsTests(unittest.TestCase):
+    """nixos/alerts.nix wires the approved design (Brief F). The VM test
+    (tests/vm-alerts.nix) proves the behaviour; this pins the wiring, fast."""
+
+    _ON = 'stackbase.alerts.to = [ "ops@example.org" ];'
+
+    def _eval(self, apply_fn: str, extra: str = _ON) -> Any:
+        result = _eval_mk_node(apply_fn, provider="null", extra_config=f"stackbase.admins.matt = \"k\"; {extra}")
+        if result.returncode != 0:
+            raise AssertionError(f"nix eval failed:\n{result.stderr}")
+        return json.loads(result.stdout)
+
+    def test_no_recipients_means_no_mailer_no_drop_in_no_watchdog(self) -> None:
+        facts = self._eval(
+            "{"
+            " nullmailer = node.config.services.nullmailer.enable;"
+            " handler = node.config.systemd.services ? \"stackbase-alert@\";"
+            " freshness = node.config.systemd.timers ? stackbase-freshness;"
+            " packages = map (p: p.name) node.config.systemd.packages;"
+            " }",
+            "",
+        )
+        self.assertFalse(facts["nullmailer"])
+        self.assertFalse(facts["handler"])
+        self.assertFalse(facts["freshness"])
+        self.assertNotIn("stackbase-alert-dropins", facts["packages"])
+
+    def test_recipients_turn_on_the_whole_alert_path(self) -> None:
+        facts = self._eval(
+            "{"
+            " nullmailer = node.config.services.nullmailer.enable;"
+            " remotesFile = node.config.services.nullmailer.remotesFile;"
+            " packages = map (p: p.name) node.config.systemd.packages;"
+            " handlerStart = node.config.systemd.services.\"stackbase-alert@\".serviceConfig.ExecStart;"
+            " remotesEnv = node.config.systemd.services.stackbase-alert-remotes.serviceConfig.EnvironmentFile;"
+            " nullmailerRequires = node.config.systemd.services.nullmailer.requires;"
+            " timer = node.config.systemd.timers.stackbase-freshness.timerConfig.OnCalendar;"
+            " freshnessEnv = node.config.systemd.services.stackbase-freshness.environment;"
+            " }"
+        )
+        self.assertTrue(facts["nullmailer"])
+        self.assertEqual(facts["remotesFile"], "/run/stackbase-alert/remotes")
+        self.assertIn("stackbase-alert-dropins", facts["packages"])
+        self.assertTrue(facts["handlerStart"].endswith(" %i"), facts["handlerStart"])
+        self.assertEqual(facts["remotesEnv"], "/var/lib/stackbase/alert.env")
+        self.assertIn("stackbase-alert-remotes.service", facts["nullmailerRequires"])
+        self.assertEqual(facts["timer"], "hourly")
+        self.assertEqual(facts["freshnessEnv"]["GRACE_SECONDS"], "3600")
+        self.assertEqual(facts["freshnessEnv"]["BUFFER_ALERT_BYTES"], "268435456")
+        self.assertEqual(facts["freshnessEnv"]["BACKUP_MAX_AGE_SECONDS"], str(36 * 3600))
+        self.assertEqual(facts["freshnessEnv"]["SENT_STALL_SECONDS"], str(2 * 3600))
+        # Backups and logs are off on this node: neither check runs.
+        self.assertEqual(facts["freshnessEnv"]["CHECK_BACKUPS"], "0")
+        self.assertEqual(facts["freshnessEnv"]["CHECK_LOGS"], "0")
+
+    def test_the_watchdog_checks_what_the_node_has(self) -> None:
+        env = self._eval(
+            "node.config.systemd.services.stackbase-freshness.environment",
+            self._ON + ' stackbase.backups.bucket = "b"; stackbase.logs.bucket = "l";',
+        )
+        self.assertEqual(env["CHECK_BACKUPS"], "1")
+        self.assertEqual(env["CHECK_LOGS"], "1")
+        opted_out = self._eval(
+            "node.config.systemd.services.stackbase-freshness.environment",
+            self._ON + ' stackbase.backups.bucket = "b"; stackbase.backups.enable = false;',
+        )
+        self.assertEqual(opted_out["CHECK_BACKUPS"], "0")
+
+    def test_a_recipient_must_be_one_address(self) -> None:
+        """`to` lands in a To: header: a newline there would inject another header."""
+        result = _eval_mk_node(
+            "node.config.stackbase.alerts.to",
+            provider="null",
+            extra_config='stackbase.admins.matt = "k"; stackbase.alerts.to = [ "ops@example.org\\nBcc: x@evil.test" ];',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stackbase.alerts.to", result.stderr)
+
+    def test_the_subject_names_project_environment_and_host(self) -> None:
+        """`[<project>/<env>/<hostname>]`, or `[<project>/<hostname>]` for a
+        project without [environments]."""
+        staging = self._eval(
+            "node.config.stackbase.alerts.subjectLabel",
+            self._ON + ' networking.hostName = "staging-a"; stackbase.environment = "staging";',
+        )
+        legacy = self._eval("node.config.stackbase.alerts.subjectLabel", self._ON + ' networking.hostName = "a";')
+        self.assertEqual((staging, legacy), ("t/staging/staging-a", "t/a"))
 
 
 @unittest.skipIf(_NIX is None, "nix is not installed")
@@ -692,6 +1105,26 @@ class TemplateUpScriptTests(unittest.TestCase):
                 (["--allow-purchase"], "up --allow-purchase"),
                 (["ssh", "a"], "ssh a"),
                 (["up", "--plan"], "up --plan"),
+            ]
+            for args, expected_tail in cases:
+                with self.subTest(args=args):
+                    result = self._run_up(infra_dir, *args, env_extra={"STACKBASE_SRC": str(source)})
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), f"--infra-dir {infra_dir} {expected_tail}")
+
+    def test_a_leading_env_flag_still_finds_or_inserts_the_subcommand(self) -> None:
+        with TemporaryDirectory() as tmp:
+            infra_dir = self._infra_dir(tmp)
+            source = self._fake_echo_source(tmp)
+
+            cases = [
+                (["--env", "staging"], "--env staging up"),
+                (["--env", "staging", "--plan"], "--env staging up --plan"),
+                (["--env=staging", "--plan"], "--env=staging up --plan"),
+                (["--env", "staging", "deploy", "v1.0.0"], "--env staging deploy v1.0.0"),
+                (["--env", "production", "ssh", "a"], "--env production ssh a"),
+                (["deploy", "v1.0.0", "--env", "staging"], "deploy v1.0.0 --env staging"),
+                (["--plan", "--env", "staging"], "up --plan --env staging"),
             ]
             for args, expected_tail in cases:
                 with self.subTest(args=args):
@@ -1232,6 +1665,10 @@ class TemplateFilesTests(unittest.TestCase):
         self.assertNotIn("backups", data)
         self.assertIn("bucket", text)
         self.assertIn("retention_days", text)
+        # Environments are opt-in too: documented, commented out.
+        self.assertNotIn("environments", data)
+        self.assertIn("# [environments.staging]", text)
+        self.assertIn("# [environments.production.nodes.a]", text)
 
     def test_the_example_stack_toml_has_no_real_vps_id_and_still_loads(self) -> None:
         """The example must never carry a real Hostinger VPS id (Finding 7)."""
@@ -1272,6 +1709,95 @@ class TemplateFilesTests(unittest.TestCase):
                 hits.append(path.relative_to(_REPO_ROOT).as_posix())
 
         self.assertEqual(sorted(hits), ["README.md", "templates/infra/flake.nix"])
+
+
+_CI_TEMPLATE = _REPO_ROOT / "templates" / "github" / "deploy-stack.yml"
+_CHECKOUT_VERSION_COMMENT = re.compile(r"#\s*v(\d+)")
+
+
+def _node20_violations(text: str) -> list[str]:
+    """Non-comment lines that depend on something the self-hosted runner lacks.
+
+    The runner ships only the node24 action runtime, so the built-in
+    `hashFiles()` (hard-wired to node20), any `actions/cache` step, and a
+    checkout pinned below v5 would all fail there.
+    """
+    violations = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "hashFiles(" in line:
+            violations.append(line)
+        if re.search(r"uses:\s*actions/cache", line):
+            violations.append(line)
+        if re.search(r"uses:\s*actions/checkout@", line):
+            version = _CHECKOUT_VERSION_COMMENT.search(line)
+            if version is None or int(version.group(1)) < 5:
+                violations.append(line)
+    return violations
+
+
+def _ci_step_blocks(lines: list[str]) -> list[list[str]]:
+    """Split the workflow's job steps: each block starts at a `      - ` item line."""
+    starts = [i for i, line in enumerate(lines) if line.startswith("      - ")]
+    return [lines[start : end] for start, end in zip(starts, starts[1:] + [len(lines)])]
+
+
+def _ci_job_lines(text: str) -> dict[str, list[str]]:
+    """The workflow's jobs, each as its own list of lines."""
+    jobs: dict[str, list[str]] = {}
+    current = None
+    for line in text.split("\njobs:\n", 1)[1].splitlines():
+        match = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        if match:
+            current = match.group(1)
+            jobs[current] = []
+        elif current is not None:
+            jobs[current].append(line)
+    return jobs
+
+
+class CiTemplateTests(unittest.TestCase):
+    def test_ci_template_has_no_node20_dependencies(self) -> None:
+        text = _CI_TEMPLATE.read_text(encoding="utf-8")
+
+        self.assertEqual(_node20_violations(text), [])
+
+    def test_node20_guard_flags_an_actions_cache_step(self) -> None:
+        self.assertEqual(
+            _node20_violations("      - uses: actions/cache@v4\n"),
+            ["- uses: actions/cache@v4"],
+        )
+
+    def test_ci_template_preflight_lists_required_tools(self) -> None:
+        jobs = _ci_job_lines(_CI_TEMPLATE.read_text(encoding="utf-8"))
+        self.assertEqual(list(jobs), ["staging", "production"])
+        for name, lines in jobs.items():
+            with self.subTest(job=name):
+                self._assert_preflight_first(lines)
+
+    def _assert_preflight_first(self, lines: list[str]) -> None:
+        blocks = _ci_step_blocks(lines)
+        preflight = [i for i, b in enumerate(blocks) if b[0].endswith("name: Check the runner has stack-base's tools")]
+        checkout = [i for i, b in enumerate(blocks) if "uses: actions/checkout@" in b[0]]
+        self.assertEqual(len(preflight), 1)
+        self.assertEqual(len(checkout), 1)
+        # Right after checkout: nothing else may run before the tools are known to exist.
+        self.assertEqual(preflight[0], checkout[0] + 1)
+
+        infra_up = [
+            i
+            for i, b in enumerate(blocks)
+            if any(not line.strip().startswith("#") and "./infra/up" in line for line in b)
+        ]
+        self.assertTrue(infra_up)
+        for i in infra_up:
+            self.assertGreater(i, preflight[0])
+
+        script = "\n".join(blocks[preflight[0]])
+        for tool in ("python3", "rsync", "tailwindcss", "x86_64-unknown-linux-musl-gcc", "rustup", "git", "ssh"):
+            self.assertIn(tool, script)
 
 
 if __name__ == "__main__":

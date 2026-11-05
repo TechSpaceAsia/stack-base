@@ -24,6 +24,12 @@ let
 
   backupEnvFile = "/var/lib/stackbase/backup.env";
 
+  # Read by nixos/alerts.nix's freshness watchdog: last-success is the
+  # epoch second of the newest run that got all the way to the end, and
+  # enabled-at (created once, never touched again) is when backups were
+  # turned on -- what "too old" counts from before the first success.
+  stampDir = "/var/lib/stackbase-backup";
+
   backupScript = pkgs.writeShellApplication {
     name = "stackbase-backup";
     runtimeInputs = [
@@ -104,6 +110,9 @@ let
       echo "→ pruning anything older than ${toString backups.retentionDays} days"
       prune_prefix db
       prune_prefix files
+      # Last, so only a run that uploaded and pruned everything counts.
+      date +%s > ${stampDir}/last-success.new
+      mv -f ${stampDir}/last-success.new ${stampDir}/last-success
       echo "✓ backup complete"
     '';
   };
@@ -248,8 +257,17 @@ in
         # much clearer message about what is missing.
         EnvironmentFile = "-${backupEnvFile}";
         ExecStart = "${backupScript}/bin/stackbase-backup";
+        # Also made by tmpfiles at boot; this covers the first switch that
+        # turns backups on, which can start the unit before tmpfiles reruns.
+        StateDirectory = "stackbase-backup";
+        StateDirectoryMode = "0755";
       };
     };
+
+    systemd.tmpfiles.rules = [
+      "d ${stampDir} 0755 root root -"
+      "f ${stampDir}/enabled-at 0644 root root -"
+    ];
 
     systemd.timers.stackbase-backup = {
       wantedBy = [ "timers.target" ];

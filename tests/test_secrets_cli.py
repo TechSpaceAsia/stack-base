@@ -585,7 +585,7 @@ class DeployKeyShowPubTests(unittest.TestCase):
     def test_prints_the_committed_public_half(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             infra_dir = Path(tmp)
-            (infra_dir / "keys").mkdir()
+            _deploy_project(infra_dir, "age1unused")
             (infra_dir / "keys" / DEPLOY_PUB_FILENAME).write_text(
                 "ssh-ed25519 AAAA deploy@acme\n", encoding="utf-8"
             )
@@ -597,10 +597,28 @@ class DeployKeyShowPubTests(unittest.TestCase):
 
     def test_a_missing_public_half_names_the_init_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            _deploy_project(Path(tmp), "age1unused")
             with self.assertRaises(StackError) as ctx:
                 deploy_key_show_pub(Path(tmp), emit=lambda _line: None)
 
             self.assertIn("deploy-key init", str(ctx.exception))
+
+    def test_an_environment_reads_its_own_public_half(self) -> None:
+        envs = (Path(__file__).resolve().parent / "fixtures" / "stack-envs.toml").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            infra_dir = Path(tmp)
+            _deploy_project(infra_dir, "age1unused")
+            (infra_dir / "stack.toml").write_text(envs, encoding="utf-8")
+            (infra_dir / "keys" / DEPLOY_PUB_FILENAME).write_text("ssh-ed25519 AAAA legacy\n", encoding="utf-8")
+            (infra_dir / "keys" / "deploy.staging.pub").write_text("ssh-ed25519 AAAA staging\n", encoding="utf-8")
+            emitted: list[str] = []
+
+            deploy_key_show_pub(infra_dir, emit=emitted.append, env="staging")
+            self.assertEqual(emitted, ["ssh-ed25519 AAAA staging"])
+            # No env on a project with environments: refused, never the legacy file.
+            with self.assertRaises(StackError) as ctx:
+                deploy_key_show_pub(infra_dir, emit=emitted.append)
+            self.assertIn("--env", str(ctx.exception))
 
 
 if __name__ == "__main__":

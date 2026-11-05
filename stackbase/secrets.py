@@ -19,9 +19,12 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 from stackbase.errors import StackError
+
+if TYPE_CHECKING:
+    from stackbase.config import Environment
 
 _DEFAULT_IDENTITY = Path.home() / ".age" / "key.txt"
 _REDACTED = "***REDACTED***"
@@ -85,27 +88,87 @@ def _deploy_missing_hint(deploy_path: Path, _recipients_path: Path) -> str:
     )
 
 
+def _env_deploy_missing_hint(env_name: str) -> Callable[[Path, Path], str]:
+    def hint(deploy_path: Path, _recipients_path: Path) -> str:
+        return (
+            f"create it with `./infra/up --env {env_name} deploy-key init` -- that generates the key in "
+            f"RAM and writes {deploy_path} (encrypted) plus infra/keys/{deploy_pub_name(env_name)} (committed)"
+        )
+
+    return hint
+
+
 @dataclass(frozen=True)
 class SecretsFile:
     """One age-encrypted JSON file plus the recipients file it is encrypted to.
 
-    Two exist. `SECRETS_FILE` holds everything an operator needs to run
-    `up` (API tokens, the origin TLS key, app_env, the R2 credentials).
-    `DEPLOY_FILE` holds exactly one value -- the project's SSH deploy
-    private key -- against a DIFFERENT, wider recipient list, so a machine
-    that only needs to push releases (a NixOS build host) can be given an
-    identity that unlocks the deploy door and nothing else. Everything
-    that reads or writes either file goes through the same code path;
-    only this descriptor changes.
+    Two kinds exist, one of each per environment. The secrets file
+    (`secrets.age`, or `secrets.<env>.age`) holds everything an operator
+    needs to run `up` (API tokens, the origin TLS key, app_env, the R2
+    credentials). The deploy file (`deploy.age` / `deploy.<env>.age`) holds
+    exactly one value -- that environment's SSH deploy private key --
+    against a DIFFERENT, wider recipient list, so a machine that only needs
+    to push releases (a NixOS build host) can be given an identity that
+    unlocks the deploy door and nothing else. Everything that reads or
+    writes any of them goes through the same code path; only this
+    descriptor changes.
+
+    `recipients_fallback`, when set, is the shared recipients file an
+    environment uses until it has a list of its own (see `recipients_path`).
     """
 
     name: str
     recipients_name: str
     missing_hint: Callable[[Path, Path], str]
+    recipients_fallback: str | None = None
+
+    def recipients_path(self, infra_dir: Path) -> Path:
+        """The environment's own recipients file if it exists, else the shared one."""
+        own = infra_dir / self.recipients_name
+        if self.recipients_fallback is None or own.exists():
+            return own
+        return infra_dir / self.recipients_fallback
 
 
 SECRETS_FILE = SecretsFile("secrets.age", "age-recipients.txt", _secrets_missing_hint)
 DEPLOY_FILE = SecretsFile("deploy.age", "deploy-recipients.txt", _deploy_missing_hint)
+
+
+def secrets_file(env: Environment) -> SecretsFile:
+    """`secrets.age` for the implicit environment, else `secrets.<env>.age`,
+    encrypted to `age-recipients.<env>.txt` if present, else `age-recipients.txt`."""
+    if env.implicit:
+        return SECRETS_FILE
+    return SecretsFile(
+        f"secrets.{env.name}.age",
+        f"age-recipients.{env.name}.txt",
+        _secrets_missing_hint,
+        recipients_fallback=SECRETS_FILE.recipients_name,
+    )
+
+
+def deploy_file(env: Environment) -> SecretsFile:
+    """`deploy.age` for the implicit environment, else `deploy.<env>.age`,
+    encrypted to `deploy-recipients.<env>.txt` if present, else
+    `deploy-recipients.txt`. One key per environment: a staging deploy key
+    cannot deploy production."""
+    if env.implicit:
+        return DEPLOY_FILE
+    return SecretsFile(
+        f"deploy.{env.name}.age",
+        f"deploy-recipients.{env.name}.txt",
+        _env_deploy_missing_hint(env.name),
+        recipients_fallback=DEPLOY_FILE.recipients_name,
+    )
+
+
+def deploy_pub_name(env_name: str | None) -> str:
+    """The deploy key's PUBLIC half under infra/keys/: `deploy.pub`, or `deploy.<env>.pub`."""
+    return f"deploy.{env_name}.pub" if env_name else "deploy.pub"
+
+
+def deploy_pub_path(infra_dir: Path, env: Environment) -> Path:
+    return infra_dir / "keys" / deploy_pub_name(env.name)
 
 
 def load_secrets(infra_dir: Path, file: SecretsFile = SECRETS_FILE) -> dict[str, str]:
@@ -121,7 +184,7 @@ def load_secrets(infra_dir: Path, file: SecretsFile = SECRETS_FILE) -> dict[str,
     `deploy-recipients.txt`.
     """
     secrets_path = infra_dir / file.name
-    recipients_path = infra_dir / file.recipients_name
+    recipients_path = file.recipients_path(infra_dir)
 
     if not secrets_path.exists():
         raise StackError(f"{secrets_path} not found", file.missing_hint(secrets_path, recipients_path))
@@ -175,7 +238,7 @@ def save_secrets(infra_dir: Path, data: dict[str, str], file: SecretsFile = SECR
     is untouched until the replace, and the temp file is removed on every
     failure path (M3, Fix round 1).
     """
-    recipients_path = infra_dir / file.recipients_name
+    recipients_path = file.recipients_path(infra_dir)
     secrets_path = infra_dir / file.name
 
     if not recipients_path.exists():
@@ -227,7 +290,9 @@ def read_recipients(path: Path) -> list[str]:
     ]
 
 
-def check_recipients_superset(infra_dir: Path) -> None:
+def check_recipients_superset(
+    infra_dir: Path, secrets: SecretsFile = SECRETS_FILE, deploy: SecretsFile = DEPLOY_FILE
+) -> None:
     """`deploy-recipients.txt` must list every recipient `age-recipients.txt` does.
 
     The split exists so a build host can decrypt the deploy key WITHOUT
@@ -247,7 +312,7 @@ def check_recipients_superset(infra_dir: Path) -> None:
     and age refuses outright on a recipients file with zero keys, so a
     `deploy.age` can never exist alongside an empty recipients list.
     """
-    deploy_recipients_path = infra_dir / DEPLOY_FILE.recipients_name
+    deploy_recipients_path = deploy.recipients_path(infra_dir)
     if not deploy_recipients_path.exists():
         return
 
@@ -255,7 +320,7 @@ def check_recipients_superset(infra_dir: Path) -> None:
     if not allowed:
         return
 
-    secrets_recipients_path = infra_dir / SECRETS_FILE.recipients_name
+    secrets_recipients_path = secrets.recipients_path(infra_dir)
     missing = [key for key in read_recipients(secrets_recipients_path) if key not in allowed]
     if not missing:
         return
@@ -263,7 +328,7 @@ def check_recipients_superset(infra_dir: Path) -> None:
     raise StackError(
         f"{deploy_recipients_path} is missing {len(missing)} recipient(s) that "
         f"{secrets_recipients_path} lists",
-        "everyone who can decrypt secrets.age must also be able to decrypt deploy.age -- add "
+        f"everyone who can decrypt {secrets.name} must also be able to decrypt {deploy.name} -- add "
         f"these line(s) to {deploy_recipients_path}, then run `./infra/up deploy-key init --rotate` "
         f"to re-encrypt it: {', '.join(missing)}",
     )

@@ -94,28 +94,37 @@ def backup_env_content(secrets: dict[str, str]) -> str | None:
         value = secrets.get(key)
         if not value:
             return None
-        # Kept as its own message: a line break is the one case whose
-        # consequence is injection into the FILE (a second KEY=value line
-        # that systemd itself would honour), not just into a shell.
-        if "\n" in value or "\r" in value:
-            raise StackError(
-                f"infra/secrets.age's '{key}' contains a line break",
-                f"R2 credentials are single-line values -- re-issue it and set it with "
-                f"`./infra/up secrets set {key}`, then run `up` again",
-            )
-        if not _VALUE_RE.match(value):
-            raise StackError(
-                f"infra/secrets.age's '{key}' contains whitespace or a character a shell "
-                "would reinterpret",
-                f"an R2 access key, secret and endpoint contain only {_VALUE_SHAPE} -- this "
-                f"one does not, so re-issue it in the Cloudflare dashboard and set it with "
-                f"`./infra/up secrets set {key}`, then run `up` again",
-            )
-        values.append(value)
+        values.append(checked_credential(key, value))
 
     lines = ["RCLONE_CONFIG_BACKUP_TYPE=s3", "RCLONE_CONFIG_BACKUP_PROVIDER=Cloudflare"]
     lines.extend(f"{variable}={value}" for (_key, variable), value in zip(_R2_KEYS, values))
     return "\n".join(lines) + "\n"
+
+
+def checked_credential(key: str, value: str) -> str:
+    """`value`, if it is a single-line R2 credential inside `_VALUE_RE`.
+
+    Shared with stackbase/logs.py, so every credentials file under
+    /var/lib/stackbase is held to the same allowlist.
+    """
+    # Kept as its own message: a line break is the one case whose
+    # consequence is injection into the FILE (a second KEY=value line
+    # that systemd itself would honour), not just into a shell.
+    if "\n" in value or "\r" in value:
+        raise StackError(
+            f"infra/secrets.age's '{key}' contains a line break",
+            f"R2 credentials are single-line values -- re-issue it and set it with "
+            f"`./infra/up secrets set {key}`, then run `up` again",
+        )
+    if not _VALUE_RE.match(value):
+        raise StackError(
+            f"infra/secrets.age's '{key}' contains whitespace or a character a shell "
+            "would reinterpret",
+            f"an R2 access key, secret and endpoint contain only {_VALUE_SHAPE} -- this "
+            f"one does not, so re-issue it in the Cloudflare dashboard and set it with "
+            f"`./infra/up secrets set {key}`, then run `up` again",
+        )
+    return value
 
 
 def backup_env_digest(content: str) -> str:
@@ -129,7 +138,14 @@ def backup_env_digest(content: str) -> str:
 _NIGHTLY_TIME = "03:00 UTC"
 
 
-def check_backup_credentials(bucket: str | None, backup_env_sha: str | None, *, emit: Callable[[str], None]) -> None:
+def check_backup_credentials(
+    bucket: str | None,
+    backup_env_sha: str | None,
+    *,
+    emit: Callable[[str], None],
+    secrets_name: str = "secrets.age",
+    env: str | None = None,
+) -> None:
     """Warn when a bucket is named but no credentials will be pushed.
 
     The two halves of "backups are on" are decided in two different places
@@ -145,16 +161,21 @@ def check_backup_credentials(bucket: str | None, backup_env_sha: str | None, *, 
     R2 token not issued yet) must still be able to run `up` for everything
     else. The line names all three keys because the failure mode that gets
     reported is usually "I set the ones I had".
+
+    `secrets_name` is the environment's own secrets file and `env` its name
+    (None for a single-environment project), so the advice names the right
+    file and command.
     """
     if not bucket or backup_env_sha is not None:
         return
     keys = ", ".join(key for key, _variable in _R2_KEYS)
+    env_flag = f" --env {env}" if env else ""
     emit(
-        f"! [backups] bucket = \"{bucket}\" is set but infra/secrets.age has no complete set of "
+        f"! [backups] bucket = \"{bucket}\" is set but infra/{secrets_name} has no complete set of "
         f"R2 credentials, so nothing is pushed -- the nightly backup timer is still installed on "
         f"every node and will fail at {_NIGHTLY_TIME} with \"no credentials in {BACKUP_ENV_PATH}\". "
-        f"Set all three of {keys} (`./infra/up secrets set <key>`) and run `up` again, or remove "
-        "`bucket` from stack.toml's [backups] table to leave backups off."
+        f"Set all three of {keys} (`./infra/up{env_flag} secrets set <key>`) and run `up` again, or "
+        "set `enabled = false` in stack.toml's [backups] table to leave backups off."
     )
 
 
@@ -165,28 +186,35 @@ def run_backup_now(
     runner: Any = subprocess.run,
     popen: Any = subprocess.Popen,
     emit: Callable[[str], None] = print,
+    env: str | None = None,
 ) -> None:
     """Run the backup unit on every selected node now, then list the bucket.
+
+    `env` names the environment (required once stack.toml has
+    `[environments]`): its nodes, its state, its bucket.
 
     Streams both commands so a multi-minute dump does not look like a hang.
     Stops at the first node whose unit fails -- an unnoticed failing backup
     is the whole thing this command exists to prevent.
     """
     cfg = load_config(infra_dir)
-    state = load_state(infra_dir)
+    environment = cfg.env(env)
+    state = load_state(infra_dir, environment)
+    backups = environment.backups
+    env_flag = f" --env {env}" if env else ""
 
-    if not cfg.backups.bucket:
+    if not backups.bucket:
         raise StackError(
             "this project has no backup bucket",
             'add a [backups] section to stack.toml with bucket = "<name>" and run `./infra/up` first',
         )
 
     if node is None:
-        names = list(cfg.nodes)
-    elif node in cfg.nodes:
+        names = list(environment.nodes)
+    elif node in environment.nodes:
         names = [node]
     else:
-        known = ", ".join(cfg.nodes) or "none"
+        known = ", ".join(environment.nodes) or "none"
         raise StackError(f"there is no node called '{node}' in stack.toml", f"known nodes: {known}")
 
     for name in names:
@@ -211,10 +239,10 @@ def run_backup_now(
             # message (bad credentials, missing recipients file, ...) is.
             raise StackError(
                 f"the backup unit failed on node {name} (exit {returncode})",
-                f"read the node's own log: ./infra/up ssh {name} -- journalctl -u stackbase-backup -n 50",
+                f"read the node's own log: ./infra/up{env_flag} ssh {name} -- journalctl -u stackbase-backup -n 50",
             )
 
-        emit(f"→ node {name}: contents of backup:{cfg.backups.bucket}")
+        emit(f"→ node {name}: contents of backup:{backups.bucket}")
         returncode, tail = ssh.run_stream(BACKUP_LS_COMMAND, emit=emit, check=False)
         if returncode != 0:
             raise StackError(

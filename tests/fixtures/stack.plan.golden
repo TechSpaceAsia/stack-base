@@ -1,0 +1,29 @@
+! [backups] bucket = "acme-backups" is set but infra/secrets.age has no complete set of R2 credentials, so nothing is pushed -- the nightly backup timer is still installed on every node and will fail at 03:00 UTC with "no credentials in /var/lib/stackbase/backup.env". Set all three of r2_access_key_id, r2_secret_access_key, r2_endpoint (`./infra/up secrets set <key>`) and run `up` again, or set `enabled = false` in stack.toml's [backups] table to leave backups off.
+would do:
+  1. registering the team's SSH keys with Hostinger
+  2. node a: waiting for the server to come up
+  3. node a: applying the firewall (SSH and HTTPS only)
+  4. node a: remembering the server's SSH fingerprint
+  5. node a: copying the server's disk and boot settings into infra/nodes
+  6. node b: adopting an existing virtual machine already found in Hostinger
+  7. node b: installing NixOS on the virtual machine
+  8. node b: waiting for the server to come up
+  9. node b: applying the firewall (SSH and HTTPS only)
+  10. node b: remembering the server's SSH fingerprint
+  11. node b: copying the server's disk and boot settings into infra/nodes
+  12. creating the Cloudflare origin certificate
+  13. node a: uploading the configuration and the origin certificate
+  14. node a: rebuilding NixOS (this can take a few minutes)
+  15. node a: updating the application's environment file
+  16. node b: uploading the configuration and the origin certificate
+  17. node b: rebuilding NixOS (this can take a few minutes)
+  18. node b: updating the application's environment file
+  19. node a: pointing the domain at the server in Cloudflare
+--- requests ---
+GET /api/vps/v1/virtual-machines
+GET /api/vps/v1/virtual-machines/1984476
+GET /api/vps/v1/virtual-machines/777
+GET /api/vps/v1/public-keys?page=1
+GET /api/vps/v1/firewall?page=1
+GET /zones?name=acme.example.com&page=1
+GET /zones/zone1/dns_records?type=A&name=acme.example.com&page=1

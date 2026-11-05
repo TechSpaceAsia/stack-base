@@ -37,7 +37,9 @@ You also need:
   Leave it out and stack-base still stands up the server — it just skips DNS
   and the TLS origin certificate, so the server is only reachable by its bare
   IP over SSH. Add the token later and run `./infra/up` again to fill both
-  in.
+  in. If your `stack.toml` names a `[logs]` or `[files]` bucket, the same
+  token also needs **Account → Workers R2 Storage → Edit** (see
+  [R2 buckets](#r2-buckets-logs-and-files) below).
 - **Your Cloudflare zone set to Full (strict) SSL mode** (only if you're using
   Cloudflare). stack-base installs a Cloudflare origin certificate on the
   server; Full (strict) is the setting that makes Cloudflare actually check
@@ -119,6 +121,7 @@ Then commit what it wrote back: `infra/stack.state.json`,
 |---|---|
 | registering the team's SSH keys | Tells Hostinger about everyone's public key |
 | buying / installing | Buys a server (only if you said so) and installs NixOS on it |
+| waiting for Hostinger to finish processing the payment | Stops the run when a purchase is still being paid for; re-run later (see [If a purchase says payment is processing](#if-a-purchase-says-payment-is-processing)) |
 | waiting for the server | Waits for it to boot and get an IP address |
 | applying the firewall | Closes everything except SSH (22) and HTTPS (443) |
 | remembering the fingerprint | Records the server's SSH identity so a swap can't go unnoticed |
@@ -126,8 +129,10 @@ Then commit what it wrote back: `infra/stack.state.json`,
 | creating the origin certificate | Gets a TLS certificate from Cloudflare for your domain |
 | uploading | Copies `infra/` and the certificate onto the server |
 | rebuilding NixOS | Applies the configuration (this is the slow one — minutes) |
+| updating the log shipping credentials | Pushes the logs bucket's R2 credentials before the rebuild that starts Vector (see [Logs](#logs)) |
 | updating the application's environment file | Pushes `app_env` from `secrets.age` to the server and restarts the running release (see [The app's environment](#the-apps-environment-app_env) below) |
 | pointing the domain | Points your domain at the server in Cloudflare |
+| creating the R2 bucket / setting the retention rule / setting the bucket-lock rule | See [R2 buckets](#r2-buckets-logs-and-files) |
 
 ## Everyday things
 
@@ -238,6 +243,135 @@ performs, so a mistake is caught here, not on the next `up`.
 
 Key names must match `^[a-z][a-z0-9_]{0,40}$` — lowercase letters, digits,
 and underscores, starting with a letter.
+
+## Staging and production
+
+One `stack.toml` can describe two (or more) matching environments. Everything
+outside the `[environments.*]` tables is shared — project, admins, data
+centre, `[app]`, and the shared `[backups]`/`[logs]`/`[alerts]`/`[files]` —
+so staging and production are the same stack by construction. Each
+environment carries only what is allowed to differ:
+
+```toml
+project    = "acme"
+owner      = "your-github-handle"
+datacenter = "kul"
+plan       = "KVM 1"
+admins     = ["your-name"]
+
+# Each environment names its OWN buckets. Two environments on one bucket
+# would let staging's lifecycle rules and restores touch production's data,
+# so a shared bucket is refused. A prefix is enough to tell them apart.
+[environments.staging]
+domain         = "staging.acme.example.com"
+backups.bucket = "acme-backups/staging"
+logs.bucket    = "acme-logs-staging"
+
+[environments.staging.nodes.a]
+role = "primary"
+
+[environments.production]
+domain         = "acme.example.com"
+backups.bucket = "acme-backups/production"
+logs.bucket    = "acme-logs-production"
+
+[environments.production.nodes.a]
+role = "primary"
+```
+
+- **What an environment may set:** `domain` (required), its own
+  `[environments.<env>.nodes.<n>]` (required, same shape as `[nodes.<n>]`),
+  `plan` and `price_item`, and `backups.bucket`, `backups.retention_days`,
+  `logs.bucket`, `logs.retention_days`, `alerts.to`, `files.bucket` and
+  `files.lock_days`, each overriding the shared value. `backups.enabled =
+  false` and `logs.enabled = false` are also allowed: that environment opts
+  out cleanly (it drops the shared bucket, warns on every run, gets no R2 or
+  logs steps) while the others keep using the shared one; setting both
+  `enabled = false` and a bucket in the same table is an error. Any other key
+  there is an error, and so is a top-level `[nodes]` next to `[environments]`.
+  Environment names are lowercase letters, digits and `-`, at most 16
+  characters.
+- **`--env <name>` is required on every command** once `[environments]`
+  exists: `up`, `up --plan`, `deploy`, `rollback`, `status`, `ssh`,
+  `backup-now`, `alert-test`, `secrets`, `deploy-key` and `ci-setup`. There is no default,
+  so a forgotten flag fails with the list of environments instead of touching
+  production. It goes before or after the command
+  (`./infra/up --env staging up --plan`, `./infra/up deploy v1.4.2 --env staging`);
+  for `ssh`, put it before the node name (`./infra/up ssh --env staging a`).
+  `--plan` prints `would do in staging:` so a plan is never mistaken for the
+  other environment's. Two different `--env` values on one command line
+  (`./infra/up --env staging deploy v1.4.2 --env production`) are refused.
+- **Files per environment:**
+
+  | | single environment | environment `<env>` |
+  |---|---|---|
+  | state | `stack.state.json` | `stack.state.<env>.json` |
+  | secrets | `secrets.age` | `secrets.<env>.age` |
+  | its recipients | `age-recipients.txt` | `age-recipients.<env>.txt` if present, else `age-recipients.txt` |
+  | deploy key | `deploy.age`, `keys/deploy.pub` | `deploy.<env>.age`, `keys/deploy.<env>.pub` |
+  | deploy recipients | `deploy-recipients.txt` | `deploy-recipients.<env>.txt` if present, else `deploy-recipients.txt` |
+  | hardware | `nodes/<node>/` | `nodes/<env>-<node>/` |
+
+  A staging deploy key cannot deploy production: each environment's servers
+  trust only their own key. Keeping production's *secrets* away from
+  staging people is a separate step, and only holds when production has
+  both its own `age-recipients.production.txt` and its own
+  `deploy-recipients.production.txt`. Without them, production's files fall
+  back to the shared recipient lists, and anyone on those lists can decrypt
+  both environments. The Hostinger and Cloudflare tokens are also
+  account-wide: whoever holds a staging `hostinger_token` or
+  `cloudflare_token` can reach production's servers and DNS through the API,
+  whichever file the token sits in. Use separate accounts, or tokens scoped
+  per account, if that matters.
+- **Two environments never share a server or a domain:** the same `vps_id`
+  or `domain` in two environments is refused when stack.toml is read.
+- **Names:** a server is `<env>-<node>` (e.g. `staging-a`) as its NixOS
+  hostname and flake attribute, and `<node>.<env domain>`
+  (`a.staging.acme.example.com`) in Hostinger. Each environment has its own
+  Hostinger firewall, `stackbase-<project>-<env>`. The node module gets
+  `stackbase.environment = "<env>"`.
+- **Set up each environment** like a project of its own:
+
+  ```bash
+  ENV=staging
+  HOSTINGER_TOKEN=<paste here>
+  CLOUDFLARE_TOKEN=<paste here, or leave empty>
+  printf '{"hostinger_token": "%s", "cloudflare_token": "%s"}' "$HOSTINGER_TOKEN" "$CLOUDFLARE_TOKEN" \
+    | age -R infra/age-recipients.txt -o "infra/secrets.$ENV.age"
+  ./infra/up --env "$ENV" up --plan
+  ./infra/up --env "$ENV" up --allow-purchase
+  ./infra/up --env "$ENV" deploy-key init
+  ```
+
+  After that, `./infra/up --env "$ENV" secrets set <key>` manages that
+  environment's secrets one key at a time, as in "Managing secrets".
+
+- **Releasing: tag → staging → production.** With the GitHub Actions
+  workflow (below), pushing a `v*` tag deploys it to staging. If that
+  succeeds and the tagged commit is on the default branch (master), the same
+  tag then deploys to production. "Succeeds" means the deploy AND its
+  smoke test (see "Smoke test"). A tag cut from any other branch stops at
+  staging, which is how you try a release candidate there first. Without the
+  workflow, or to promote a tag yourself, run the same commands from your
+  own machine:
+
+  ```bash
+  TAG=v1.4.2
+  ./infra/up --env staging deploy "$TAG"
+  ./infra/up --env staging smoke "$TAG"
+  ./infra/up --env production deploy "$TAG"
+  ./infra/up --env production smoke "$TAG"
+  ```
+
+  On GitHub Free a private repository has no environment-scoped secrets, so
+  both deploy keys are plain repo secrets, and anyone who can push a branch
+  could edit the workflow to read them. What bounds a leaked key is the
+  deploy door: it can upload, deploy or roll back a release, never open a
+  shell.
+
+A `stack.toml` without `[environments]` is one implicit environment: the
+files, hostnames, plans and commands above stay exactly what they were, and
+`--env` is refused.
 
 ## Releasing a version
 
@@ -363,6 +497,37 @@ after the swap (and, failing a graceful stop within `TimeoutStopSec`,
 force-killed). A client reconnecting picks up the new color; there's no
 in-place migration of an open connection.
 
+### Smoke test
+
+`./infra/up smoke <version>` checks a deploy from the outside, and fails at
+the first problem:
+
+1. **Every node serves `<version>`**, read from each node's `status`.
+2. **The site answers**: `https://<domain><health_path>` returns 200 through
+   the real front door (DNS, Cloudflare, TLS), with no redirect. It retries
+   for about 30 seconds. A project with no public front door turns this off
+   with `[app] smoke_public = false`.
+3. **Your own checks**: if `infra/smoke` exists, it must be executable. It
+   runs from the repository root with `SMOKE_BASE_URL` (e.g.
+   `https://staging.acme.example.com`), `SMOKE_VERSION` and `SMOKE_ENV` set,
+   and any non-zero exit fails the smoke test. For example:
+
+   ```sh
+   #!/bin/sh
+   set -eu
+   curl -fsS "$SMOKE_BASE_URL/" | grep -q "<title>"
+   curl -fsS "$SMOKE_BASE_URL/login" >/dev/null
+   ```
+
+```bash
+TAG=v1.2.3
+./infra/up --env staging smoke "$TAG"
+```
+
+The GitHub Actions workflow smoke-tests after every deploy, and production
+only deploys once staging's smoke test has passed. A failed smoke test never
+rolls back by itself; its message names the rollback command.
+
 ## The project deploy key
 
 Every project has exactly **one** SSH deploy key. You use it, a build host
@@ -409,12 +574,29 @@ node24 action runtime, so the template uses node24 actions and no
 `actions/cache` step: `$CARGO_HOME` persists in the runner's state directory
 between jobs, and the runner's built-in `hashFiles()` needs a node20 it does
 not have. If you do not have that runner, change `runs-on` to
-`ubuntu-latest` and add `sudo apt-get install -y musl-tools` back to the
-toolchain step. If you push a tag without doing either, the
-deploy job just queues forever with no error — GitHub does not fail a job
-for want of a matching runner, it simply never schedules it — so a tag that
-never deploys and never fails is a sign to check `runs-on`, not to wait
-longer.
+`ubuntu-latest` and add the install step below right after checkout. If you
+push a tag without doing either, the deploy job just queues forever with no
+error — GitHub does not fail a job for want of a matching runner, it simply
+never schedules it — so a tag that never deploys and never fails is a sign to
+check `runs-on`, not to wait longer.
+
+```yaml
+      - name: Install the deploy tools (ubuntu-latest only)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools rsync
+          # musl-tools ships `musl-gcc`; stack-base looks for the NixOS name.
+          sudo ln -sf "$(command -v musl-gcc)" /usr/local/bin/x86_64-unknown-linux-musl-gcc
+          # The standalone Tailwind binary, put on PATH (the preflight needs it there).
+          curl -fsSL -o "$RUNNER_TEMP/tailwindcss" https://github.com/tailwindlabs/tailwindcss/releases/latest/download/tailwindcss-linux-x64
+          sudo install -m 755 "$RUNNER_TEMP/tailwindcss" /usr/local/bin/tailwindcss
+```
+
+Right after checkout, the workflow runs a preflight that checks the runner has
+`python3`, `rsync`, `tailwindcss`, `x86_64-unknown-linux-musl-gcc`, `rustup`,
+`git` and `ssh` on its `PATH`, and fails naming whatever is still missing. The
+install step above must run before it, which is why it sits right after
+checkout; on a runner that has all of them, the preflight passes unchanged.
 
 **CI decrypts nothing.** The workflow writes the `STACK_DEPLOY_KEY` secret
 to a file under `$RUNNER_TEMP` and exports `$STACKBASE_SSH_IDENTITY` — that
@@ -423,8 +605,7 @@ is step **1** of "Which key a deploy offers" above, and it wins over
 committed it), but the runner holds no age identity to open it, so without
 the explicit identity the deploy would stop at step 2 with "this project has
 a deploy key … but this machine cannot decrypt it". The key file is removed
-by an `if: always()` step, pass or fail. This is also what makes the
-`ubuntu-latest` fallback work — nothing about it needs `age` at all.
+by an `if: always()` step, pass or fail. Neither runner needs `age`.
 
 **What `./infra/up ci-setup` does:** pushes the project's own deploy key
 (above) straight into a **repository-level** GitHub Actions secret
@@ -468,6 +649,24 @@ git add infra/deploy.age infra/keys/deploy.pub && git commit -m "deploy: rotate 
 Because it's the SAME key everywhere, rotating it also replaces what you
 and any build host deploy with — there is no "laptop deploys are
 unaffected" any more (Task 2 removed the separate `ci-deploy` key).
+
+**With staging and production**, a `v*` tag push runs
+`./infra/up --env staging deploy` and then `smoke` with the
+`STACK_DEPLOY_KEY_STAGING` repo secret. Then, if both passed and the tag is
+on the default branch, it does the same for production with
+`STACK_DEPLOY_KEY_PRODUCTION`.
+Write each secret with its own run:
+
+```bash
+./infra/up --env staging ci-setup
+./infra/up --env production ci-setup
+```
+
+A project without `[environments]` keeps the single `STACK_DEPLOY_KEY`.
+After copying the workflow, edit it: delete the `production` job (and the
+staging job's `outputs:` and default-branch step), drop `--env staging` from
+the deploy step, and change `secrets.STACK_DEPLOY_KEY_STAGING` to
+`secrets.STACK_DEPLOY_KEY` (`ci-setup` prints these same edits).
 
 **Turn it off** (CI only — this does not remove the deploy key itself,
 since it's also your own):
@@ -602,8 +801,9 @@ combination on every run:
 ! [backups] bucket = "..." is set but infra/secrets.age has no complete set of R2 credentials, ...
 ```
 
-Finish the three `secrets set` commands, or drop `bucket` from the
-`[backups]` table to leave backups off.
+Finish the three `secrets set` commands (with `--env "$ENV"` in a project
+with environments), or set `enabled = false` in the `[backups]` table to
+leave backups off.
 
 What happens at 03:00 UTC on each node:
 
@@ -708,6 +908,390 @@ step 2 — the same requirement the node has for writing the backup.
 **Test this before you need it.** A backup nobody has ever restored is a
 hypothesis, not a backup.
 
+## Logs
+
+Every server streams its journal to R2 as soon as its environment names a
+logs bucket:
+
+```toml
+# infra/stack.toml
+[logs]
+bucket = "acme-logs"
+retention_days = 90
+```
+
+With [environments](#staging-and-production), give each one its own bucket
+(`logs.bucket = "acme-logs-staging"` in `[environments.staging]`). A `[logs]`
+table that names no bucket after that merge is refused; `enabled = false` in
+`[logs]` turns logs off instead. A project with no `[logs]` table at all is
+refused by `up` (v0.2.0 requires logs): add a bucket, or set `enabled = false`
+to leave them off.
+
+The node writes with its own R2 token, scoped to the logs bucket — not the
+backup one. `r2_endpoint` is shared with backups:
+
+```bash
+LOGS_ACCESS_KEY_ID=<paste here>
+LOGS_SECRET_ACCESS_KEY=<paste here>
+R2_ENDPOINT=<paste here, e.g. https://<account>.r2.cloudflarestorage.com>
+printf '%s' "$LOGS_ACCESS_KEY_ID"     | ./infra/up secrets set logs_access_key_id
+printf '%s' "$LOGS_SECRET_ACCESS_KEY" | ./infra/up secrets set logs_secret_access_key
+printf '%s' "$R2_ENDPOINT"            | ./infra/up secrets set r2_endpoint
+./infra/up
+```
+
+(add `--env <name>` to each command once you have environments). With logs on
+and any of the three missing, `up` and `--plan` stop and name them: Vector
+cannot start without its credentials, and a service that fails to start
+fails the whole rebuild. `up` pushes them to `/var/lib/stackbase/logs.env`
+(0600, root) **before** the rebuild that starts Vector, and restarts Vector
+when they change.
+
+**What is shipped, and when.** [Vector](https://vector.dev) reads the whole
+persistent journal and keeps nine fields per entry — `timestamp`, `host`,
+`unit`, `ident`, `pid`, `priority`, `message`, `boot_id`, `cursor` — and
+uploads a batch at least every 15 seconds. Command lines, executable paths
+and the rest of journald's metadata stay on the server. If the server is
+destroyed, you lose at most the last ~15 seconds — plus, if R2 was
+unreachable at that moment, whatever was still waiting to be sent.
+
+**Key layout.** One gzipped, newline-delimited JSON object per batch:
+
+```
+journal/<host>/<YYYY>/<MM>/<DD>/<HH>/<uuid>.ndjson.gz
+```
+
+`<host>` is the server's hostname (`a`, or `staging-a` with environments),
+and the hour is UTC.
+
+**Searching.** From your machine, with a read-only R2 token:
+
+```bash
+BUCKET=acme-logs
+HOST=a
+DAY=2026/11/04
+R2_ENDPOINT=<paste here>
+export AWS_ACCESS_KEY_ID=<paste here> AWS_SECRET_ACCESS_KEY=<paste here>
+aws s3 ls --recursive --endpoint-url "$R2_ENDPOINT" "s3://$BUCKET/journal/$HOST/$DAY/"
+KEY=<one key from the listing>
+aws s3 cp --endpoint-url "$R2_ENDPOINT" "s3://$BUCKET/$KEY" - | zcat -f | rg 'panicked'
+# a whole day, duplicates removed by cursor:
+aws s3 cp --recursive --endpoint-url "$R2_ENDPOINT" "s3://$BUCKET/journal/$HOST/$DAY/" ./logs/
+fd -e gz . ./logs -x zcat -f | jq -c -s 'unique_by(.cursor) | sort_by(.timestamp)[]' | rg 'panicked'
+```
+
+On the server itself, the last 3 days are plain text under `/var/log/vector`,
+and the journal keeps 7:
+
+```bash
+./infra/up ssh a -- rg 'panicked' /var/log/vector
+./infra/up ssh a -- journalctl -u acme@blue --since -2h
+```
+
+**Outages.** Vector keeps unsent batches in a 1 GiB buffer on disk that
+survives restarts, and only moves its journal bookmark once an entry is in
+that buffer. When the buffer is full it waits, and the journal itself holds
+the rest — so an R2 outage of up to **7 days** (the local journal's
+retention) loses nothing, and Vector catches up on its own afterwards. That
+holds as long as the journal stays inside its size caps (`SystemMaxUse=2G`,
+`SystemKeepFree=4G`): a very chatty server can reach them sooner, and
+journald then drops its oldest files, read by Vector or not. A sudden power
+cut can also take the last few seconds, because journald syncs to disk every
+5 seconds and Vector's buffer does not wait for an fsync.
+Delivery is **at least once**: after a restart or a retry the same entry
+can be uploaded twice. Every entry carries its journal `cursor`, which is
+unique — dedupe on it (as the `jq` line above does). A full local disk
+never holds up R2: the local copy is best effort and simply skips entries it
+cannot write.
+
+**Retention** is the bucket's lifecycle rule (see
+[R2 buckets](#r2-buckets-logs-and-files)): objects under `journal/` are
+deleted by R2 after `retention_days` (default 90). The server never deletes
+a log object.
+
+**Checking it works** (on the server, `./infra/up ssh a`):
+
+```bash
+# the config Vector is running, with a dummy endpoint (nothing is contacted)
+CONFIG=$(systemctl show -p ExecStart --value vector.service | grep -o '/nix/store/[^ ]*vector.toml')
+LOGS_ENDPOINT=https://validate.invalid vector validate --no-environment "$CONFIG"
+vector top                      # live throughput per component (API on 127.0.0.1:8686)
+vector tap slim                 # watch entries as they leave the journal
+curl -s http://127.0.0.1:9598/metrics | rg 'vector_component_sent_events_total|vector_buffer_byte_size'
+```
+
+`vector_buffer_byte_size` for the `r2` sink climbing and staying up means R2
+has been unreachable for a while; `vector_component_sent_events_total` for
+`r2` should keep rising. Both endpoints listen on 127.0.0.1 only.
+
+## Alerts
+
+With `[alerts]`, **any** service that fails on a server emails the listed
+addresses — stack-base's own units, the app's, nixpkgs' and anything a project
+adds later. Nothing is listed unit by unit, so nothing can be forgotten.
+`alerts.to` may differ per environment.
+
+```toml
+# infra/stack.toml
+[alerts]
+to = ["ops@example.com"]
+
+[environments.staging]
+alerts.to = ["ops@example.com", "servers.acme.staging@example.com"]
+```
+
+The subject says where it happened: `[acme/staging/staging-a] app@blue.service
+failed` (`[acme/a] …` in a project without environments). The body is the
+unit's `systemctl status` and its last 60 journal lines (cut at 64 KiB). Each
+unit mails **at most once every 6 hours**, so a unit that keeps failing does
+not flood anyone.
+
+Mail goes out through **nullmailer**, which queues on the server's disk and
+retries: an alert raised while the relay (or Mesh, on the way to it) is down is
+delivered when it is back, not lost. The relay is your own: stack-base bakes no
+mail server in. Set five secrets per environment and run `up`:
+
+```bash
+ENV=<the environment, e.g. staging>
+SMTP_HOST=<the relay's host name, e.g. mail.example.com>
+SMTP_PORT=465
+SMTP_USER=<this environment's SMTP login>
+SMTP_PASSWORD=<its password>
+SMTP_FROM=<the address alerts come from>
+printf '%s' "$SMTP_HOST" | ./infra/up --env "$ENV" secrets set smtp_host
+printf '%s' "$SMTP_PORT" | ./infra/up --env "$ENV" secrets set smtp_port
+printf '%s' "$SMTP_USER" | ./infra/up --env "$ENV" secrets set smtp_user
+printf '%s' "$SMTP_PASSWORD" | ./infra/up --env "$ENV" secrets set smtp_password
+printf '%s' "$SMTP_FROM" | ./infra/up --env "$ENV" secrets set smtp_from
+./infra/up --env "$ENV"
+```
+
+(Drop `--env "$ENV"` in a project without environments.) The relay is reached
+with implicit TLS (`smtp_port` is normally 465) and `AUTH LOGIN`, and its
+certificate is checked against the server's CA bundle. A login and password are
+letters, digits and `. _ : / + = @ -` only. `up` writes the five values to
+`/var/lib/stackbase/alert.env` (0600, root) before the rebuild that starts the
+mailer; the password never enters the Nix store. With `[alerts]` set and any of
+the five missing, `up` stops before touching anything and names them. Without
+`[alerts]`, `up` works as before and prints one warning at the end of the run:
+nobody would be told about a failure.
+
+**A freshness watchdog** (`stackbase-freshness`, hourly) fails — and so
+mails — when:
+
+- backups are on and the newest successful backup is more than 36 hours old
+  (before the first one, counted from when backups were turned on);
+- logs are on and `vector.service` is not running;
+- Vector's R2 buffer holds more than 256 MiB, meaning R2 has been unreachable
+  for a while;
+- Vector has sent nothing to R2 for 2 hours although new entries came in.
+
+It checks nothing during the first hour after a boot, while Vector and the
+first backup catch up. A check whose feature is off (`[logs] enabled = false`,
+`[backups] enabled = false`) is skipped.
+
+**Check it end to end:**
+
+```bash
+./infra/up --env "$ENV" alert-test     # sent — check ops@example.com
+```
+
+It fails a throwaway unit on every server on purpose, waits until each one has
+queued its email, and prints where to look. "Sent" means accepted by
+nullmailer: with the relay down, the mail arrives when it is back. On the
+server (`./infra/up ssh a`):
+
+```bash
+systemctl list-timers stackbase-freshness   # when the watchdog runs next
+journalctl -u 'stackbase-alert@*' -n 20      # what was mailed, or skipped by the 6 h limit
+ls /var/spool/nullmailer/queue               # mail still waiting for the relay
+```
+
+**Not covered:** a unit with `Restart=always` that crash-loops and comes back
+never enters `failed`, so it is not mailed; and a server that is down sends
+nothing at all. Both need a monitor outside the server.
+
+## Mesh
+
+With `[mesh]` on, every server joins [Cloudflare Mesh](https://developers.cloudflare.com/cloudflare-one/):
+it runs a headless `cloudflare-warp` connector (firewall not opened, the
+connector dials out), so you can reach it over Mesh. SSH over Mesh is the only
+use stack-base supports. `[mesh]` is shared by every environment, and a
+project without it is untouched.
+
+```toml
+# infra/stack.toml
+[mesh]
+enabled = true
+```
+
+**Setting it up**, once per environment:
+
+1. In the Cloudflare dashboard, create a Mesh node for the environment and copy
+   its connector token. A token is a credential: it goes straight into the
+   secrets, never into the repository or a chat.
+2. Give the node an **include-only** device profile using the **MASQUE**
+   protocol, so that only Mesh destinations use the tunnel and the server's
+   other traffic keeps its normal path.
+3. Store the token, and run `up`:
+
+```bash
+MESH_TOKEN=<paste the node's connector token here>
+printf '%s' "$MESH_TOKEN" | ./infra/up --env "$ENV" secrets set mesh_connector_token
+./infra/up --env "$ENV"
+```
+
+(Drop `--env "$ENV"` in a project without environments.) Secrets are per
+environment, so each environment has its own `mesh_connector_token`. `up`
+installs the connector with the rebuild, then enrols each node **once** with
+that token, connects it, waits up to 60 seconds for `Connected`, and prints the
+node's Mesh IPv6 address. A node that already reports Connected is left alone,
+so rotating the token later does not re-enrol it. Without the token, `up` stops
+before touching anything and names the key.
+
+The token reaches the server on the SSH connection's stdin and is never in a
+local command line or log. `warp-cli connector new` only accepts it as an
+argument, so on the server it is visible to root in that one short-lived
+process.
+
+**Verify** (on the server, `./infra/up ssh a`):
+
+```bash
+warp-cli --accept-tos status          # Status update: Connected
+ip -6 addr show CloudflareWARP        # the node's Mesh address
+```
+
+## R2 buckets (logs and files)
+
+When an environment's `[logs]` or `[files]` table names a `bucket`, `./infra/up`
+(and `--plan`) looks after that bucket in Cloudflare R2:
+
+| Table | What `up` ensures |
+|---|---|
+| `[logs] bucket` | The bucket exists, with a lifecycle rule `stackbase-logs`: delete objects under `journal/` after `retention_days` (default 90). |
+| `[files] bucket` | The bucket exists, with a bucket-lock rule `stackbase-files`: every object (prefix `""`) is locked for `lock_days` (default 30), which forbids deleting **and overwriting** it until the lock expires. |
+
+Other rules on those buckets are left exactly as they are; only the rule with
+stack-base's own id is added or changed. `--plan` prints the exact rule change,
+for example `R2 bucket acme-logs: setting the retention rule (rule
+stackbase-logs: delete journal/ after 90 days)`. stack-base never deletes a
+bucket, an object or a rule. The `[backups]` bucket is not managed here: create
+it yourself. With `[logs] enabled = false` no logs bucket is managed. A project
+with neither bucket needs no account id and makes no R2 call.
+
+It needs two secrets:
+
+```bash
+ACCOUNT_ID=<your Cloudflare account id>
+printf '%s' "$ACCOUNT_ID" | ./infra/up secrets set cloudflare_account_id
+```
+
+With [environments](#staging-and-production), set it for each one:
+
+```bash
+ENV=staging
+printf '%s' "$ACCOUNT_ID" | ./infra/up --env "$ENV" secrets set cloudflare_account_id
+```
+
+and a `cloudflare_token` that carries **Account → Workers R2 Storage → Edit**
+(the DNS token may simply carry that scope too). If a bucket is named and
+`cloudflare_account_id` is missing, `up` stops and says so.
+
+### Uploaded files in R2
+
+An app that takes uploads should put them in R2, not on the node's disk. A
+disk is per node (the blue and green releases and a second node would not see
+each other's files), it is only backed up nightly, and it dies with the
+server; R2 is shared by every node, outlives them, and costs no egress.
+(`[backups].extra_paths` stays for apps that still write files to disk.)
+
+```toml
+[files]
+bucket = "acme-files"   # per environment: "acme-files-staging" in [environments.staging]
+lock_days = 30          # optional, 1 to 3650, default 30
+```
+
+Set the bucket's own token (an R2 token scoped to the files bucket, not the
+backup or logs one) in the environment's secrets, next to the shared
+`r2_endpoint`:
+
+```bash
+printf '%s' "$FILES_ACCESS_KEY_ID" | ./infra/up secrets set files_access_key_id
+printf '%s' "$FILES_SECRET_ACCESS_KEY" | ./infra/up secrets set files_secret_access_key
+```
+
+`up` then appends these to the app's environment, after `app_env`:
+`STORAGE_BUCKET`, `STORAGE_ENDPOINT`, `STORAGE_REGION=auto`,
+`STORAGE_ACCESS_KEY_ID`, `STORAGE_SECRET_ACCESS_KEY` and `STORAGE_LOCK_DAYS`.
+They are not part of `app_env`: a `STORAGE_*` line in `app_env` is refused
+(one owner per variable), incomplete files credentials are refused naming the
+missing keys, and rotating a files key alone re-pushes and restarts the app.
+`[files]` requires the `app_env` secret: stack-base appends the STORAGE_*
+lines to `app_env` and owns the whole `app.env` file, so `up` (and `--plan`)
+refuses with "[files] needs the app_env secret" rather than overwrite a
+hand-managed file; move the app's environment into it with
+`./infra/up --env "$ENV" secrets set app_env`.
+A project without `[files]` gets exactly the environment it had before.
+
+Removing `[files]` later re-pushes `app.env` without the STORAGE_* lines (a
+rewrite; the bucket and its objects are never touched) and prints a reminder to
+revoke the files R2 token, since the old credentials were on the node.
+
+**The bucket lock has consequences.** Every object is locked for `lock_days`,
+which forbids deleting **and overwriting** it until the lock expires. So the
+app must:
+
+- write a unique key for every upload (never reuse a key to "replace" a file);
+- treat a refused delete as "delete later": a user's deletion (a GDPR erasure,
+  say) is queued and finishes once the lock has expired, so make that delay
+  part of your retention promise.
+
+platform-base's storage backend does both; see its storage documentation.
+
+## Upgrading to v0.2.0
+
+v0.2.0 changes one default: **backups and logs are required**. After
+upgrading, `./infra/up` (and `--plan`) refuses in any environment that has
+neither a `[backups]` / `[logs]` bucket nor an explicit opt-out. Per project,
+edit `infra/stack.toml` once:
+
+```toml
+[backups]
+bucket = "acme-backups"      # or: enabled = false  (warns on every run)
+
+[logs]
+bucket = "acme-logs"         # or: enabled = false  (warns on every run)
+```
+
+Move the pinned release too: bump `inputs.stack-base.url` in `infra/flake.nix`
+to `v0.2.0` and re-lock:
+
+```bash
+sed -i 's#stack-base/v0\.[0-9.]*"#stack-base/v0.2.0"#' infra/flake.nix
+cd infra && nix flake lock --update-input stack-base
+```
+
+`enabled = false` together with a bucket is an error: say one or the other.
+The warning for an opt-out goes to stderr, once per run, so the plan on
+stdout is unchanged. A project that already has `[backups] bucket` only needs
+the `[logs]` choice.
+
+- **Environments are opt-in.** A `stack.toml` without `[environments]` keeps
+  working exactly as before (same file names, same hostnames, same plans);
+  nothing about staging and production applies until you add them.
+- **CI deploys staging, then production.** With environments, a tag deploys
+  staging; a tag on the default branch then deploys production too. Run
+  `ci-setup` once per environment (see "Deploying from GitHub Actions").
+- **New secrets**, each only if you turn the feature on:
+  `logs_access_key_id` and `logs_secret_access_key` (an R2 token scoped to the
+  logs bucket), `cloudflare_account_id` (Cloudflare account access, used to
+  create buckets and set their lifecycle and lock rules, never to delete),
+  `smtp_host`, `smtp_port`, `smtp_user`, `smtp_password` and `smtp_from` for
+  `[alerts]`, `mesh_connector_token` for `[mesh]`, and
+  `files_access_key_id` / `files_secret_access_key` for `[files]`. Per
+  environment, set them with `./infra/up --env "$ENV" secrets set <key>`.
+  See "Logs", "Alerts", "Mesh" and "R2 buckets".
+
 ## Things to watch
 
 Three ways to hurt yourself that no amount of code can prevent.
@@ -757,9 +1341,11 @@ Every failure is one line: what went wrong, then what to check.
 | `the API token is wrong or expired` | Re-issue the token and re-create `secrets.age` |
 | `the API token doesn't have permission` | Cloudflare: add **Zone → SSL and Certificates → Edit**. Hostinger: use a full-access token |
 | `no Cloudflare zone found for domain …` | The token can't see that zone — check it's scoped to the right account |
+| `… the 'cloudflare_account_id' secret is not set` | `[logs]` or `[files]` names an R2 bucket; set the secret as in [R2 buckets](#r2-buckets-logs-and-files) |
 | `multiple A records found for …` | Two records fight over the name. Delete the wrong one in the Cloudflare dashboard; stack-base won't guess |
 | `no Hostinger data center named …` | The message lists the valid names — put one in `stack.toml` |
 | `node(s) a have no vps_id…` | Either set `vps_id`, or re-run with `--allow-purchase` |
+| `purchase for node … is still processing` | Hostinger accepted the order but has not provisioned it yet — see [If a purchase says payment is processing](#if-a-purchase-says-payment-is-processing) |
 | `buying a server needs a price_item` | Copy the plan's catalog id from Hostinger into `price_item` |
 | `the new configuration failed to build` | The build output is above the error. Fix `infra/`, run again — nothing was made permanent |
 | `You must set the option boot.loader…` or a `fileSystems` error | The provider module's defaults don't match this node's disk/network — see "First run on a new provider image" below |
@@ -774,10 +1360,41 @@ Every failure is one line: what went wrong, then what to check.
 | Cargo.toml declares several `[[bin]]` entries and stack.toml has no `[app].binary` | Ambiguous — add `[app] binary = "..."` to `stack.toml`, choosing one of the listed candidates |
 | `infra/ has uncommitted changes that would be pushed` | Commit them, or re-run with `--allow-dirty` if you are deliberately testing |
 | `the backup unit failed on node a` | `./infra/up ssh a -- journalctl -u stackbase-backup -n 50` — the usual causes are wrong R2 credentials or a bucket that does not exist |
+| `… turns logs on but names no [logs] bucket` | Set `bucket` in `[logs]` (or `logs.bucket` in that environment), or `enabled = false` to leave logs off — see [Logs](#logs) |
+| `backups are required but no [backups] bucket is set` (or the same for logs) | Set `bucket = "…"` in that table, or opt out with `enabled = false`; see [Upgrading to v0.2.0](#upgrading-to-v020) |
+| `[logs] bucket = "…" is set but … has no complete set of logs credentials` | Set `logs_access_key_id`, `logs_secret_access_key` and `r2_endpoint` as in [Logs](#logs) |
+| `Invalid record from journald, discarding … text=-- cursor: s=…` in `journalctl -u vector` | Harmless: right after a restart Vector reads journalctl's own cursor trailer line, which is not a log entry. Nothing is lost |
+| Nothing new in the logs bucket | `./infra/up ssh a -- systemctl status vector` and `-- journalctl -u vector -n 50`; the usual causes are a wrong token or a bucket that does not exist |
+| `[alerts] sends to … but … has no complete set of SMTP settings` | Set `smtp_host`, `smtp_port`, `smtp_user`, `smtp_password` and `smtp_from` as in [Alerts](#alerts), or remove `[alerts]` |
+| `the secret 'smtp_…' contains whitespace, a character a shell would reinterpret, or is not the right shape` | Set it again with `./infra/up secrets set smtp_…`; the message gives the allowed shape |
+| `the test alert was not queued on node a` | `./infra/up ssh a -- journalctl -u 'stackbase-alert@*' -u nullmailer -n 50`; run `up` first if the server predates `[alerts]` |
+| An alert was queued but never arrived | `./infra/up ssh a -- journalctl -u nullmailer -n 50`: a wrong login, a relay certificate the server does not trust, or a relay that is unreachable (mail waits in `/var/spool/nullmailer/queue`) |
 | `this project has no backup bucket` | Add `[backups] bucket = "..."` to `stack.toml` and run `./infra/up` |
 
 A failed run changes nothing further and can always simply be run again: it
 picks up exactly where it stopped.
+
+## If a purchase says payment is processing
+
+Sometimes Hostinger answers a purchase with "accepted, payment still
+processing" instead of handing back a server. stack-base then records the
+order's subscription id in `infra/stack.state.json` (as
+`pending_subscription_id`) and stops with:
+
+```
+error: purchase for node 'a' (subscription <id>) is still processing — re-run ./infra/up in a few minutes
+```
+
+Nothing is lost and nothing is bought twice: while that id is recorded,
+stack-base will not purchase for the node again. Wait a few minutes and run
+`./infra/up` again. Once the server appears in your Hostinger account, it is
+recognised by its subscription id (not its name — a fresh server is called
+something like `srv123456.hstgr.cloud`), adopted, and set up the usual way,
+which also gives it the proper hostname. The id is then cleared from the state
+file.
+
+If it never appears, find the server in hPanel and put its id in `stack.toml`
+as `vps_id` for that node; stack-base uses that from then on.
 
 ## First run on a new provider image
 
@@ -905,6 +1522,7 @@ config and used directly, so edits to stack-base take effect on the next run.
 | `deploy-recipients.txt` | Who can decrypt `deploy.age` — a superset of `age-recipients.txt`. Commit |
 | `deploy.age` | The project's encrypted SSH deploy key. Commit (it's encrypted) |
 | `keys/deploy.pub` | The deploy key's public half — this is what gets installed on the servers. Commit |
+| `secrets.<env>.age`, `deploy.<env>.age`, `keys/deploy.<env>.pub`, `stack.state.<env>.json` | The same, per environment, when `stack.toml` has `[environments]` (see "Staging and production") |
 | `stack.state.json` | What stack-base has done so far — addresses, record ids, fingerprints. Written for you: commit it, don't edit it. The servers' configuration is built from `stack.toml` alone, so nothing in here changes what gets installed |
 | `known_hosts` | The servers' SSH fingerprints. Commit |
 | `nodes/<name>/` | Each server's own disk and boot settings, copied off the machine. Commit |

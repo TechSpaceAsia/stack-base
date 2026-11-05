@@ -1,0 +1,49 @@
+# A two-environment stack.toml: staging and production from one file.
+# Everything outside [environments.*] is shared, so the two match by
+# construction; each environment carries only what may differ.
+project    = "acme"
+owner      = "matt"
+datacenter = "kul"
+plan       = "KVM 1"
+admins     = ["matt"]
+
+[backups]
+bucket         = "acme-backups"
+retention_days = 30
+on_calendar    = "03:00"
+
+[logs]
+bucket         = "acme-logs"
+retention_days = 90
+
+[alerts]
+to = ["ops@example.com"]
+
+[files]
+bucket    = "acme-files"
+lock_days = 30
+
+[environments.staging]
+domain = "staging.acme.example.com"
+backups.bucket = "acme-backups-staging"
+logs.bucket = "acme-logs-staging"
+alerts.to = ["ops@example.com", "servers.acme.staging@example.com"]
+files.bucket = "acme-files-staging"
+files.lock_days = 7
+
+[environments.staging.nodes.a]
+role   = "primary"
+vps_id = 1111111
+
+[environments.production]
+domain     = "acme.example.com"
+plan       = "KVM 2"
+price_item = "hostingercom-vps-kvm2-usd-1m"
+backups.retention_days = 365
+
+[environments.production.nodes.a]
+role   = "primary"
+vps_id = 2222222
+
+[environments.production.nodes.b]
+role = "replica"

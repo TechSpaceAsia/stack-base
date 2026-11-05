@@ -4,20 +4,35 @@ name: Deploy (stack-base)
 # `./infra/up deploy <tag>` (stackbase/release.py) -- over the SAME
 # restricted SSH door every `stackbase.deploy.keys` entry uses
 # (nixos/deploy/stack-deploy-ssh.sh): upload | deploy | rollback | status |
-# colors | releases. This workflow drives that one door with the
-# repo-level `STACK_DEPLOY_KEY` secret (created by `./infra/up ci-setup`)
+# colors | releases. This workflow drives that one door with a
+# repo-level deploy-key secret (created by `./infra/up --env <env> ci-setup`)
 # and nothing else -- it never gets a shell on a server, never touches
-# nginx/TLS, and cannot see this project's own secrets (infra/secrets.age
-# never leaves the operator's machine; this workflow never decrypts it).
+# nginx/TLS, and cannot see this project's own secrets (infra/secrets.*.age
+# never leave the operator's machine; this workflow never decrypts them).
 #
-# Nothing is decrypted here, including infra/deploy.age -- which IS in the
+# Staging, then production. A `v*` tag push deploys that tag to STAGING
+# with the `STACK_DEPLOY_KEY_STAGING` repo secret and smoke-tests it
+# (`./infra/up smoke`). If both succeed AND the tagged commit is on the
+# repository's default branch (master), the same tag then deploys to
+# PRODUCTION with `STACK_DEPLOY_KEY_PRODUCTION`.
+# A tag cut from any other branch stops at staging. Each secret is written
+# by `./infra/up --env <env> ci-setup`.
+#
+# On GitHub Free a private repo has no environment-scoped secrets, so both
+# keys are repo secrets: anyone who can push a branch could edit this file
+# and read them. What bounds that is the door, not GitHub: a deploy key can
+# only upload, deploy or roll back a release (see the restricted SSH door
+# above), never get a shell. Promoting by hand still works too:
+# `./infra/up --env production deploy <tag>` from an operator's machine.
+#
+# Nothing is decrypted here, including infra/deploy.<env>.age -- which IS in the
 # checkout, because `ci-setup` tells you to commit it. That file is the same
 # key, encrypted to the team's age recipients, and the runner holds no age
 # identity for it. The workflow therefore writes the plaintext key it was
 # handed to a file and exports $STACKBASE_SSH_IDENTITY, which is resolution
 # path 1 of `release.deploy_identity` ("an explicit operator choice always
 # wins, and nothing is decrypted") -- it takes precedence over the
-# deploy.age path, so the deploy never asks for an age identity the runner
+# deploy.<env>.age path, so the deploy never asks for an age identity the runner
 # does not have. See the README's "Deploying from GitHub Actions" section.
 #
 # `./infra/up deploy` itself builds the static-musl binary, builds the CSS
@@ -48,7 +63,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  deploy:
+  staging:
+    # Every tag deploys staging first -- see the header.
+    outputs:
+      on_default_branch: ${{ steps.branch.outputs.on_default_branch }}
     # A self-hosted runner, not ubuntu-latest: minutes on it are free (it
     # is our own machine), and it is a NixOS box that carries the musl
     # cross compiler and tailwindcss -- so no C toolchain is installed at
@@ -73,14 +91,55 @@ jobs:
     steps:
       # node24 actions throughout: the runner ships only the node24 runtime.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # Full history: the default-branch check below needs merge-base.
+          fetch-depth: 0
+
+      # Runs before anything else that needs a tool: a runner that lacks one
+      # (GitHub's ubuntu-latest has rustup but no tailwindcss or musl cross
+      # compiler, for instance) fails here in seconds with the full list,
+      # instead of halfway through `./infra/up deploy` with a bare "command
+      # not found".
+      - name: Check the runner has stack-base's tools
+        run: |
+          missing=()
+          for t in python3 rsync tailwindcss x86_64-unknown-linux-musl-gcc rustup git ssh; do
+            if ! command -v "$t" >/dev/null 2>&1; then
+              missing+=("$t")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::this runner is missing: ${missing[*]} — use the production runner or add them to its extraPackages"
+            exit 1
+          fi
 
       - name: Verify the tag matches Cargo.toml's version
         run: |
           CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          # A tag, never a branch that happens to be named like one.
+          if ! git show-ref --verify --quiet "refs/tags/$GITHUB_REF_NAME"; then
+            echo "ERROR: $GITHUB_REF_NAME is not a tag in this repository"
+            exit 1
+          fi
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
             echo "ERROR: tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VERSION"
             exit 1
+          fi
+
+      - name: Is the tagged commit on the default branch?
+        id: branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git fetch --no-tags origin "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          commit=$(git rev-parse "$GITHUB_REF_NAME^{commit}")
+          if git merge-base --is-ancestor "$commit" "origin/$DEFAULT_BRANCH"; then
+            echo "on_default_branch=true" >> "$GITHUB_OUTPUT"
+            echo "$GITHUB_REF_NAME is on $DEFAULT_BRANCH: production follows staging"
+          else
+            echo "on_default_branch=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$GITHUB_REF_NAME is not on $DEFAULT_BRANCH: deploying staging only"
           fi
 
       - name: Install the musl Rust target
@@ -102,14 +161,14 @@ jobs:
 
       - name: Write the CI deploy key and point $STACKBASE_SSH_IDENTITY at it
         env:
-          # The ONLY secret this workflow references. Kept in `env:`, never
+          # The ONLY secret this job references -- staging's own key. Kept in `env:`, never
           # interpolated directly into a `run:` script line -- GitHub Actions
           # does not shell-escape `${{ }}` expressions, so putting a secret
           # straight into a script is both a leak risk (it can end up in
           # `set -x`/debug output) and an injection risk. `$STACK_DEPLOY_KEY`
           # below is an ordinary environment variable read by the shell, not
           # a template expression.
-          STACK_DEPLOY_KEY: ${{ secrets.STACK_DEPLOY_KEY }}
+          STACK_DEPLOY_KEY: ${{ secrets.STACK_DEPLOY_KEY_STAGING }}
         run: |
           umask 077
           key_file="$RUNNER_TEMP/deploy_key"
@@ -121,7 +180,7 @@ jobs:
           install -m 600 /dev/null "$key_file"
           printf '%s\n' "$STACK_DEPLOY_KEY" > "$key_file"
           # Resolution path 1 of release.deploy_identity: an explicit
-          # identity wins over infra/deploy.age (which is in this checkout
+          # identity wins over infra/deploy.staging.age (which is in this checkout
           # but cannot be decrypted here -- no age identity on the runner)
           # and nothing is decrypted. stackbase/ssh.py reads this variable
           # and offers exactly this one key, with `-o IdentitiesOnly=yes`,
@@ -129,8 +188,63 @@ jobs:
           # no SSH agent is involved at any point.
           echo "STACKBASE_SSH_IDENTITY=$key_file" >> "$GITHUB_ENV"
 
-      - name: Deploy
-        run: ./infra/up deploy "$GITHUB_REF_NAME"
+      - name: Deploy to staging
+        run: ./infra/up --env staging deploy "$GITHUB_REF_NAME"
+
+      # Production waits on this job, so a failed smoke test stops the
+      # release here. It checks every node serves the tag, the public URL
+      # answers, and runs infra/smoke if the project has one.
+      - name: Smoke-test staging
+        run: ./infra/up --env staging smoke "$GITHUB_REF_NAME"
+
+      - name: Remove the deploy key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/deploy_key"
+
+  production:
+    # Only after staging succeeded, and only for a tag on the default branch.
+    needs: staging
+    if: needs.staging.outputs.on_default_branch == 'true'
+    runs-on: [self-hosted, production]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # The staging job already checked the tag against Cargo.toml.
+      - name: Check the runner has stack-base's tools
+        run: |
+          missing=()
+          for t in python3 rsync tailwindcss x86_64-unknown-linux-musl-gcc rustup git ssh; do
+            if ! command -v "$t" >/dev/null 2>&1; then
+              missing+=("$t")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::this runner is missing: ${missing[*]} — use the production runner or add them to its extraPackages"
+            exit 1
+          fi
+
+      - name: Install the musl Rust target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Write the CI deploy key and point $STACKBASE_SSH_IDENTITY at it
+        env:
+          # The ONLY secret this job references -- production's own key, in
+          # `env:` for the same reasons as in the staging job.
+          STACK_DEPLOY_KEY: ${{ secrets.STACK_DEPLOY_KEY_PRODUCTION }}
+        run: |
+          umask 077
+          key_file="$RUNNER_TEMP/deploy_key"
+          install -m 600 /dev/null "$key_file"
+          printf '%s\n' "$STACK_DEPLOY_KEY" > "$key_file"
+          echo "STACKBASE_SSH_IDENTITY=$key_file" >> "$GITHUB_ENV"
+
+      - name: Deploy to production
+        run: ./infra/up --env production deploy "$GITHUB_REF_NAME"
+
+      # A failure turns the run red and prints the rollback command; it
+      # does not roll back by itself.
+      - name: Smoke-test production
+        run: ./infra/up --env production smoke "$GITHUB_REF_NAME"
 
       - name: Remove the deploy key
         if: always()

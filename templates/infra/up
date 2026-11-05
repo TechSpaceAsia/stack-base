@@ -301,7 +301,17 @@ def _with_implicit_up(args: list[str]) -> list[str]:
     --plan`) or asks for top-level help (`-h`/`--help`) works. Anything else
     with no args, or whose first token looks like an option, gets `up`
     inserted ahead of it.
+
+    A leading `--env <name>` (or `--env=<name>`) is a global option, not
+    the subcommand: it is kept in front and the same rule is applied to
+    what follows, so `./infra/up --env staging --plan` becomes
+    `--env staging up --plan` and `./infra/up --env staging deploy v1.0.0`
+    is left alone.
     """
+    if args and args[0] == "--env" and len(args) >= 2:
+        return [*args[:2], *_with_implicit_up(args[2:])]
+    if args and args[0].startswith("--env="):
+        return [args[0], *_with_implicit_up(args[1:])]
     if not args:
         return ["up"]
     if args[0] in ("-h", "--help"):

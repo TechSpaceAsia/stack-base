@@ -25,7 +25,21 @@ import subprocess
 from collections import deque
 from typing import Callable
 
+from stackbase.alerts import ALERT_REMOTES_UNIT, alert_env_content, alert_env_digest
 from stackbase.backups import backup_env_content, backup_env_digest
+from stackbase.files import files_env_digest, storage_env_block, storage_env_lines
+from stackbase.logs import LOGS_UNIT, logs_env_content, logs_env_digest
+from stackbase.config import save_state
+from stackbase.mesh import (
+    CONNECT_CMD,
+    CONNECT_POLL_SECONDS,
+    CONNECT_WAIT_SECONDS,
+    ENROL_CMD,
+    IP_CMD,
+    connector_token,
+    mesh_ipv6,
+    observe_mesh,
+)
 from stackbase.errors import StackError
 from stackbase.reconcile import (
     PUSH_EXCLUDES,
@@ -42,10 +56,12 @@ from stackbase.reconcile import (
     firewall_name,
     first_address,
     hostname_for,
+    nixos_name,
     primary_node,
     validate_app_env,
 )
-from stackbase.secrets import save_secrets
+from stackbase.r2 import R2Account, ensure_lifecycle_rule, ensure_lock_rule, r2_targets, summarize_rule
+from stackbase.secrets import redact, save_secrets
 from stackbase.ssh import HOST_KEY_CHANGED_MARKER, Ssh, host_key_mismatch_hint
 
 _HPANEL = "check the virtual machine in hPanel (https://hpanel.hostinger.com/)"
@@ -85,17 +101,38 @@ def execute(ctx: Context, step: Step) -> str:
 def _purchase(ctx: Context, step: Step) -> str:
     node = _node(step)
     inline_key, extra_ids = _admin_keys(ctx)
-    vps_id, warnings = ctx.hostinger.purchase_vm(
-        price_item=ctx.cfg.price_item or "",
+    result = ctx.hostinger.purchase_vm(
+        price_item=ctx.environment.price_item or "",
         template_id=ctx.hostinger.template_id("NixOS"),
         data_center_id=ctx.hostinger.data_center_id(ctx.cfg.datacenter),
-        hostname=hostname_for(ctx.cfg, node),
+        hostname=hostname_for(ctx.cfg, ctx.environment, node),
         public_key=inline_key,
         public_key_ids=extra_ids,
     )
-    _warn(ctx, warnings)
-    ctx.node_state(node).vps_id = vps_id
-    return f"node {node}: bought and installed virtual machine {vps_id}"
+    _warn(ctx, result.warnings)
+    if result.vps_id is None:
+        # HTTP 202: paid for, not provisioned yet. Persist the marker NOW --
+        # `apply` only saves after a step returns, and this one raises -- so
+        # the next run waits for this subscription instead of buying again.
+        ctx.node_state(node).pending_subscription_id = result.subscription_id
+        save_state(ctx.infra_dir, ctx.environment, ctx.state)
+        raise _still_processing(node, result.subscription_id)
+    ctx.node_state(node).vps_id = result.vps_id
+    return f"node {node}: bought and installed virtual machine {result.vps_id}"
+
+
+def _still_processing(node: str, subscription_id: str | None) -> StackError:
+    return StackError(
+        f"purchase for node '{node}' (subscription {subscription_id}) is still processing",
+        "re-run ./infra/up in a few minutes; if it never appears, find the VM in hPanel "
+        "and set vps_id in stack.toml",
+    )
+
+
+def _wait_purchase(ctx: Context, step: Step) -> str:
+    """Stop the run while a 202 purchase has no VM yet; changes nothing."""
+    node = _node(step)
+    raise _still_processing(node, ctx.node_state(node).pending_subscription_id)
 
 
 def _adopt(ctx: Context, step: Step) -> str:
@@ -114,11 +151,14 @@ def _adopt(ctx: Context, step: Step) -> str:
             f"node {node} has no adoptable virtual machine on record",
             "this is a bug in stack-base -- please report it",
         )
-    hostname = hostname_for(ctx.cfg, node)
+    hostname = hostname_for(ctx.cfg, ctx.environment, node)
     ctx.emit(
         f"! found an existing server {vps_id} named {hostname} -- adopting it instead of buying another"
     )
-    ctx.node_state(node).vps_id = vps_id
+    node_state = ctx.node_state(node)
+    node_state.vps_id = vps_id
+    # The pending purchase has landed; the marker has done its job.
+    node_state.pending_subscription_id = None
     return f"node {node}: adopted existing virtual machine {vps_id} ({hostname})"
 
 
@@ -130,7 +170,7 @@ def _setup(ctx: Context, step: Step) -> str:
         vps_id,
         template_id=ctx.hostinger.template_id("NixOS"),
         data_center_id=ctx.hostinger.data_center_id(ctx.cfg.datacenter),
-        hostname=hostname_for(ctx.cfg, node),
+        hostname=hostname_for(ctx.cfg, ctx.environment, node),
         public_key=inline_key,
         public_key_ids=extra_ids,
     )
@@ -188,7 +228,7 @@ def _ensure_keys(ctx: Context, _step: Step) -> str:
 
 def _ensure_firewall(ctx: Context, step: Step) -> str:
     node = _node(step)
-    firewall_id = ctx.hostinger.ensure_firewall(firewall_name(ctx.cfg), desired_firewall_rules())
+    firewall_id = ctx.hostinger.ensure_firewall(firewall_name(ctx.cfg, ctx.environment), desired_firewall_rules())
     ctx.state.hostinger.firewall_id = firewall_id
     ctx.hostinger.activate_firewall(firewall_id, _vps_id(ctx, node))
     return f"node {node}: firewall up to date (SSH and HTTPS only)"
@@ -258,7 +298,10 @@ def _capture_hardware(ctx: Context, step: Step) -> str:
         if line.strip().endswith(".nix") and "/" not in line.strip()
     ]
 
-    destination = ctx.infra_dir / "nodes" / node
+    # `nixos_name`: `nodes/<env>-<node>/` in an environment, so staging's
+    # node a and production's node a never overwrite each other's disk facts.
+    directory = nixos_name(ctx.environment, node)
+    destination = ctx.infra_dir / "nodes" / directory
     destination.mkdir(parents=True, exist_ok=True)
 
     if _HARDWARE_FILE in names:
@@ -276,7 +319,7 @@ def _capture_hardware(ctx: Context, step: Step) -> str:
         (destination / _HARDWARE_FILE).write_text(output, encoding="utf-8")
 
     ctx.node_state(node).hardware_captured = True
-    return f"node {node}: disk and boot settings saved to infra/nodes/{node}/ (commit them)"
+    return f"node {node}: disk and boot settings saved to infra/nodes/{directory}/ (commit them)"
 
 
 # --------------------------------------------------------------------------
@@ -291,7 +334,8 @@ def _ensure_origin_cert(ctx: Context, _step: Step) -> str:
     the same stdout; both are split apart in memory. The key goes straight
     into `secrets.age` (encrypted) and, at push time, into an ssh stdin pipe.
     """
-    domain = ctx.cfg.domain
+    domain = ctx.environment.domain
+    secrets_name = ctx.secrets_file.name
     key_pem, csr_pem = _generate_key_and_csr(ctx, domain)
     cert_pem = ctx.cloudflare.create_origin_cert([domain], csr_pem)
 
@@ -300,7 +344,7 @@ def _ensure_origin_cert(ctx: Context, _step: Step) -> str:
     ctx.secrets["origin_cert"] = cert_pem
     ctx.secrets["origin_key"] = key_pem
     try:
-        save_secrets(ctx.infra_dir, ctx.secrets)
+        save_secrets(ctx.infra_dir, ctx.secrets, file=ctx.secrets_file)
     except StackError as exc:
         # Cloudflare has already issued the certificate by this point -- a
         # failure to save it locally does not un-issue it. Say so, so the
@@ -308,11 +352,11 @@ def _ensure_origin_cert(ctx: Context, _step: Step) -> str:
         raise StackError(
             exc.message,
             f"{exc.hint} -- a Cloudflare origin certificate for {domain} was just issued and is "
-            "now orphaned (it was never saved to secrets.age); running `up` again will issue a "
+            f"now orphaned (it was never saved to {secrets_name}); running `up` again will issue a "
             "fresh one, and the orphaned certificate can be revoked in the Cloudflare dashboard -> "
             "SSL/TLS -> Origin Server",
         ) from exc
-    return f"origin certificate for {domain} created and stored in infra/secrets.age"
+    return f"origin certificate for {domain} created and stored in infra/{secrets_name}"
 
 
 def _generate_key_and_csr(ctx: Context, domain: str) -> tuple[str, str]:
@@ -357,19 +401,20 @@ def _extract_pem(text: str, label: str) -> str | None:
 
 
 def _upsert_dns(ctx: Context, step: Step) -> str:
-    node = step.node or primary_node(ctx.cfg)
+    domain = ctx.environment.domain
+    node = step.node or primary_node(ctx.cfg, ctx.environment)
     ipv4 = ctx.node_state(node).ipv4
     if not ipv4:
         raise StackError(
-            f"node {node} has no IP address to point {ctx.cfg.domain} at",
+            f"node {node} has no IP address to point {domain} at",
             "run `up` again -- the address is recorded once the server is running",
         )
 
-    zone_id = ctx.observed.zone_id or ctx.cloudflare.zone_for(ctx.cfg.domain)[0]
-    record_id = ctx.cloudflare.upsert_a_record(zone_id, ctx.cfg.domain, ipv4, proxied=True)
+    zone_id = ctx.observed.zone_id or ctx.cloudflare.zone_for(domain)[0]
+    record_id = ctx.cloudflare.upsert_a_record(zone_id, domain, ipv4, proxied=True)
     ctx.state.cloudflare.zone_id = zone_id
     ctx.state.cloudflare.record_id = record_id
-    return f"{ctx.cfg.domain} now points at node {node} ({ipv4}), proxied by Cloudflare"
+    return f"{domain} now points at node {node} ({ipv4}), proxied by Cloudflare"
 
 
 # --------------------------------------------------------------------------
@@ -413,7 +458,7 @@ def _push_origin_cert(ctx: Context, ssh: Ssh) -> None:
     key = ctx.secrets.get("origin_key")
     if not cert or not key:
         raise StackError(
-            "the origin certificate is missing from infra/secrets.age",
+            f"the origin certificate is missing from infra/{ctx.secrets_file.name}",
             "run `up` again -- stack-base creates the certificate before pushing it",
         )
 
@@ -487,7 +532,7 @@ def _rebuild(ctx: Context, step: Step) -> str:
             raise _host_key_mismatch_error(ctx, node)
         raise StackError(
             f"node {node}: the new configuration failed to build or activate",
-            _tail_hint(tail, _test_failure_advice(node, tail)),
+            _tail_hint(tail, _test_failure_advice(nixos_name(ctx.environment, node), tail)),
         )
 
     probe = ctx.ssh(node).run("true", check=False)  # a NEW connection, on purpose
@@ -582,7 +627,10 @@ def _test_failure_advice(node: str, tail: list[str]) -> str:
 
 
 def _rebuild_command(ctx: Context, node: str, mode: str) -> str:
-    """`nixos-rebuild <mode> --flake /etc/nixos/stack#<node>`, safely quoted.
+    """`nixos-rebuild <mode> --flake /etc/nixos/stack#<nixos_name>`, safely quoted.
+
+    The flake attribute is `nixos_name(env, node)`: the bare node name for a
+    single-environment project, `<env>-<node>` in an environment.
 
     This string is handed to a root shell on the node, and `node` is a
     stack.toml table key. `load_config` already constrains it, but the flake
@@ -591,7 +639,7 @@ def _rebuild_command(ctx: Context, node: str, mode: str) -> str:
     there is no `str.format` here either: a brace in `node` would otherwise
     be a second interpolation nobody asked for.)
     """
-    target = shlex.quote(f"{REMOTE_CONFIG_DIR}#{node}")
+    target = shlex.quote(f"{REMOTE_CONFIG_DIR}#{nixos_name(ctx.environment, node)}")
     override = (
         f" --override-input stack-base {shlex.quote(f'path:{REMOTE_SRC_DIR}')}"
         if ctx.stackbase_src
@@ -702,15 +750,20 @@ def _ensure_app_env(ctx: Context, step: Step) -> str:
     """
     node = _node(step)
     raw = ctx.secrets.get("app_env")
-    if not raw:
+    # The STORAGE_* block (empty without [files]) is validated before any ssh
+    # call too, and is appended after app_env without entering its digest.
+    storage_lines = storage_env_lines(ctx.environment, ctx.secrets)
+    if not raw and not storage_lines:
         raise StackError(
-            "infra/secrets.age has no 'app_env' to push",
+            f"infra/{ctx.secrets_file.name} has no 'app_env' to push",
             "this is a bug in stack-base -- please report it",
         )
     # Validated and normalised before any ssh call: a malformed app_env must
     # never open a connection, let alone reach the node -- and the message
     # never echoes any part of its content.
-    normalized = validate_app_env(raw)
+    normalized = validate_app_env(raw) if raw else ""
+    block = storage_env_block(storage_lines)
+    pushed = normalized + block
 
     project = ctx.cfg.project
     ssh = ctx.ssh(node)
@@ -726,7 +779,7 @@ def _ensure_app_env(ctx: Context, step: Step) -> str:
     tmp_path = _cert_path("app.env.new")
     final_path = _cert_path("app.env")
     ssh.run(f"set -eu; install -m 0640 -o root -g {shlex.quote(project)} /dev/null {tmp_path}")
-    ssh.run(f"set -eu; cat > {tmp_path}", input=normalized)
+    ssh.run(f"set -eu; cat > {tmp_path}", input=pushed)
     ssh.run(f"set -eu; mv -f {tmp_path} {final_path}")
 
     # The restart runs BEFORE app_env_sha is saved (Fix round, B2): the old
@@ -740,11 +793,21 @@ def _ensure_app_env(ctx: Context, step: Step) -> str:
     # here leaves state unchanged and the whole step (push + restart) retries
     # on the next `up`.
     color = _restart_active_color(ctx, ssh, node, project)
-    ctx.node_state(node).app_env_sha = app_env_digest(normalized)
+    node_state = ctx.node_state(node)
+    if raw:
+        node_state.app_env_sha = app_env_digest(normalized)
+    removed_storage = node_state.files_env_sha is not None and not storage_lines
+    node_state.files_env_sha = files_env_digest(block) if storage_lines else None
 
+    message = f"node {node}: application environment updated"
     if color:
-        return f"node {node}: application environment updated, {color} restarted"
-    return f"node {node}: application environment updated"
+        message += f", {color} restarted"
+    if removed_storage:
+        message += (
+            "; the STORAGE_* credentials were removed from app.env -- revoke the files R2 token "
+            "in the Cloudflare dashboard"
+        )
+    return message
 
 
 def _restart_active_color(ctx: Context, ssh: Ssh, node: str, project: str) -> str | None:
@@ -831,7 +894,7 @@ def _ensure_backup_env(ctx: Context, step: Step) -> str:
     content = backup_env_content(ctx.secrets)
     if not content:
         raise StackError(
-            "infra/secrets.age has no complete set of R2 credentials to push",
+            f"infra/{ctx.secrets_file.name} has no complete set of R2 credentials to push",
             "this is a bug in stack-base -- please report it",
         )
 
@@ -849,6 +912,197 @@ def _ensure_backup_env(ctx: Context, step: Step) -> str:
     # converged.
     ctx.node_state(node).backup_env_sha = backup_env_digest(content)
     return f"node {node}: backup credentials updated"
+
+
+# --------------------------------------------------------------------------
+# Log shipping credentials: push logs.env, root-only, restart Vector
+# --------------------------------------------------------------------------
+
+
+def _ensure_logs_env(ctx: Context, step: Step) -> str:
+    """Push Vector's R2 credentials to /var/lib/stackbase/logs.env, 0600 root:root.
+
+    The same stdin-only, owner-and-mode-first model as `_ensure_backup_env`.
+    root:root is enough even though Vector itself runs as `vector`: systemd
+    reads an `EnvironmentFile` as PID 1, before dropping privileges, so the
+    service user never needs to open the file -- and this step runs before a
+    node's first rebuild, when no `vector` user exists yet to own anything.
+
+    A running Vector is restarted so it picks up rotated keys; one that is
+    not running yet (the first push, before the rebuild that installs it)
+    is left alone -- the rebuild starts it with this file already in place.
+    Events waiting in its disk buffer survive the restart.
+    """
+    node = _node(step)
+    content = logs_env_content(ctx.secrets)
+    if not content:
+        raise StackError(
+            f"infra/{ctx.secrets_file.name} has no complete set of logs credentials to push",
+            "this is a bug in stack-base -- please report it",
+        )
+
+    ssh = ctx.ssh(node)
+    tmp_path = _cert_path("logs.env.new")
+    final_path = _cert_path("logs.env")
+    ssh.run(f"set -eu; install -d -m 0750 {shlex.quote(REMOTE_CERT_DIR)}")
+    ssh.run(f"set -eu; install -m 0600 -o root -g root /dev/null {tmp_path}")
+    ssh.run(f"set -eu; cat > {tmp_path}", input=content)
+    ssh.run(f"set -eu; mv -f {tmp_path} {final_path}")
+    ssh.run(
+        f"set -eu; if systemctl is-active --quiet {LOGS_UNIT}; then systemctl restart {LOGS_UNIT}; fi"
+    )
+
+    # After the restart: a node whose Vector could not come back up with the
+    # new file replans the step next run instead of being called converged.
+    ctx.node_state(node).logs_env_sha = logs_env_digest(content)
+    return f"node {node}: log shipping credentials updated"
+
+
+# --------------------------------------------------------------------------
+# Cloudflare Mesh: enrol a node with the environment's connector token
+# --------------------------------------------------------------------------
+
+
+def _ensure_mesh(ctx: Context, step: Step) -> str:
+    """Enrol the node on Mesh, connect, and wait up to 60 s for Connected.
+
+    The token goes over ssh's stdin (see stackbase/mesh.py for the one
+    place it is briefly an argument on the node itself). A failed `connector
+    new` is not fatal on its own: a node enrolled by an earlier run that is
+    merely disconnected rejects it, and `connect` is what it needs. If it
+    then never connects, the failure's stderr tail is the hint.
+    """
+    node = _node(step)
+    env = ctx.environment
+    token = connector_token(
+        ctx.secrets, ctx.secrets_file.name, "" if env.implicit else f" --env {env.name}"
+    )
+
+    ssh = ctx.ssh(node)
+    enrol = ssh.run(ENROL_CMD, check=False, input=token + "\n")
+    ssh.run(CONNECT_CMD)
+
+    waited = 0
+    while not observe_mesh(ssh):
+        if waited >= CONNECT_WAIT_SECONDS:
+            reason = ""
+            if enrol.returncode != 0:
+                tail = enrol.stderr if isinstance(enrol.stderr, str) else ""
+                # Redact the WHOLE stderr, then truncate: cutting first could
+                # leave the start of the token on screen, no longer matching.
+                shown = redact(tail.strip(), ctx.secret_values)[-300:]
+                reason = f"enrolling failed first: {shown or 'no output'}. "
+            raise StackError(
+                f"node {node} did not join Cloudflare Mesh within {CONNECT_WAIT_SECONDS} seconds",
+                f"{reason}check the token is a current node token and the device profile is the "
+                'include-only MASQUE one (README "Mesh" section), then run `up` again; on the '
+                "server, `warp-cli --accept-tos status` says why",
+            )
+        ctx.sleep(CONNECT_POLL_SECONDS)
+        waited += CONNECT_POLL_SECONDS
+
+    address = mesh_ipv6(ssh.run(IP_CMD, check=False).stdout or "")
+    where = f" (Mesh address {address})" if address else ""
+    return f"node {node}: joined Cloudflare Mesh{where}"
+
+
+# --------------------------------------------------------------------------
+# Failure email: push alert.env, root-only, re-render nullmailer's remotes
+# --------------------------------------------------------------------------
+
+
+def _ensure_alert_env(ctx: Context, step: Step) -> str:
+    """Push the SMTP settings to /var/lib/stackbase/alert.env, 0600 root:root.
+
+    The same stdin-only, owner-and-mode-first model as `_ensure_logs_env`,
+    and planned before the rebuild for the same reason: the rebuild that
+    turns alerts on starts the oneshot that renders nullmailer's remotes
+    from this file, and that oneshot fails without it.
+
+    A running relay is re-rendered (nullmailer is PartOf that oneshot, so it
+    restarts with the new remotes), and a failed one (say, after a bad
+    value) is repaired the same way; one never started yet (the first push)
+    is left for the rebuild. Mail already queued survives the restart.
+    """
+    node = _node(step)
+    content = alert_env_content(ctx.secrets)
+    if not content:
+        raise StackError(
+            f"infra/{ctx.secrets_file.name} has no complete set of SMTP settings to push",
+            "this is a bug in stack-base -- please report it",
+        )
+
+    ssh = ctx.ssh(node)
+    tmp_path = _cert_path("alert.env.new")
+    final_path = _cert_path("alert.env")
+    ssh.run(f"set -eu; install -d -m 0750 {shlex.quote(REMOTE_CERT_DIR)}")
+    ssh.run(f"set -eu; install -m 0600 -o root -g root /dev/null {tmp_path}")
+    ssh.run(f"set -eu; cat > {tmp_path}", input=content)
+    ssh.run(f"set -eu; mv -f {tmp_path} {final_path}")
+    ssh.run(
+        f"set -eu; if systemctl is-active --quiet {ALERT_REMOTES_UNIT} "
+        f"|| systemctl is-failed --quiet {ALERT_REMOTES_UNIT}; "
+        f"then systemctl restart {ALERT_REMOTES_UNIT}; fi"
+    )
+
+    # Only after the re-render: a node whose relay could not take the new
+    # settings replans the step next run instead of being called converged.
+    ctx.node_state(node).alert_env_sha = alert_env_digest(content)
+    return f"node {node}: alert mail credentials updated"
+
+
+# --------------------------------------------------------------------------
+# Cloudflare R2: buckets, the logs retention rule, the files lock
+# --------------------------------------------------------------------------
+
+
+def _r2(ctx: Context) -> R2Account:
+    if ctx.r2 is None:
+        raise StackError(
+            "an R2 step ran without an R2 client",
+            "this is a bug in stack-base -- please report it",
+        )
+    return ctx.r2
+
+
+def _bucket(step: Step) -> str:
+    if not step.bucket:
+        raise StackError(
+            f"step '{step.action.value}' has no bucket",
+            "this is a bug in stack-base -- please report it",
+        )
+    return step.bucket
+
+
+def _r2_rule(ctx: Context, step: Step, kind: str) -> dict:
+    bucket = _bucket(step)
+    for target in r2_targets(ctx.environment):
+        if target.kind == kind and target.bucket == bucket:
+            return target.rule
+    raise StackError(
+        f"stack.toml no longer names bucket '{bucket}' for this",
+        "run `up` again to re-plan",
+    )
+
+
+def _ensure_r2_bucket(ctx: Context, step: Step) -> str:
+    bucket = _bucket(step)
+    _r2(ctx).create_bucket(bucket)
+    return f"R2 bucket {bucket}: created"
+
+
+def _ensure_r2_lifecycle(ctx: Context, step: Step) -> str:
+    bucket = _bucket(step)
+    rule = _r2_rule(ctx, step, "logs")
+    ensure_lifecycle_rule(_r2(ctx), bucket, rule)
+    return f"R2 bucket {bucket}: {summarize_rule('logs', rule)}"
+
+
+def _ensure_r2_lock(ctx: Context, step: Step) -> str:
+    bucket = _bucket(step)
+    rule = _r2_rule(ctx, step, "files")
+    ensure_lock_rule(_r2(ctx), bucket, rule)
+    return f"R2 bucket {bucket}: {summarize_rule('files', rule)}"
 
 
 def _tail_hint(tail: list[str], advice: str) -> str:
@@ -876,7 +1130,8 @@ def _node(step: Step) -> str:
 
 
 def _vps_id(ctx: Context, node: str) -> int:
-    configured = ctx.cfg.nodes[node].vps_id if node in ctx.cfg.nodes else None
+    nodes = ctx.environment.nodes
+    configured = nodes[node].vps_id if node in nodes else None
     vps_id = configured or ctx.node_state(node).vps_id
     if vps_id is None:
         raise StackError(
@@ -890,6 +1145,7 @@ def _vps_id(ctx: Context, node: str) -> int:
 _EXECUTORS: dict[Action, Callable[[Context, Step], str]] = {
     Action.PURCHASE: _purchase,
     Action.ADOPT: _adopt,
+    Action.WAIT_PURCHASE: _wait_purchase,
     Action.SETUP: _setup,
     Action.WAIT_RUNNING: _wait_running,
     Action.ENSURE_KEYS: _ensure_keys,
@@ -901,5 +1157,11 @@ _EXECUTORS: dict[Action, Callable[[Context, Step], str]] = {
     Action.REBUILD: _rebuild,
     Action.ENSURE_APP_ENV: _ensure_app_env,
     Action.ENSURE_BACKUP_ENV: _ensure_backup_env,
+    Action.ENSURE_LOGS_ENV: _ensure_logs_env,
+    Action.ENSURE_ALERT_ENV: _ensure_alert_env,
+    Action.ENSURE_MESH: _ensure_mesh,
+    Action.ENSURE_R2_BUCKET: _ensure_r2_bucket,
+    Action.ENSURE_R2_LIFECYCLE: _ensure_r2_lifecycle,
+    Action.ENSURE_R2_LOCK: _ensure_r2_lock,
     Action.UPSERT_DNS: _upsert_dns,
 }
