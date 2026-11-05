@@ -1772,7 +1772,7 @@ class CiTemplateTests(unittest.TestCase):
 
     def test_ci_template_preflight_lists_required_tools(self) -> None:
         jobs = _ci_job_lines(_CI_TEMPLATE.read_text(encoding="utf-8"))
-        self.assertEqual(list(jobs), ["staging"])
+        self.assertEqual(list(jobs), ["staging", "production"])
         for name, lines in jobs.items():
             with self.subTest(job=name):
                 self._assert_preflight_first(lines)
