@@ -1127,6 +1127,7 @@ _ENV_COMMANDS = [
     ["deploy", "v1.0.0"],
     ["rollback"],
     ["status"],
+    ["smoke", "v1.0.0"],
     ["ssh", "a"],
     ["backup-now"],
     ["alert-test"],

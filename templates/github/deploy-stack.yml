@@ -11,9 +11,10 @@ name: Deploy (stack-base)
 # never leave the operator's machine; this workflow never decrypts them).
 #
 # Staging, then production. A `v*` tag push deploys that tag to STAGING
-# with the `STACK_DEPLOY_KEY_STAGING` repo secret. If staging succeeds AND
-# the tagged commit is on the repository's default branch (master), the
-# same tag then deploys to PRODUCTION with `STACK_DEPLOY_KEY_PRODUCTION`.
+# with the `STACK_DEPLOY_KEY_STAGING` repo secret and smoke-tests it
+# (`./infra/up smoke`). If both succeed AND the tagged commit is on the
+# repository's default branch (master), the same tag then deploys to
+# PRODUCTION with `STACK_DEPLOY_KEY_PRODUCTION`.
 # A tag cut from any other branch stops at staging. Each secret is written
 # by `./infra/up --env <env> ci-setup`.
 #
@@ -190,6 +191,12 @@ jobs:
       - name: Deploy to staging
         run: ./infra/up --env staging deploy "$GITHUB_REF_NAME"
 
+      # Production waits on this job, so a failed smoke test stops the
+      # release here. It checks every node serves the tag, the public URL
+      # answers, and runs infra/smoke if the project has one.
+      - name: Smoke-test staging
+        run: ./infra/up --env staging smoke "$GITHUB_REF_NAME"
+
       - name: Remove the deploy key
         if: always()
         run: rm -f "$RUNNER_TEMP/deploy_key"
@@ -233,6 +240,11 @@ jobs:
 
       - name: Deploy to production
         run: ./infra/up --env production deploy "$GITHUB_REF_NAME"
+
+      # A failure turns the run red and prints the rollback command; it
+      # does not roll back by itself.
+      - name: Smoke-test production
+        run: ./infra/up --env production smoke "$GITHUB_REF_NAME"
 
       - name: Remove the deploy key
         if: always()

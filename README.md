@@ -349,7 +349,8 @@ role = "primary"
 - **Releasing: tag → staging → production.** With the GitHub Actions
   workflow (below), pushing a `v*` tag deploys it to staging. If that
   succeeds and the tagged commit is on the default branch (master), the same
-  tag then deploys to production. A tag cut from any other branch stops at
+  tag then deploys to production. "Succeeds" means the deploy AND its
+  smoke test (see "Smoke test"). A tag cut from any other branch stops at
   staging, which is how you try a release candidate there first. Without the
   workflow, or to promote a tag yourself, run the same commands from your
   own machine:
@@ -357,7 +358,9 @@ role = "primary"
   ```bash
   TAG=v1.4.2
   ./infra/up --env staging deploy "$TAG"
+  ./infra/up --env staging smoke "$TAG"
   ./infra/up --env production deploy "$TAG"
+  ./infra/up --env production smoke "$TAG"
   ```
 
   On GitHub Free a private repository has no environment-scoped secrets, so
@@ -494,6 +497,37 @@ after the swap (and, failing a graceful stop within `TimeoutStopSec`,
 force-killed). A client reconnecting picks up the new color; there's no
 in-place migration of an open connection.
 
+### Smoke test
+
+`./infra/up smoke <version>` checks a deploy from the outside, and fails at
+the first problem:
+
+1. **Every node serves `<version>`**, read from each node's `status`.
+2. **The site answers**: `https://<domain><health_path>` returns 200 through
+   the real front door (DNS, Cloudflare, TLS), with no redirect. It retries
+   for about 30 seconds. A project with no public front door turns this off
+   with `[app] smoke_public = false`.
+3. **Your own checks**: if `infra/smoke` exists, it must be executable. It
+   runs from the repository root with `SMOKE_BASE_URL` (e.g.
+   `https://staging.acme.example.com`), `SMOKE_VERSION` and `SMOKE_ENV` set,
+   and any non-zero exit fails the smoke test. For example:
+
+   ```sh
+   #!/bin/sh
+   set -eu
+   curl -fsS "$SMOKE_BASE_URL/" | grep -q "<title>"
+   curl -fsS "$SMOKE_BASE_URL/login" >/dev/null
+   ```
+
+```bash
+TAG=v1.2.3
+./infra/up --env staging smoke "$TAG"
+```
+
+The GitHub Actions workflow smoke-tests after every deploy, and production
+only deploys once staging's smoke test has passed. A failed smoke test never
+rolls back by itself; its message names the rollback command.
+
 ## The project deploy key
 
 Every project has exactly **one** SSH deploy key. You use it, a build host
@@ -617,9 +651,10 @@ and any build host deploy with — there is no "laptop deploys are
 unaffected" any more (Task 2 removed the separate `ci-deploy` key).
 
 **With staging and production**, a `v*` tag push runs
-`./infra/up --env staging deploy` with the `STACK_DEPLOY_KEY_STAGING` repo
-secret. Then, if staging succeeded and the tag is on the default branch, it
-runs `./infra/up --env production deploy` with `STACK_DEPLOY_KEY_PRODUCTION`.
+`./infra/up --env staging deploy` and then `smoke` with the
+`STACK_DEPLOY_KEY_STAGING` repo secret. Then, if both passed and the tag is
+on the default branch, it does the same for production with
+`STACK_DEPLOY_KEY_PRODUCTION`.
 Write each secret with its own run:
 
 ```bash

@@ -650,6 +650,20 @@ class WorkflowEnvironmentsTests(unittest.TestCase):
         self.assertIn('echo "on_default_branch=true" >> "$GITHUB_OUTPUT"', staging)
         self.assertIn('echo "on_default_branch=false" >> "$GITHUB_OUTPUT"', staging)
 
+    def test_each_job_smoke_tests_after_deploying_and_before_removing_the_key(self) -> None:
+        for env in ("staging", "production"):
+            with self.subTest(job=env):
+                text = _jobs()[env]
+                deploy = text.index(f'./infra/up --env {env} deploy "$GITHUB_REF_NAME"')
+                smoke = text.index(f'./infra/up --env {env} smoke "$GITHUB_REF_NAME"')
+                cleanup = text.index("if: always()")
+                self.assertLess(deploy, smoke)
+                self.assertLess(smoke, cleanup)
+                # The smoke step must not be skippable: a failure fails the job.
+                block = text[smoke - 200 : smoke]
+                self.assertNotIn("continue-on-error", block)
+        self.assertNotIn("continue-on-error", _WORKFLOW_TEXT)
+
     def test_the_default_branch_check_runs_before_the_staging_deploy(self) -> None:
         staging = _jobs()["staging"]
         self.assertLess(staging.index("id: branch"), staging.index("name: Deploy to staging"))

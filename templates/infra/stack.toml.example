@@ -62,12 +62,15 @@ role = "primary"
 # crate's [package].name or [[bin]] name is different, set it here --
 # `./infra/up deploy` refuses to build otherwise, with the exact value to
 # paste. health_path/health_tries/health_sleep override the release
-# engine's health check (default "/health", 30 tries, 2s apart).
+# engine's health check (default "/health", 30 tries, 2s apart);
+# `./infra/up smoke` also fetches https://<domain><health_path>, unless
+# smoke_public = false (a project with no public front door).
 # [app]
 # binary = "my_crate_name"
 # health_path = "/health"
 # health_tries = 30
 # health_sleep = 2
+# smoke_public = true
 
 # REQUIRED (since v0.2.0; uncomment one choice): nightly off-box backups.
 # The project's database, plus any directories listed here, encrypted to

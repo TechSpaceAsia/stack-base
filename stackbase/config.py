@@ -111,6 +111,8 @@ class AppConfig:
     health_path: str | None = None
     health_tries: int | None = None
     health_sleep: int | None = None
+    # `smoke` checks https://<domain><health_path> unless this is False.
+    smoke_public: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -683,7 +685,20 @@ def _parse_app(data: dict[str, Any], toml_path: Path) -> AppConfig:
     health_tries = _optional_ranged_int(raw, "health_tries", 1, 300, toml_path)
     health_sleep = _optional_ranged_int(raw, "health_sleep", 1, 60, toml_path)
 
-    return AppConfig(binary=binary, health_path=health_path, health_tries=health_tries, health_sleep=health_sleep)
+    smoke_public = raw.get("smoke_public")
+    if smoke_public is not None and not isinstance(smoke_public, bool):
+        raise StackError(
+            f"{toml_path} has an invalid [app].smoke_public {smoke_public!r}",
+            "smoke_public must be true or false",
+        )
+
+    return AppConfig(
+        binary=binary,
+        health_path=health_path,
+        health_tries=health_tries,
+        health_sleep=health_sleep,
+        smoke_public=smoke_public,
+    )
 
 
 def _optional_ranged_int(

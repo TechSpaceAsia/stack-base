@@ -56,6 +56,7 @@ from stackbase.reconcile import (
     render_description,
 )
 from stackbase.release import run_deploy, run_rollback, run_status
+from stackbase.smoke import run_smoke
 from stackbase.secrets import (
     SecretsFile,
     check_recipients_superset,
@@ -139,6 +140,10 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--node", help="restrict to one node")
     status.add_argument("--debug", action="store_true", help="print the full traceback on failure")
 
+    smoke = commands.add_parser("smoke", help="check every node serves a release and the site answers")
+    smoke.add_argument("version", help="the release every node should be serving, e.g. v1.4.2")
+    smoke.add_argument("--debug", action="store_true", help="print the full traceback on failure")
+
     backup_now_p = commands.add_parser("backup-now", help="run the backup on every node now and list the bucket")
     backup_now_p.add_argument("--node", help="restrict to one node")
     backup_now_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
@@ -191,7 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
     secrets_edit_p.add_argument("--debug", action="store_true", help="print the full traceback on failure")
 
     for command in (
-        up, shell, deploy, rollback, status, backup_now_p, alert_test_p, ci_setup_p, deploy_key_p, secrets_p
+        up, shell, deploy, rollback, status, smoke, backup_now_p, alert_test_p, ci_setup_p, deploy_key_p, secrets_p
     ):
         _add_env(command, "env_cmd")
     for leaf in (deploy_key_init_p, deploy_key_show_p, secrets_keys_p, secrets_set_p, secrets_unset_p, secrets_edit_p):
@@ -223,6 +228,8 @@ def main(argv: list[str] | None = None) -> None:
             _rollback(args, infra_dir, secrets, env)
         elif args.command == "status":
             _status(args, infra_dir, secrets, env)
+        elif args.command == "smoke":
+            _smoke(args, infra_dir, secrets, env)
         elif args.command == "backup-now":
             _backup_now(args, infra_dir, secrets, env)
         elif args.command == "alert-test":
@@ -539,6 +546,16 @@ def _status(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], 
     run_status(
         infra_dir,
         node=args.node,
+        emit=_emit_masked(secrets),
+        register_secret=_secret_register_counter(secrets),
+        env=env,
+    )
+
+
+def _smoke(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env: str | None) -> None:
+    run_smoke(
+        infra_dir,
+        args.version,
         emit=_emit_masked(secrets),
         register_secret=_secret_register_counter(secrets),
         env=env,
