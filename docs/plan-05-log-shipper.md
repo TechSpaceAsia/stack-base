@@ -125,7 +125,7 @@
 ### Task 6: Boost production moves from Vector to the script
 
 **Files (in `/home/matiboy/code/boost/infra`):**
-- Modify: `host-native/log-shipper/install` (rewrite: apt `rclone python3`; install `log-shipper.py` copied from stack-base `v0.3.0` with its sha256 checked in the installer; `stackbase-logs.service` + `.timer` equivalent to Task 2's, `EnvironmentFile=/etc/stackbase-logs/logs.env`; seed `/var/lib/stackbase-logs/cursor` from Vector's checkpoint `/var/lib/vector/journal/checkpoint.txt` (Vector names it after the source id, `journal`` if present so nothing is re-sent or skipped; then stop, disable and purge Vector and its apt repo/pin/keyring; run the service once and require exit 0 and an object under `journal/boost-app-26/` newer than the start)
+- Modify: `host-native/log-shipper/install` (rewrite: apt `rclone python3`; install `log-shipper.py` copied from stack-base `v0.3.0` with its sha256 checked in the installer; `stackbase-logs.service` + `.timer` equivalent to Task 2's, `EnvironmentFile=/etc/stackbase-logs/logs.env`; seed `/var/lib/stackbase-logs/cursor` from Vector's checkpoint `/var/lib/vector/journal/checkpoint.txt` (Vector names it after the source id, `journal`) if present so nothing is re-sent or skipped; then stop, disable and purge Vector and its apt repo/pin/keyring; run the service once and require exit 0 and an object under `journal/boost-app-26/` newer than the start)
 - Delete: `host-native/log-shipper/vector.yaml`, `vector.test.yaml`
 - Modify: `host-native/log-shipper/README.md`
 - Keep: `apply-bucket`, `r2-bucket.json` (unchanged)
