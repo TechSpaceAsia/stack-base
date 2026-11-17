@@ -1,4 +1,4 @@
-"""Tests for stackbase.logs: Vector's R2 credentials file and its step.
+"""Tests for stackbase.logs: the log shipper's R2 credentials file and its step.
 
 The shipping itself runs entirely on the node (`nixos/logs.nix`, proved in
 `tests/vm-logs.nix`). This is the laptop side: rendering
@@ -17,6 +17,7 @@ from stackbase.config import LogsConfig, NodeState, StackState, load_state, save
 from stackbase.errors import StackError
 from stackbase.logs import (
     LOGS_ENV_PATH,
+    LOGS_UNIT,
     check_logs_credentials,
     logs_enabled,
     logs_env_content,
@@ -61,6 +62,7 @@ class LogsEnvContentTests(unittest.TestCase):
             "LOGS_ENDPOINT=https://abc123.r2.cloudflarestorage.com\n",
         )
         self.assertEqual(LOGS_ENV_PATH, "/var/lib/stackbase/logs.env")
+        self.assertEqual(LOGS_UNIT, "stackbase-logs.service")
 
     def test_a_missing_or_empty_value_means_no_file_at_all(self) -> None:
         for key in _LOGS_SECRETS:
@@ -147,9 +149,9 @@ class LogsEnvPlanTests(unittest.TestCase):
         steps = plan(_config(), _converged_state(), self._observed("sha"), env=_env(_ON))
         self.assertEqual(steps, [Step(Action.ENSURE_LOGS_ENV, "a")])
 
-    def test_the_credentials_land_before_the_rebuild_that_starts_vector(self) -> None:
-        """Vector refuses to start without ${LOGS_ENDPOINT}, and a unit that
-        fails to start fails the whole `nixos-rebuild switch`."""
+    def test_the_credentials_land_before_the_rebuild_that_starts_the_shipper(self) -> None:
+        """The shipper's unit requires logs.env (EnvironmentFile without
+        "-"), so it must be on the node before the rebuild installs it."""
         steps = plan(_config(), _converged_state(rev="old-rev"), self._observed("sha"), env=_env(_ON))
         self.assertEqual(
             [s.action for s in steps], [Action.ENSURE_LOGS_ENV, Action.PUSH_CONFIG, Action.REBUILD]
@@ -171,8 +173,7 @@ class EnsureLogsEnvTests(unittest.TestCase):
     _TMP_CMD = "set -eu; install -m 0600 -o root -g root /dev/null /var/lib/stackbase/logs.env.new"
     _CAT_CMD = "set -eu; cat > /var/lib/stackbase/logs.env.new"
     _MV_CMD = "set -eu; mv -f /var/lib/stackbase/logs.env.new /var/lib/stackbase/logs.env"
-    _RESTART_CMD = "set -eu; if systemctl is-active --quiet vector.service; then systemctl restart vector.service; fi"
-    _COMMANDS = (_DIR_CMD, _TMP_CMD, _CAT_CMD, _MV_CMD, _RESTART_CMD)
+    _COMMANDS = (_DIR_CMD, _TMP_CMD, _CAT_CMD, _MV_CMD)
 
     def _ctx(self, infra_dir, *, failing: str | None = None, secrets=None, state=None):
         def handler(argv, kwargs):
@@ -192,7 +193,9 @@ class EnsureLogsEnvTests(unittest.TestCase):
             env=_env(_ON),
         )
 
-    def test_pushes_root_only_through_stdin_then_restarts_a_running_vector(self) -> None:
+    def test_pushes_root_only_through_stdin_and_restarts_nothing(self) -> None:
+        """The shipper is a timer-driven oneshot: its next run reads the new
+        file, so there is no long-running unit to restart."""
         with Infra() as infra_dir:
             ctx, lines = self._ctx(infra_dir)
 

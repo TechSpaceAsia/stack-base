@@ -1,15 +1,16 @@
-"""Logs off-box: Vector's R2 credentials, laptop side.
+"""Logs off-box: the log shipper's R2 credentials, laptop side.
 
-The shipping runs entirely on the node (`nixos/logs.nix`: journald ->
-Vector -> R2, with a disk buffer and end-to-end acknowledgements). This
-module renders the one credentials file Vector needs,
+The shipping runs entirely on the node (`nixos/logs.nix`: the
+`stackbase-logs` timer runs `nixos/log-shipper.py`, which reads the journal
+after a saved cursor, uploads with rclone and reads each object back before
+moving the cursor). This module renders the one credentials file it needs,
 `/var/lib/stackbase/logs.env`, pushed by the ENSURE_LOGS_ENV step, and
 decides whether logs are on for an environment at all.
 
 The credentials are the environment's own `logs_access_key_id` and
 `logs_secret_access_key` -- a token scoped to the logs bucket, never the
 backup one -- plus the shared `r2_endpoint`. They are rendered as the
-variables Vector's AWS credential chain and its config interpolation read
+variables rclone's AWS env-auth and the unit's endpoint wrapper read
 (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `LOGS_ENDPOINT`), so no key
 ever enters the Nix store, which is world-readable.
 """
@@ -24,9 +25,10 @@ from stackbase.errors import StackError
 
 LOGS_ENV_PATH = "/var/lib/stackbase/logs.env"
 
-LOGS_UNIT = "vector.service"
+# The shipper's oneshot unit (its timer is `stackbase-logs.timer`).
+LOGS_UNIT = "stackbase-logs.service"
 
-# secrets keys -> the variables nixos/logs.nix's Vector reads, in the order
+# secrets keys -> the variables nixos/logs.nix's shipper unit reads, in the order
 # they are written. Values are held to the same allowlist as backup.env's
 # (`stackbase.backups.checked_credential`).
 _LOGS_KEYS: tuple[tuple[str, str], ...] = (
@@ -70,11 +72,10 @@ def logs_env_digest(content: str) -> str:
 def check_logs_credentials(env: Environment, logs_env_sha: str | None) -> None:
     """Refuse when logs are on but the credentials are incomplete.
 
-    A refusal, not a warning like `check_backup_credentials`: Vector's
-    config reads `${LOGS_ENDPOINT}`, so without logs.env the unit cannot
-    start, and a unit that fails to start fails the whole `nixos-rebuild
-    switch` -- the server would be left half-deployed. Under `--plan` too:
-    it is a statement about the configuration.
+    A refusal, not a warning like `check_backup_credentials`: the shipper
+    unit requires logs.env and its endpoint, so without them every run
+    fails and nothing leaves the server. Under `--plan` too: it is a
+    statement about the configuration.
     """
     if not logs_enabled(env.logs) or logs_env_sha is not None:
         return
@@ -83,7 +84,7 @@ def check_logs_credentials(env: Environment, logs_env_sha: str | None) -> None:
     env_flag = "" if env.implicit else f" --env {env.name}"
     raise StackError(
         f'[logs] bucket = "{env.logs.bucket}" is set but infra/{where} has no complete set of logs '
-        "credentials, so Vector could not start on the servers",
+        "credentials, so the log shipper could not run on the servers",
         f"set all three of {keys} (`./infra/up{env_flag} secrets set <key>`; the access key pair is an "
         "R2 token scoped to the logs bucket) and run `up` again, or set `enabled = false` in [logs] "
         "to leave logs off",

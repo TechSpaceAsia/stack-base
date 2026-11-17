@@ -378,7 +378,7 @@ _ENV_FACTS = (
     " backupsRetentionDays = node.config.stackbase.backups.retentionDays;"
     " logsEnable = node.config.stackbase.logs.enable;"
     " logsBucket = node.config.stackbase.logs.bucket;"
-    " vectorEnable = node.config.services.vector.enable;"
+    " logsTimerEnable = node.config.systemd.timers.\"stackbase-logs\".enable or false;"
     " alertsTo = node.config.stackbase.alerts.to;"
     " nullmailerEnable = node.config.services.nullmailer.enable;"
     " deployKeys = node.config.stackbase.deploy.keys;"
@@ -428,7 +428,7 @@ class TemplateEnvironmentsTests(unittest.TestCase):
 
     def test_logs_bucket_env_override(self) -> None:
         """[environments.<env>] logs.bucket wins over the shared [logs] table,
-        and naming a bucket is what turns Vector on."""
+        and naming a bucket is what turns the log shipper on."""
         with TemporaryDirectory() as tmp:
             directory = Path(tmp)
             _instantiate_envs_template(directory)
@@ -440,7 +440,7 @@ class TemplateEnvironmentsTests(unittest.TestCase):
             self.assertEqual(production["logsBucket"], "acme-logs")
             for facts in (staging, production):
                 self.assertTrue(facts["logsEnable"])
-                self.assertTrue(facts["vectorEnable"])
+                self.assertTrue(facts["logsTimerEnable"])
 
     def test_environment_opt_out_beats_the_shared_buckets(self) -> None:
         """staging sets backups.enabled / logs.enabled = false and no bucket
@@ -463,13 +463,13 @@ class TemplateEnvironmentsTests(unittest.TestCase):
             self.assertFalse(staging["backupsEnable"])
             self.assertEqual(staging["backupsBucket"], "")
             self.assertFalse(staging["logsEnable"])
-            self.assertFalse(staging["vectorEnable"])
+            self.assertFalse(staging["logsTimerEnable"])
             self.assertTrue(production["backupsEnable"])
             self.assertEqual(production["backupsBucket"], "acme-backups")
             self.assertTrue(production["logsEnable"])
             self.assertEqual(production["logsBucket"], "acme-logs")
 
-    def test_logs_enabled_false_turns_vector_off_even_with_a_bucket(self) -> None:
+    def test_logs_enabled_false_turns_the_shipper_off_even_with_a_bucket(self) -> None:
         with TemporaryDirectory() as tmp:
             directory = Path(tmp)
             _instantiate_template(directory)
@@ -480,7 +480,7 @@ class TemplateEnvironmentsTests(unittest.TestCase):
             facts = _nix_eval_attr(directory, "nixosConfigurations.a", _ENV_FACTS)
 
             self.assertFalse(facts["logsEnable"])
-            self.assertFalse(facts["vectorEnable"])
+            self.assertFalse(facts["logsTimerEnable"])
 
     def test_alerts_to_env_override(self) -> None:
         """[environments.<env>] alerts.to wins over the shared [alerts] table,
@@ -549,10 +549,10 @@ class TemplateEnvironmentsTests(unittest.TestCase):
             self.assertEqual(facts["hostName"], "a")
             self.assertEqual(facts["environment"], "")
             self.assertEqual(facts["domain"], "acme.example.com")
-            # No [logs] table: no Vector, exactly as before logs existed.
+            # No [logs] table: no shipper, exactly as before logs existed.
             self.assertFalse(facts["logsEnable"])
             self.assertEqual(facts["logsBucket"], "")
-            self.assertFalse(facts["vectorEnable"])
+            self.assertFalse(facts["logsTimerEnable"])
             # No [alerts] table: no nullmailer, no drop-in, no watchdog.
             self.assertEqual(facts["alertsTo"], [])
             self.assertFalse(facts["nullmailerEnable"])
@@ -728,10 +728,10 @@ class ProjectDeployKeyTests(unittest.TestCase):
 
 
 @unittest.skipIf(_NIX is None, "nix is not installed")
-class VectorSettingsTests(unittest.TestCase):
-    """nixos/logs.nix renders the approved Vector design verbatim (Brief D).
-    The VM test (tests/vm-logs.nix) proves the behaviour; this pins the
-    values, fast, so a drive-by edit to one of them is caught."""
+class LogShipperUnitTests(unittest.TestCase):
+    """nixos/logs.nix wires nixos/log-shipper.py as a oneshot on a timer
+    (plan 05). The VM test (tests/vm-logs.nix) proves the behaviour; this
+    pins the wiring, fast, so a drive-by edit to one value is caught."""
 
     def _eval(self, apply_fn: str, extra: str = 'stackbase.logs.bucket = "acme-logs";') -> Any:
         result = _eval_mk_node(apply_fn, provider="null", extra_config=f"stackbase.admins.matt = \"k\"; {extra}")
@@ -739,76 +739,94 @@ class VectorSettingsTests(unittest.TestCase):
             raise AssertionError(f"nix eval failed:\n{result.stderr}")
         return json.loads(result.stdout)
 
-    def test_vector_settings_match_the_spec(self) -> None:
-        settings = self._eval("node.config.services.vector.settings")
+    _FACTS = (
+        "let s = node.config.systemd.services.\"stackbase-logs\";"
+        " t = node.config.systemd.timers.\"stackbase-logs\"; in {"
+        " sc = s.serviceConfig;"
+        " env = s.environment;"
+        " path = map (p: p.pname or p.name) s.path;"
+        " timer = t.timerConfig;"
+        " timerWantedBy = t.wantedBy;"
+        " user = node.config.users.users.\"stackbase-logs\".isSystemUser;"
+        " group = node.config.users.users.\"stackbase-logs\".group;"
+        " groupExists = node.config.users.groups ? \"stackbase-logs\";"
+        " vector = node.config.services.vector.enable;"
+        " }"
+    )
 
-        self.assertEqual(settings["data_dir"], "/var/lib/vector")
-        self.assertEqual(settings["api"], {"enabled": True, "address": "127.0.0.1:8686"})
-        journal = settings["sources"]["journal"]
-        self.assertEqual(journal["type"], "journald")
-        self.assertIs(journal["current_boot_only"], False)
-        self.assertIs(journal["since_now"], False)
-        self.assertEqual(journal["exclude_units"], ["vector.service"])
-        self.assertIs(journal["emit_cursor"], True)
+    def test_the_service_runs_the_shipper_as_a_hardened_oneshot(self) -> None:
+        facts = self._eval(self._FACTS)
+        sc = facts["sc"]
+        self.assertEqual(sc["Type"], "oneshot")
+        self.assertIn("log-shipper.py", sc["ExecStart"])
+        self.assertEqual(sc["EnvironmentFile"], "/var/lib/stackbase/logs.env")
+        self.assertEqual(sc["User"], "stackbase-logs")
+        self.assertEqual(sc["Group"], "stackbase-logs")
+        self.assertNotIn("DynamicUser", sc)
+        self.assertEqual(sc["StateDirectory"], "stackbase-logs")
+        self.assertEqual(sc["StateDirectoryMode"], "0700")
+        self.assertIn("systemd-journal", sc["SupplementaryGroups"])
+        self.assertEqual(sc["ProtectSystem"], "strict")
+        self.assertIs(sc["ProtectHome"], True)
+        self.assertIs(sc["PrivateTmp"], True)
+        self.assertIs(sc["NoNewPrivileges"], True)
+        self.assertEqual(str(sc["TimeoutStartSec"]), "600")
+        self.assertEqual(sc["Nice"], 10)
+        self.assertEqual(sc["IOSchedulingClass"], "idle")
+        self.assertIn("systemd", facts["path"])
+        self.assertIn("rclone", facts["path"])
+        self.assertTrue(facts["user"])
+        self.assertEqual(facts["group"], "stackbase-logs")
+        self.assertTrue(facts["groupExists"])
+        self.assertFalse(facts["vector"])
 
-        remap = settings["transforms"]["slim"]
-        self.assertEqual(remap["inputs"], ["journal"])
-        for field in ("timestamp", "host", "unit", "ident", "pid", "priority", "message", "boot_id", "cursor"):
-            self.assertIn(f'"{field}"', remap["source"])
-        self.assertIn("compact(", remap["source"])
+    def test_rclone_is_configured_only_through_the_environment(self) -> None:
+        env = self._eval(self._FACTS)["env"]
+        self.assertEqual(env["LOGS_BUCKET"], "acme-logs")
+        self.assertEqual(env["LOGS_STATE"], "/var/lib/stackbase-logs")
+        self.assertEqual(env["LOGS_EXCLUDE_UNIT"], "stackbase-logs.service")
+        self.assertEqual(env["RCLONE_CONFIG_LOGS_TYPE"], "s3")
+        self.assertEqual(env["RCLONE_CONFIG_LOGS_PROVIDER"], "Cloudflare")
+        self.assertEqual(env["RCLONE_CONFIG_LOGS_ENV_AUTH"], "true")
+        self.assertEqual(env["RCLONE_CONFIG_LOGS_REGION"], "auto")
+        self.assertEqual(env["RCLONE_CONFIG_LOGS_NO_CHECK_BUCKET"], "true")
+        # The endpoint comes from logs.env at run time (the wrapper exports
+        # it); systemd does not expand variables inside Environment=.
+        self.assertNotIn("RCLONE_CONFIG_LOGS_ENDPOINT", env)
+        for value in env.values():
+            self.assertNotIn("AWS_", str(value))
 
-        r2 = settings["sinks"]["r2"]
-        self.assertEqual(r2["type"], "aws_s3")
-        self.assertEqual(r2["bucket"], "acme-logs")
-        self.assertEqual(r2["region"], "auto")
-        self.assertEqual(r2["endpoint"], "${LOGS_ENDPOINT}")
-        self.assertIs(r2["force_path_style"], True)
-        self.assertEqual(r2["key_prefix"], "journal/{{ host }}/%Y/%m/%d/%H/")
-        self.assertIs(r2["filename_append_uuid"], True)
-        self.assertEqual(r2["filename_extension"], "ndjson.gz")
-        self.assertEqual(r2["compression"], "gzip")
-        self.assertEqual(r2["encoding"], {"codec": "json"})
-        self.assertEqual(r2["framing"], {"method": "newline_delimited"})
-        self.assertEqual(r2["batch"], {"timeout_secs": 15, "max_bytes": 67108864})
-        self.assertEqual(r2["buffer"], {"type": "disk", "max_size": 1073741824, "when_full": "block"})
-        self.assertEqual(r2["acknowledgements"], {"enabled": True})
-        self.assertEqual(r2["request"], {"concurrency": "adaptive"})
-        self.assertEqual(r2["healthcheck"], {"enabled": True})
-        for forbidden in ("storage_class", "acl", "server_side_encryption", "ssekms_key_id", "grant_full_control"):
-            self.assertNotIn(forbidden, r2)
-
-        local = settings["sinks"]["local"]
-        self.assertEqual(local["type"], "file")
-        self.assertEqual(local["path"], "/var/log/vector/%Y-%m-%d/%H.ndjson")
-        self.assertEqual(local["buffer"], {"type": "memory", "max_events": 10000, "when_full": "drop_newest"})
-
-        self.assertEqual(settings["sources"]["vector_metrics"], {"type": "internal_metrics"})
-        self.assertEqual(
-            settings["sinks"]["metrics"],
-            {"type": "prometheus_exporter", "inputs": ["vector_metrics"], "address": "127.0.0.1:9598"},
+    def test_the_timer_runs_every_interval(self) -> None:
+        facts = self._eval(self._FACTS)
+        self.assertEqual(facts["timer"]["OnBootSec"], "60s")
+        self.assertEqual(facts["timer"]["OnUnitInactiveSec"], "60s")
+        self.assertEqual(facts["timer"]["AccuracySec"], "5s")
+        self.assertIn("timers.target", facts["timerWantedBy"])
+        custom = self._eval(
+            'node.config.systemd.timers."stackbase-logs".timerConfig',
+            'stackbase.logs.bucket = "b2"; stackbase.logs.intervalSeconds = 300;',
         )
+        self.assertEqual(custom["OnUnitInactiveSec"], "300s")
+        self.assertEqual(custom["OnBootSec"], "300s")
 
-    def test_the_unit_reads_the_credentials_file_and_the_local_copy_ages_out(self) -> None:
+    def test_no_bucket_means_no_unit(self) -> None:
         facts = self._eval(
-            "{"
-            " env = node.config.systemd.services.vector.serviceConfig.EnvironmentFile;"
-            " rw = node.config.systemd.services.vector.serviceConfig.ReadWritePaths;"
-            " rules = node.config.systemd.tmpfiles.rules;"
-            " journaldAccess = node.config.services.vector.journaldAccess;"
-            " }"
+            "{ s = node.config.systemd.services ? \"stackbase-logs\";"
+            " t = node.config.systemd.timers ? \"stackbase-logs\"; }",
+            "",
         )
-        self.assertEqual(facts["env"], "/var/lib/stackbase/logs.env")
-        self.assertIn("/var/log/vector", facts["rw"])
-        self.assertIn("d /var/log/vector 0750 vector vector 3d", facts["rules"])
-        self.assertTrue(facts["journaldAccess"])
+        self.assertEqual(facts, {"s": False, "t": False})
 
-    def test_batch_seconds_and_buffer_bytes_are_options(self) -> None:
-        r2 = self._eval(
-            "node.config.services.vector.settings.sinks.r2",
-            'stackbase.logs.bucket = "b2"; stackbase.logs.batchSeconds = 5; stackbase.logs.bufferBytes = 268435488;',
-        )
-        self.assertEqual(r2["batch"]["timeout_secs"], 5)
-        self.assertEqual(r2["buffer"]["max_size"], 268435488)
+    def test_removed_vector_options_fail_with_a_pointer(self) -> None:
+        for option in ("bufferBytes = 268435456", "batchSeconds = 5", "localDays = 3"):
+            with self.subTest(option=option):
+                result = _eval_mk_node(
+                    "node.config.system.build.toplevel.drvPath",
+                    provider="null",
+                    extra_config=f'stackbase.admins.matt = "k"; stackbase.logs.bucket = "b"; stackbase.logs.{option};',
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("stackbase-logs timer", result.stderr)
 
     def test_journald_keeps_seven_days_and_syncs_every_five_seconds(self) -> None:
         conf = self._eval('node.config.environment.etc."systemd/journald.conf".text', "")
