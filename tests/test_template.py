@@ -897,9 +897,11 @@ class AlertsSettingsTests(unittest.TestCase):
         self.assertIn("stackbase-alert-remotes.service", facts["nullmailerRequires"])
         self.assertEqual(facts["timer"], "hourly")
         self.assertEqual(facts["freshnessEnv"]["GRACE_SECONDS"], "3600")
-        self.assertEqual(facts["freshnessEnv"]["BUFFER_ALERT_BYTES"], "268435456")
         self.assertEqual(facts["freshnessEnv"]["BACKUP_MAX_AGE_SECONDS"], str(36 * 3600))
-        self.assertEqual(facts["freshnessEnv"]["SENT_STALL_SECONDS"], str(2 * 3600))
+        self.assertEqual(facts["freshnessEnv"]["LOGS_MAX_AGE_SECONDS"], "900")
+        # Vector's metrics are gone: nothing reads a buffer or a counter.
+        self.assertNotIn("BUFFER_ALERT_BYTES", facts["freshnessEnv"])
+        self.assertNotIn("SENT_STALL_SECONDS", facts["freshnessEnv"])
         # Backups and logs are off on this node: neither check runs.
         self.assertEqual(facts["freshnessEnv"]["CHECK_BACKUPS"], "0")
         self.assertEqual(facts["freshnessEnv"]["CHECK_LOGS"], "0")
@@ -916,6 +918,32 @@ class AlertsSettingsTests(unittest.TestCase):
             self._ON + ' stackbase.backups.bucket = "b"; stackbase.backups.enable = false;',
         )
         self.assertEqual(opted_out["CHECK_BACKUPS"], "0")
+
+    def test_the_logs_age_limit_is_settable(self) -> None:
+        env = self._eval(
+            "node.config.systemd.services.stackbase-freshness.environment",
+            self._ON + ' stackbase.logs.bucket = "l"; stackbase.alerts.logsMaxAgeSeconds = 120;',
+        )
+        self.assertEqual(env["LOGS_MAX_AGE_SECONDS"], "120")
+
+    def test_the_logs_clock_starts_when_shipping_is_turned_on(self) -> None:
+        """Before the first upload the watchdog counts from enabled-at, made
+        by tmpfiles with the same owner and mode as the unit's
+        StateDirectory, so neither fights the other."""
+        rules = self._eval("node.config.systemd.tmpfiles.rules", self._ON + ' stackbase.logs.bucket = "l";')
+        self.assertIn("d /var/lib/stackbase-logs 0700 stackbase-logs stackbase-logs -", rules)
+        self.assertIn("f /var/lib/stackbase-logs/enabled-at 0600 stackbase-logs stackbase-logs -", rules)
+        off = self._eval("node.config.systemd.tmpfiles.rules", self._ON)
+        self.assertFalse([r for r in off if "stackbase-logs" in r], off)
+
+    def test_the_removed_buffer_alert_option_fails_with_a_pointer(self) -> None:
+        result = _eval_mk_node(
+            "node.config.system.build.toplevel.drvPath",
+            provider="null",
+            extra_config='stackbase.admins.matt = "k"; ' + self._ON + " stackbase.alerts.bufferAlertBytes = 65536;",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stackbase-logs timer", result.stderr)
 
     def test_a_recipient_must_be_one_address(self) -> None:
         """`to` lands in a To: header: a newline there would inject another header."""

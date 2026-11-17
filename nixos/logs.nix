@@ -160,6 +160,16 @@ in
       };
     };
 
+    # enabled-at: when shipping was turned on, which the alert watchdog
+    # (nixos/alerts.nix) counts from until the first `last-success`.
+    # Created once, never touched again. The directory line repeats the
+    # unit's StateDirectory owner and mode exactly, so tmpfiles and systemd
+    # never correct each other.
+    systemd.tmpfiles.rules = [
+      "d ${stateDir} 0700 ${unitName} ${unitName} -"
+      "f ${stateDir}/enabled-at 0600 ${unitName} ${unitName} -"
+    ];
+
     systemd.timers.${unitName} = {
       wantedBy = [ "timers.target" ];
       timerConfig = {

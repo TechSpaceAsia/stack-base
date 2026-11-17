@@ -4,7 +4,9 @@
 # trusts -- the same `--tls`, CA-verified path a real relay is reached by.
 # It proves: any failed unit mails, the handler cannot recurse, mail raised
 # while the relay is down is queued and delivered later, one mail per unit
-# per interval, and the freshness watchdog's grace, buffer and backup checks.
+# per interval, and the freshness watchdog's grace, log-shipping and backup
+# checks. The shipper really runs against MinIO, so the stamp the watchdog
+# reads is the one stackbase-logs.service writes.
 #
 # Iterate on it alone with:
 #   nix build .#checks.x86_64-linux.vm-alerts -L
@@ -50,10 +52,6 @@ let
     SMTP_PASSWORD=${smtpPassword}
     SMTP_FROM=${smtpFrom}
   '';
-
-  # Low enough that a short burst of journal lines with MinIO stopped
-  # passes it (production: 256 MiB).
-  bufferAlertBytes = 65536;
 in
 pkgs.testers.runNixOSTest {
   name = "stackbase-vm-alerts";
@@ -75,13 +73,11 @@ pkgs.testers.runNixOSTest {
       stackbase.admins.deploy = adminKey;
 
       stackbase.alerts.to = recipients;
-      stackbase.alerts.bufferAlertBytes = bufferAlertBytes;
       # Retry quickly once the relay is back; production waits 60 s.
       stackbase.alerts.retrySeconds = 3;
       stackbase.alerts.maxRetrySeconds = 6;
 
       stackbase.logs.bucket = "logs";
-      stackbase.logs.batchSeconds = 5;
       # The watchdog's backup check needs backups configured; the unit
       # itself never runs here.
       stackbase.backups.bucket = "unused";
@@ -104,8 +100,8 @@ pkgs.testers.runNixOSTest {
 
       systemd.services.stackbase-test-env-files = {
         wantedBy = [ "multi-user.target" ];
-        before = [ "vector.service" "stackbase-alert-remotes.service" ];
-        requiredBy = [ "vector.service" "stackbase-alert-remotes.service" ];
+        before = [ "stackbase-logs.service" "stackbase-alert-remotes.service" ];
+        requiredBy = [ "stackbase-logs.service" "stackbase-alert-remotes.service" ];
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
@@ -128,7 +124,7 @@ pkgs.testers.runNixOSTest {
     start_all()
     node.wait_for_unit("multi-user.target")
     ${minio.createBucket "node" "logs"}
-    node.wait_for_unit("vector.service")
+    node.wait_for_unit("stackbase-logs.timer")
     node.wait_for_unit("nullmailer.service")
     node.wait_for_unit("mailpit-sink.service")
     node.wait_for_open_port(${toString smtpPort})
@@ -267,17 +263,58 @@ pkgs.testers.runNixOSTest {
         )
 
 
+    LOGS = "/var/lib/stackbase-logs"
+
+
+    def stop_shipper():
+        """No shipper run from here on until start_shipper(): the stamps the
+        test writes are then the only ones."""
+        node.succeed("systemctl stop stackbase-logs.timer")
+        node.wait_until_succeeds(
+            "test \"$(systemctl show -p ActiveState --value stackbase-logs.service)\" != activating"
+        )
+
+
+    def start_shipper():
+        node.succeed("systemctl start stackbase-logs.timer")
+
+
+    def logs_stamp(age_seconds):
+        node.succeed(f"echo $(( $(date +%s) - {age_seconds} )) > {LOGS}/last-success")
+
+
+    def allow_another_mail():
+        node.succeed("rm -f /var/lib/stackbase-alert/stackbase-freshness.service")
+
+
+    def last_problem(prefix):
+        """The watchdog's newest '✗ <prefix>...' line, from its journal."""
+        out = node.succeed(
+            f"journalctl -u stackbase-freshness -o cat --no-pager | grep '^✗ {prefix}' | tail -1"
+        ).strip()
+        assert out, f"no watchdog line starting '✗ {prefix}'"
+        return out
+
+
+    with subtest("the shipper writes the stamp the watchdog reads"):
+        # Created at boot by tmpfiles, with the StateDirectory's owner and
+        # mode, so neither corrects the other.
+        node.succeed(f"test \"$(stat -c '%U %G %a' {LOGS})\" = 'stackbase-logs stackbase-logs 700'")
+        node.succeed(f"test \"$(stat -c '%U %G %a' {LOGS}/enabled-at)\" = 'stackbase-logs stackbase-logs 600'")
+        # The timer's first run (60 s after boot) ships and stamps.
+        node.wait_until_succeeds(f"test -s {LOGS}/last-success", timeout=240)
+        node.fail("systemctl is-failed --quiet stackbase-logs.service")
+
     with subtest("test_watchdog_grace_after_boot"):
         # Something it would flag -- and it still passes, being inside the
         # first hour after boot.
-        node.succeed("systemctl stop vector.service")
+        stop_shipper()
+        logs_stamp(1000)
         assert run_freshness(), "the watchdog failed inside the grace"
         node.succeed("journalctl -u stackbase-freshness -o cat --no-pager | grep -q 'inside the 3600s grace'")
         time.sleep(3)
         assert FRESHNESS not in subjects(), subjects()
-        node.succeed("systemctl start vector.service")
-        node.wait_for_unit("vector.service")
-        node.wait_for_open_port(9598)
+        logs_stamp(0)
 
     # From here the watchdog checks: what the grace would otherwise hide.
     override(GRACE_SECONDS=0)
@@ -285,38 +322,46 @@ pkgs.testers.runNixOSTest {
     with subtest("the watchdog passes on a fresh node"):
         assert run_freshness(), node.succeed("journalctl -u stackbase-freshness -o cat --no-pager | tail -5")
 
-    with subtest("test_watchdog_alerts_on_buffer_growth"):
-        node.succeed("systemctl stop minio.service")
-        node.succeed("for i in $(seq 1 5000); do echo \"buffer-probe-$i $(head -c 200 /dev/zero | tr '\\0' x)\"; done | systemd-cat -t probe")
+    with subtest("test_watchdog_alerts_on_stale_logs"):
+        # The shipper's last success 1000 s ago, past the 900 s default.
+        logs_stamp(1000)
+        allow_another_mail()
+        assert not run_freshness(), "the watchdog passed with no log upload for 1000 s"
+        line = last_problem("logs: ")
+        assert line.startswith("✗ logs: no log upload has succeeded since "), line
+        assert line.endswith(", more than 15 min ago -- see journalctl -u stackbase-logs"), line
+        wait_freshness_mail("logs: no log upload has succeeded since")
+        # Restored, it passes again...
+        logs_stamp(0)
+        assert run_freshness(), "the watchdog failed with a fresh log stamp"
+        # ...and so it does after a real shipper run from a stale stamp:
+        # the stamp the shipper writes is the one the watchdog reads.
+        logs_stamp(1000)
+        node.succeed("systemctl start stackbase-logs.service")
+        assert run_freshness(), node.succeed("journalctl -u stackbase-freshness -o cat --no-pager | tail -5")
 
-
-        def buffered():
-            metrics = node.succeed("curl -sf http://127.0.0.1:9598/metrics")
-            return sum(
-                float(line.rsplit("}", 1)[1].split()[0])
-                for line in metrics.splitlines()
-                if line.startswith("vector_buffer_byte_size{") and 'component_id="r2"' in line
-            )
-
-
-        deadline = time.monotonic() + 120
-        while buffered() <= ${toString bufferAlertBytes}:
-            assert time.monotonic() < deadline, f"the R2 buffer never passed the threshold ({buffered()})"
-            time.sleep(2)
-        print(f"R2 buffer holds {buffered():.0f} bytes")
-        assert not run_freshness(), "the watchdog passed with a growing buffer"
-        text = body(wait_for_mail(FRESHNESS))
-        assert "waiting in Vector's R2 buffer" in text, text
-        node.succeed("systemctl start minio.service")
-        node.wait_for_open_port(${toString minio.port})
+    with subtest("test_watchdog_logs_clock_fails_closed"):
+        # Neither stamp: the watchdog starts the clock now (with the
+        # shipper's owner and mode) instead of staying silent forever...
+        node.succeed(f"rm -f {LOGS}/last-success {LOGS}/enabled-at")
+        assert run_freshness(), "the watchdog failed with the logs clock just started"
+        node.succeed(f"test \"$(stat -c '%U %G %a' {LOGS}/enabled-at)\" = 'stackbase-logs stackbase-logs 600'")
+        node.succeed("journalctl -u stackbase-freshness -o cat --no-pager | grep -q 'no log upload stamp yet: counting from now'")
+        # ...and 16 min later, with still no success, it says so.
+        node.succeed(f"touch -d '16 minutes ago' {LOGS}/enabled-at")
+        allow_another_mail()
+        assert not run_freshness(), "the watchdog passed with no log upload in 16 min"
+        line = last_problem("logs: ")
+        assert line.startswith("✗ logs: no log upload has succeeded yet; log shipping was turned on at "), line
+        assert line.endswith(", more than 15 min ago -- see journalctl -u stackbase-logs"), line
+        wait_freshness_mail("logs: no log upload has succeeded yet")
+        logs_stamp(0)
 
     with subtest("the watchdog alerts on a stale backup"):
-        # Once the buffer has drained the watchdog passes again (its failures
-        # meanwhile are not mailed: the 6 h stamp from the mail above)...
-        node.wait_until_succeeds("systemctl start stackbase-freshness.service", timeout=180)
-        # ...then make the newest success 37 h old, and allow a second mail.
+        assert run_freshness(), node.succeed("journalctl -u stackbase-freshness -o cat --no-pager | tail -5")
+        # Make the newest success 37 h old, and allow another mail.
         node.succeed("echo $(( $(date +%s) - 37 * 3600 )) > /var/lib/stackbase-backup/last-success")
-        node.succeed("rm -f /var/lib/stackbase-alert/stackbase-freshness.service")
+        allow_another_mail()
         before = subjects().count(FRESHNESS)
         assert not run_freshness(), "the watchdog passed with a 37 h old backup"
         node.wait_until_succeeds(
@@ -326,69 +371,18 @@ pkgs.testers.runNixOSTest {
         newest = next(m for m in mails() if m["Subject"] == FRESHNESS)
         assert "backups: the newest successful backup" in body(newest), body(newest)
 
-    with subtest("test_watchdog_alerts_on_sent_stall"):
-        # A 20 s stall window instead of 2 h, through the same runtime
-        # override as the grace; the backup is fresh, so only Vector can fail.
-        override(GRACE_SECONDS=0, SENT_STALL_SECONDS=20)
-        node.succeed("date +%s > /var/lib/stackbase-backup/last-success")
-        node.succeed("rm -f /var/lib/stackbase-freshness/r2-samples /var/lib/stackbase-alert/stackbase-freshness.service")
-        node.succeed("systemctl stop minio.service")
-
-
-        def r2_counter(name):
-            metrics = node.succeed("curl -sf http://127.0.0.1:9598/metrics")
-            return sum(
-                float(line.rsplit("}", 1)[1].split()[0])
-                for line in metrics.splitlines()
-                if line.startswith(name + "{") and 'component_id="r2"' in line
-            )
-
-
-        names = ("vector_component_sent_events_total", "vector_buffer_received_events_total",
-                 "vector_component_received_events_total")
-        # A request already in flight when MinIO stopped can still complete;
-        # take the baseline only once `sent` has held still for 10 s.
-        deadline = time.monotonic() + 120
-        last, since = r2_counter(names[0]), time.monotonic()
-        while time.monotonic() - since < 10:
-            assert time.monotonic() < deadline, "sent never settled with MinIO stopped"
-            time.sleep(1)
-            now_sent = r2_counter(names[0])
-            if now_sent != last:
-                last, since = now_sent, time.monotonic()
-        run_freshness()  # the baseline sample, taken with R2 down and sent flat
-        before = {n: r2_counter(n) for n in names}
-        node.succeed("for i in $(seq 1 200); do logger -t stall stall-probe-$i; done")
-        time.sleep(25)
-        # Recorded for the sink's own received counter: once sent has
-        # settled it stays flat with it (observed delta 0), which is why the
-        # watchdog reads the buffer's received counter instead -- with the
-        # sink's, the alert below would never fire.
-        print("r2 counter deltas during the outage: "
-              + ", ".join(f"{n}={r2_counter(n) - before[n]:.0f}" for n in names))
-        assert r2_counter(names[0]) == before[names[0]], "something reached R2 with MinIO stopped"
-        assert r2_counter(names[1]) > before[names[1]], "no new entries entered the R2 buffer"
-        assert not run_freshness(), "the watchdog passed with nothing sent for longer than the window"
-        wait_freshness_mail("Vector has sent nothing to R2 since")
-        node.succeed("systemctl start minio.service")
-        node.wait_for_open_port(${toString minio.port})
-        override(GRACE_SECONDS=0)
-
     with subtest("test_watchdog_backup_clock_fails_closed"):
         # Neither stamp: the watchdog starts the clock now instead of staying
         # silent forever...
         node.succeed("rm -f /var/lib/stackbase-backup/last-success /var/lib/stackbase-backup/enabled-at")
-        node.succeed("rm -f /var/lib/stackbase-freshness/r2-samples")
-        node.wait_until_succeeds(
-            "systemctl reset-failed stackbase-freshness.service; systemctl start stackbase-freshness.service",
-            timeout=180,
-        )
+        assert run_freshness(), node.succeed("journalctl -u stackbase-freshness -o cat --no-pager | tail -5")
         node.succeed("test -e /var/lib/stackbase-backup/enabled-at")
         node.succeed("journalctl -u stackbase-freshness -o cat --no-pager | grep -q 'no backup stamp yet: counting from now'")
         # ...and 36 h later, with still no success, it says so.
         node.succeed("touch -d '37 hours ago' /var/lib/stackbase-backup/enabled-at")
-        node.succeed("rm -f /var/lib/stackbase-alert/stackbase-freshness.service")
+        allow_another_mail()
         assert not run_freshness(), "the watchdog passed with no backup in 37 h"
         wait_freshness_mail("no backup has succeeded yet")
+        start_shipper()
   '';
 }
