@@ -4,7 +4,7 @@
 #
 #   stackbase-logs.timer -> stackbase-logs.service (oneshot)
 #     journalctl -o json after the saved cursor -> nine fields per entry
-#     -> one gzipped NDJSON object per event-hour -> rclone rcat
+#     -> one gzipped NDJSON object per event-hour -> rclone copyto (one PUT)
 #     -> rclone cat + sha256 compare -> only then the cursor moves
 #
 # Objects land under `journal/<host>/%Y/%m/%d/%H/`, with the same fields
@@ -17,7 +17,9 @@
 # than the local journal's 7 days (base.nix) -- provided the journal does
 # not hit its SystemMaxUse=2G / SystemKeepFree=4G caps first: journald then
 # drops its oldest files, shipped or not. The script detects a cursor that
-# was rotated away and fails loudly rather than skipping silently.
+# was rotated away: it logs the gap, ships everything still readable, saves
+# its state, and then exits 1 for that one run, so the unit fails and the
+# OnFailure alert reports the lost logs. The next run exits 0 again.
 #
 # Why not Vector (what this module ran until v0.3.0): from 0.46 its S3 sink
 # sends two checksums and R2 rejects every upload

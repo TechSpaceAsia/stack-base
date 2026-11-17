@@ -121,14 +121,31 @@ class RealR2Tests(unittest.TestCase):
         if r.returncode != 0:
             print(f"cleanup: rclone delete failed: {r.stderr.decode(errors='replace')[-500:]}", file=sys.stderr)
 
-    # -- the test --
+    # -- the tests --
 
     def test_ships_to_real_r2_and_reads_back(self) -> None:
+        self._ship_and_check(3, lambda run_id, i: f"r2 probe {run_id} line {i}")
+
+    def test_ships_object_above_rclone_streaming_cutoff(self) -> None:
+        # rclone's --streaming-upload-cutoff is 100 KiB; a stdin upload above
+        # it turns multipart. The shipper uploads a file of known size
+        # (copyto: one PUT up to --s3-upload-cutoff). Random hex barely
+        # compresses, so this object is several hundred KiB after gzip --
+        # the size a backfill after an upgrade or an outage ships.
+        size = self._ship_and_check(
+            400, lambda run_id, i: f"r2 probe {run_id} line {i} " + os.urandom(1024).hex()
+        )
+        self.assertGreater(size, 100 * 1024, "object not above the 100 KiB streaming cutoff")
+
+    def _ship_and_check(self, count: int, message) -> int:
+        """Ship `count` fake entries through the real script; return the object's size."""
         run_id = str(uuid.uuid4())
         now_us = int(time.time() * 1_000_000) - 5_000_000
+        # Keep every entry in one UTC hour so exactly one object is written.
+        now_us = min(now_us, (now_us // 3_600_000_000 + 1) * 3_600_000_000 - count * 1000 - 1)
         entries = []
         expected = []
-        for i in range(1, 4):
+        for i in range(1, count + 1):
             us = now_us + i * 1000
             entry = {
                 "__CURSOR": f"s=r2probe{run_id.replace('-', '')};i={i:x}",
@@ -139,7 +156,7 @@ class RealR2Tests(unittest.TestCase):
                 "SYSLOG_IDENTIFIER": "r2-probe",
                 "_PID": str(1000 + i),
                 "PRIORITY": "6",
-                "MESSAGE": f"r2 probe {run_id} line {i}",
+                "MESSAGE": message(run_id, i),
                 "_CMDLINE": "/bin/r2-probe --not-shipped",
             }
             entries.append(entry)
@@ -152,7 +169,7 @@ class RealR2Tests(unittest.TestCase):
                     "ident": "r2-probe",
                     "pid": str(1000 + i),
                     "priority": "6",
-                    "message": f"r2 probe {run_id} line {i}",
+                    "message": entry["MESSAGE"],
                     "boot_id": "r2probeboot",
                     "cursor": entry["__CURSOR"],
                 }
@@ -183,6 +200,7 @@ class RealR2Tests(unittest.TestCase):
 
         self._purge()
         self.assertEqual(self._list(), [], f"{_PREFIX} is not empty after cleanup")
+        return len(got.stdout)
 
 
 if __name__ == "__main__":

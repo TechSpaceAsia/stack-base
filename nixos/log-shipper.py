@@ -10,11 +10,17 @@ Run by a systemd timer (nixos/logs.nix). Each run:
    consecutive entries by the UTC hour they happened in, and writes each
    group gzipped to `pending/` (fsync'd), capped at `max_object_bytes` of
    NDJSON per object.
-4. Uploads the group with `rclone rcat`, reads it back with `rclone cat` and
-   compares sha256. Only then is the spool deleted and the cursor of the
-   group's last entry saved (atomically). An upload R2 silently rejected can
+4. Uploads the sealed group with `rclone copyto` (known size, so one PUT --
+   never a multipart upload), reads it back with `rclone cat` and compares
+   sha256. Only then is the cursor of the group's last entry saved
+   (atomically) and the spool deleted. An upload R2 silently rejected can
    therefore never move the cursor -- the failure that retired Vector.
 5. Stops when caught up or after `max_run_seconds`; the next run continues.
+
+A gap in the journal (the saved cursor was rotated away before it was
+shipped) is logged and the run finishes normally, then `main()` exits 1 so
+the unit fails and its OnFailure alert reports the lost logs; the next run
+exits 0 again.
 
 Object keys and fields match what Vector wrote before (key prefix
 `journal/<host>/%Y/%m/%d/%H/`), so old archives and the README's search
@@ -40,13 +46,22 @@ import time
 import urllib.parse
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
 MAX_OBJECT_BYTES = 64 * 1024 * 1024
 MAX_RUN_SECONDS = 240.0
 REMOTE = "logs"
+
+# What journalctl prints per entry. JSON output adds __CURSOR,
+# __REALTIME_TIMESTAMP, __MONOTONIC_TIMESTAMP, __SEQNUM* and _BOOT_ID on its
+# own; everything else journald stores (_CMDLINE, _EXE, ...) stays on the
+# node instead of being parsed and thrown away.
+_OUTPUT_FIELDS = (
+    "MESSAGE,_HOSTNAME,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_PID,PRIORITY,_BOOT_ID,"
+    "_SOURCE_REALTIME_TIMESTAMP,CONTAINER_NAME,CONTAINER_ID,IMAGE_NAME"
+)
 
 # journald field -> output field. Order is the order written per line.
 _FIELDS = (
@@ -112,7 +127,7 @@ def _event_us(entry: dict) -> int | None:
 
 def _iso(us: int) -> str:
     secs, frac = divmod(us, 1_000_000)
-    return datetime.fromtimestamp(secs, UTC).strftime("%Y-%m-%dT%H:%M:%S") + f".{frac:06d}Z"
+    return datetime.fromtimestamp(secs, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + f".{frac:06d}Z"
 
 
 def slim(entry: dict) -> dict:
@@ -132,7 +147,7 @@ def _slim_us(slimmed: dict) -> int:
     ts = slimmed.get("timestamp")
     if ts:
         try:
-            dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+            dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
             return int(dt.timestamp()) * 1_000_000 + dt.microsecond
         except ValueError:
             pass
@@ -146,7 +161,7 @@ def object_key(host: str, first: dict, uid: str) -> str:
     picks the hour directory (an entry without one falls back to now).
     """
     secs = _slim_us(first) // 1_000_000
-    hour = datetime.fromtimestamp(secs, UTC).strftime("%Y/%m/%d/%H")
+    hour = datetime.fromtimestamp(secs, timezone.utc).strftime("%Y/%m/%d/%H")
     return f"journal/{host}/{hour}/{secs}-{uid}.ndjson.gz"
 
 
@@ -242,12 +257,19 @@ def _sha256_file(path: Path) -> str:
 
 def _upload_verified(cfg: Config, key: str, spool: Path) -> None:
     """Upload `spool` to `key` and prove it landed byte for byte; raise if not."""
-    with open(spool, "rb") as f:
-        put = subprocess.run(
-            ["rclone", "rcat", _dest(cfg, key)], stdin=f, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-        )
+    # copyto from a file, not rcat from stdin: with the size known up front
+    # rclone sends one PUT up to --s3-upload-cutoff (200 MiB, above the
+    # 64 MiB uncompressed cap), never a multipart upload. --no-check-dest:
+    # always upload -- a key retried after a bad read-back must be rewritten
+    # even if size and modtime happen to match.
+    put = subprocess.run(
+        ["rclone", "copyto", "--no-check-dest", str(spool), _dest(cfg, key)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
     if put.returncode != 0:
-        raise RuntimeError(f"upload of {key} failed (rclone rcat exit {put.returncode}): {_tail(put.stderr)}")
+        raise RuntimeError(f"upload of {key} failed (rclone copyto exit {put.returncode}): {_tail(put.stderr)}")
 
     h = hashlib.sha256()
     with tempfile.TemporaryFile() as err:
@@ -288,10 +310,12 @@ def _ship_pending(cfg: Config) -> int:
         _log(f"retrying spooled object {key}")
         cursor = _last_cursor_in_spool(p)
         _upload_verified(cfg, key, p)
-        p.unlink()
-        _fsync_dir(pdir)
+        # Cursor first: a crash before the unlink re-uploads the same key
+        # (idempotent) rather than shipping the entries again under a new one.
         if cursor:
             _save_cursor(cfg, cursor)
+        p.unlink()
+        _fsync_dir(pdir)
         shipped += 1
     return shipped
 
@@ -304,7 +328,23 @@ class _CursorGone(Exception):
     pass
 
 
-def _gap_warning(cursor: str, landed: str | None) -> None:
+class JournalGap(RuntimeError):
+    """Raised by run() AFTER a complete, successful run that found a gap.
+
+    Everything readable was shipped, the cursor saved and `last-success`
+    written; this only makes the run fail so the gap is reported.
+    """
+
+    def __init__(self, cursor: str, shipped: int) -> None:
+        super().__init__(
+            f"journal gap: saved cursor {cursor} was no longer in the journal, so entries "
+            f"between it and where reading resumed were lost before shipping ({shipped} object(s) shipped)"
+        )
+        self.shipped = shipped
+
+
+def _gap_warning(gaps: list[str], cursor: str, landed: str | None) -> None:
+    gaps.append(cursor)
     _log(
         f"saved cursor no longer in the journal ({cursor}): the journal was rotated or the "
         "cursor is unreadable, so entries between it and where reading resumes may be lost; "
@@ -312,7 +352,7 @@ def _gap_warning(cursor: str, landed: str | None) -> None:
     )
 
 
-def _journal(cursor: str | None) -> Iterator[dict]:
+def _journal(cursor: str | None, gaps: list[str]) -> Iterator[dict]:
     """Journal entries after `cursor` (or from the oldest), streamed.
 
     Reads with `--cursor`, not `--after-cursor`: for a well-formed cursor
@@ -323,7 +363,7 @@ def _journal(cursor: str | None) -> Iterator[dict]:
     journalctl cannot parse fails with "Failed to seek to cursor" and is
     handled by the caller.
     """
-    argv = ["journalctl", "--output=json", "--no-pager", "--all"]
+    argv = ["journalctl", "--output=json", f"--output-fields={_OUTPUT_FIELDS}", "--no-pager", "--all"]
     if cursor:
         argv.append(f"--cursor={cursor}")
     with tempfile.TemporaryFile() as err:
@@ -347,7 +387,7 @@ def _journal(cursor: str | None) -> Iterator[dict]:
                     first = _value(entry.get("__CURSOR"))
                     if first == cursor:
                         continue
-                    _gap_warning(cursor, first)
+                    _gap_warning(gaps, cursor, first)
                 yield entry
             finished = True
         finally:
@@ -405,18 +445,19 @@ class _Group:
 def _ship_group(cfg: Config, group: _Group) -> None:
     spool = group.seal()
     _upload_verified(cfg, group.key, spool)
-    spool.unlink()
-    _fsync_dir(spool.parent)
+    # Cursor first, as in _ship_pending.
     if group.cursor:
         _save_cursor(cfg, group.cursor)
+    spool.unlink()
+    _fsync_dir(spool.parent)
 
 
-def _ship_journal(cfg: Config, cursor: str | None, out_of_time: Callable[[], bool]) -> int:
+def _ship_journal(cfg: Config, cursor: str | None, out_of_time: Callable[[], bool], gaps: list[str]) -> int:
     shipped = 0
     group: _Group | None = None
     loose_cursor: str | None = None  # excluded entries read while no group was open
     try:
-        for entry in _journal(cursor):
+        for entry in _journal(cursor, gaps):
             entry_cursor = _value(entry.get("__CURSOR"))
             if _value(entry.get("_SYSTEMD_UNIT")) == cfg.exclude_unit:
                 if group is not None:
@@ -455,6 +496,9 @@ def run(cfg: Config, now: Callable[[], float] = time.monotonic) -> int:
 
     Raises on any upload, read-back or journalctl failure, leaving the
     cursor where it was and the unverified object spooled in `pending/`.
+    Raises JournalGap at the very end of an otherwise complete run (cursor
+    saved, `last-success` written) when the saved cursor had been rotated
+    away, so main() exits 1 and the loss is reported.
     """
     start = now()
 
@@ -465,15 +509,25 @@ def run(cfg: Config, now: Callable[[], float] = time.monotonic) -> int:
     pdir.mkdir(parents=True, exist_ok=True)
     shipped = _ship_pending(cfg)
 
+    gaps: list[str] = []
     if not out_of_time():
         cursor = _read_cursor(cfg)
         try:
-            shipped += _ship_journal(cfg, cursor, out_of_time)
-        except _CursorGone:
-            _gap_warning(cursor or "", None)
-            shipped += _ship_journal(cfg, None, out_of_time)
+            try:
+                shipped += _ship_journal(cfg, cursor, out_of_time, gaps)
+            except _CursorGone:
+                _gap_warning(gaps, cursor or "", None)
+                shipped += _ship_journal(cfg, None, out_of_time, gaps)
+        except Exception as e:
+            if gaps:
+                # The next run will not see the gap again (the cursor may
+                # have moved past it): keep it in this failure's message.
+                raise RuntimeError(f"{e} (also: journal gap after saved cursor {gaps[0]})") from e
+            raise
 
     _write_atomic(cfg.state / "last-success", f"{int(time.time())}\n")
+    if gaps:
+        raise JournalGap(gaps[0], shipped)
     return shipped
 
 

@@ -9,9 +9,12 @@ replaced by small fakes put first on `PATH`:
   `--cursor=X` starts AT X when X exists and at the nearest (here: oldest)
   entry when X is well-formed but rotated away; only a malformed cursor fails
   with "Failed to seek to cursor". `--after-cursor` is refused.
-- `rclone rcat logs:<bucket>/<key>` stores stdin under `r2/<key>`;
-  `rclone cat` serves it back. `FAKE_RCAT_FAIL=1` makes `rcat` fail and
-  `FAKE_CAT_CORRUPT=1` makes `cat` return different bytes. Every argv is
+  `--output-fields=` keeps only the listed fields plus what JSON output
+  always prints (`__*` and `_BOOT_ID`, checked against systemd 262).
+- `rclone copyto <file> logs:<bucket>/<key>` stores the file under
+  `r2/<key>`; `rclone cat` serves it back. `FAKE_UPLOAD_FAIL=1` makes
+  `copyto` fail and `FAKE_CAT_CORRUPT=1` makes `cat` return different
+  bytes. Every argv is
   appended to `rclone.calls`.
 """
 
@@ -24,6 +27,8 @@ import importlib.util
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import unittest
@@ -67,7 +72,13 @@ for arg in sys.argv[1:]:
             sys.exit(1)
         idx = [i for i, e in enumerate(entries) if e["__CURSOR"] == cursor]
         start = idx[0] if idx else 0
+keep = None
+for arg in sys.argv[1:]:
+    if arg.startswith("--output-fields="):
+        keep = set(arg.split("=", 1)[1].split(","))
 for e in entries[start:]:
+    if keep is not None:
+        e = {k: v for k, v in e.items() if k in keep or k.startswith("__") or k == "_BOOT_ID"}
     sys.stdout.write(json.dumps(e) + "\\n")
 """
 
@@ -83,10 +94,12 @@ assert remote == "logs", dest
 bucket, key = rest.split("/", 1)
 assert bucket == os.environ["FAKE_BUCKET"], bucket
 path = os.path.join(d, "r2", key)
-if op == "rcat":
-    data = sys.stdin.buffer.read()
-    if os.environ.get("FAKE_RCAT_FAIL") == "1":
-        sys.stderr.write("ERROR : Failed to rcat: AccessDenied\\n")
+if op == "copyto":
+    assert "--no-check-dest" in sys.argv, sys.argv
+    with open(sys.argv[-2], "rb") as f:
+        data = f.read()
+    if os.environ.get("FAKE_UPLOAD_FAIL") == "1":
+        sys.stderr.write("ERROR : Failed to copy: AccessDenied\\n")
         sys.exit(1)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
@@ -143,7 +156,7 @@ class ShipperTestCase(unittest.TestCase):
         os.environ["FAKE_DIR"] = str(self.tmp)
         os.environ["FAKE_JOURNAL"] = str(self.journal)
         os.environ["FAKE_BUCKET"] = "logs-bucket"
-        for k in ("FAKE_RCAT_FAIL", "FAKE_CAT_CORRUPT"):
+        for k in ("FAKE_UPLOAD_FAIL", "FAKE_CAT_CORRUPT"):
             os.environ.pop(k, None)
 
     def tearDown(self) -> None:
@@ -175,6 +188,13 @@ class ShipperTestCase(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             n = self.mod.run(cfg, **kw)
         return n, err.getvalue()
+
+    def run_gap(self, cfg) -> tuple[int, str]:
+        """run() on a journal gap: completes, then raises JournalGap."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(self.mod.JournalGap) as cm:
+            self.mod.run(cfg)
+        return cm.exception.shipped, err.getvalue()
 
     def objects(self) -> list[str]:
         if not self.r2.exists():
@@ -257,6 +277,16 @@ class RunTests(ShipperTestCase):
         argv = self.calls("journalctl")[0]
         self.assertIn("--output=json", argv)
         self.assertIn("--no-pager", argv)
+        self.assertIn(
+            "--output-fields=MESSAGE,_HOSTNAME,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_PID,PRIORITY,_BOOT_ID,"
+            "_SOURCE_REALTIME_TIMESTAMP,CONTAINER_NAME,CONTAINER_ID,IMAGE_NAME",
+            argv,
+        )
+        # Uploaded from the sealed spool file (known size: one PUT), then read back.
+        ops = self.calls("rclone")
+        self.assertEqual([c[0] for c in ops], ["copyto", "cat"])
+        self.assertEqual(ops[0][-1], f"logs:logs-bucket/{objs[0]}")
+        self.assertEqual(ops[1][-1], f"logs:logs-bucket/{objs[0]}")
         self.assertFalse(any(a.startswith(("--after-cursor", "--cursor")) for a in argv))
         self.assertFalse(any(a.startswith("--boot") or a == "-b" for a in argv))
 
@@ -297,7 +327,7 @@ class RunTests(ShipperTestCase):
         self.run_quiet(self.cfg())
         entries = [_entry(i, _T0 + i) for i in range(1, 4)]
         self.write_journal(entries, append=True)
-        os.environ["FAKE_RCAT_FAIL"] = "1"
+        os.environ["FAKE_UPLOAD_FAIL"] = "1"
         with self.assertRaises(Exception):
             self.run_quiet(self.cfg())
         self.assertEqual(self.cursor(), first[0]["__CURSOR"])
@@ -322,13 +352,13 @@ class RunTests(ShipperTestCase):
 
         # Next run, with R2 accepting: the spooled object goes first, under the
         # same key, then the cursor moves and nothing is re-sent.
-        del os.environ["FAKE_RCAT_FAIL"]
+        del os.environ["FAKE_UPLOAD_FAIL"]
         before = len(self.calls("rclone"))
         n, _ = self.run_quiet(self.cfg())
         self.assertEqual(n, 1)
-        rcats = [c for c in self.calls("rclone")[before:] if c[0] == "rcat"]
-        self.assertEqual(rcats[0][-1], f"logs:logs-bucket/{key}")
-        self.assertEqual(len(rcats), 1)
+        uploads = [c for c in self.calls("rclone")[before:] if c[0] == "copyto"]
+        self.assertEqual(uploads[0][-1], f"logs:logs-bucket/{key}")
+        self.assertEqual(len(uploads), 1)
         self.assertEqual(self.object_lines(key), [self.mod.slim(e) for e in entries])
         self.assertEqual(self.pending(), [])
         self.assertEqual(self.cursor(), entries[-1]["__CURSOR"])
@@ -371,14 +401,20 @@ class RunTests(ShipperTestCase):
         self.write_journal(entries)
         self.state.mkdir(parents=True)
         (self.state / "cursor").write_text("s=rotated;i=ffff\n", encoding="utf-8")
-        n, err = self.run_quiet(self.cfg())
+        before = time.time()
+        n, err = self.run_gap(self.cfg())
         # Real journalctl does not fail on a rotated-away cursor: it lands on
         # the nearest entry. The first entry is not the saved one, so the gap
         # is named and that entry is shipped too.
-        self.assertEqual(self.calls("journalctl"), [["--output=json", "--no-pager", "--all", "--cursor=s=rotated;i=ffff"]])
+        argvs = self.calls("journalctl")
+        self.assertEqual(len(argvs), 1)
+        self.assertIn("--cursor=s=rotated;i=ffff", argvs[0])
         self.assertIn("cursor no longer in the journal", err)
         self.assertIn("s=rotated;i=ffff", err)
         self.assertEqual(n, 1)
+        # The run itself completed: last-success is fresh, nothing pending.
+        self.assertGreaterEqual(int((self.state / "last-success").read_text(encoding="utf-8")), int(before))
+        self.assertEqual(self.pending(), [])
         self.assertEqual(self.object_lines(self.objects()[0]), [self.mod.slim(e) for e in entries])
         self.assertEqual(self.cursor(), entries[-1]["__CURSOR"])
 
@@ -387,7 +423,7 @@ class RunTests(ShipperTestCase):
         self.write_journal(entries)
         self.state.mkdir(parents=True)
         (self.state / "cursor").write_text("garbage\n", encoding="utf-8")
-        n, err = self.run_quiet(self.cfg())
+        n, err = self.run_gap(self.cfg())
         argvs = self.calls("journalctl")
         self.assertEqual(len(argvs), 2)
         self.assertIn("--cursor=garbage", argvs[0])
@@ -396,6 +432,89 @@ class RunTests(ShipperTestCase):
         self.assertEqual(n, 1)
         self.assertEqual(self.object_lines(self.objects()[0]), [self.mod.slim(e) for e in entries])
         self.assertEqual(self.cursor(), entries[-1]["__CURSOR"])
+
+    def test_journal_gap_fails_main_once(self) -> None:
+        entries = [_entry(i, _T0 + i) for i in range(3)]
+        self.write_journal(entries)
+        self.state.mkdir(parents=True)
+        (self.state / "cursor").write_text("s=rotated;i=ffff\n", encoding="utf-8")
+        os.environ.update(LOGS_BUCKET="logs-bucket", LOGS_STATE=str(self.state), LOGS_HOST="test-host")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            self.mod.main()
+        # Exit 1 so OnFailure reports the lost logs -- but only after the
+        # run shipped everything and saved its state.
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("journal gap", err.getvalue())
+        self.assertEqual(self.cursor(), entries[-1]["__CURSOR"])
+        self.assertTrue((self.state / "last-success").exists())
+        self.assertEqual(len(self.objects()), 1)
+        # The next run is back to normal.
+        self.write_journal([_entry(3, _T0 + 3)], append=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.mod.main()
+        self.assertNotIn("cursor no longer in the journal", err.getvalue())
+        self.assertEqual(len(self.objects()), 2)
+
+    def test_upload_failure_after_gap_names_the_gap(self) -> None:
+        self.write_journal([_entry(i, _T0 + i) for i in range(3)])
+        self.state.mkdir(parents=True)
+        (self.state / "cursor").write_text("s=rotated;i=ffff\n", encoding="utf-8")
+        os.environ["FAKE_UPLOAD_FAIL"] = "1"
+        with self.assertRaises(RuntimeError) as cm:
+            self.run_quiet(self.cfg())
+        self.assertNotIsInstance(cm.exception, self.mod.JournalGap)
+        self.assertIn("AccessDenied", str(cm.exception))
+        self.assertIn("journal gap", str(cm.exception))
+
+    def test_cursor_saved_before_spool_is_deleted(self) -> None:
+        # A crash between the two must leave the spool (re-uploaded under the
+        # same key next run), never a deleted spool with an old cursor.
+        seen = []
+        real = self.mod._save_cursor
+
+        def spy(cfg, cursor):
+            seen.append((cursor, self.pending()))
+            real(cfg, cursor)
+
+        self.mod._save_cursor = spy
+        first = [_entry(0, _T0)]
+        self.write_journal(first)
+        self.run_quiet(self.cfg())
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], first[0]["__CURSOR"])
+        self.assertEqual(len(seen[0][1]), 1, "spool already gone when the cursor was saved")
+
+        # The same order when replaying a spool left by an earlier run.
+        second = [_entry(1, _T0 + 1)]
+        self.write_journal(second, append=True)
+        os.environ["FAKE_UPLOAD_FAIL"] = "1"
+        with self.assertRaises(RuntimeError):
+            self.run_quiet(self.cfg())
+        del os.environ["FAKE_UPLOAD_FAIL"]
+        seen.clear()
+        self.run_quiet(self.cfg())
+        self.assertEqual(seen[0][0], second[0]["__CURSOR"])
+        self.assertEqual(len(seen[0][1]), 1, "spool already gone when the cursor was saved")
+        self.assertEqual(self.pending(), [])
+
+    def test_loads_and_runs_under_python_3_10(self) -> None:
+        # Ubuntu 22.04 nodes run this file with their system Python 3.10.
+        py310 = shutil.which("python3.10")
+        if py310 is None or subprocess.run([py310, "--version"], capture_output=True).returncode != 0:
+            # (an asdf shim with no 3.10 installed is on PATH but fails)
+            self.skipTest("no working python3.10 on PATH (nix shell nixpkgs#python310)")
+        code = (
+            "import importlib.machinery, importlib.util, sys\n"
+            f"l = importlib.machinery.SourceFileLoader('s', {str(_SCRIPT)!r})\n"
+            "spec = importlib.util.spec_from_loader('s', l)\n"
+            "m = importlib.util.module_from_spec(spec); sys.modules['s'] = m; l.exec_module(m)\n"
+            f"print(m.slim({{'__REALTIME_TIMESTAMP': '{_T0}', 'MESSAGE': [104, 105, 255]}}))\n"
+        )
+        out = subprocess.run([py310, "-c", code], capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("2026-11-17T04:00:02.760172Z", out.stdout)
 
     def test_other_journalctl_failure_raises(self) -> None:
         self.write_journal([_entry(0, _T0)])

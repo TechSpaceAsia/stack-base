@@ -1011,7 +1011,8 @@ size caps (`SystemMaxUse=2G`, `SystemKeepFree=4G`): a very chatty server can
 reach them sooner, and journald then drops its oldest files, shipped or not.
 If the saved position has been rotated out of the journal, the script logs
 `saved cursor no longer in the journal` and resumes from the oldest entry
-left. A sudden power cut can take the last few seconds, because journald
+left; that run then exits with an error, so the failure alert mails you
+about the lost logs (the next run is back to normal). A sudden power cut can take the last few seconds, because journald
 syncs to disk every 5 seconds.
 Delivery is **at least once**: after a retry the same entry can be uploaded
 twice. Every entry carries its journal `cursor`, which is unique — dedupe on
@@ -1318,6 +1319,13 @@ unchanged, so nothing in `stack.toml` or the secrets changes; move the pin
   one gets an error pointing here. Delete the line.
 - The plain-text copy under `/var/log/vector` is gone. On the server use
   `journalctl` (7 days).
+- The first run after the upgrade has no cursor, so it ships the whole
+  persisted journal (up to journald's 2 GiB cap). That takes several runs
+  of at most 240 s each, one minute apart, so expect a backlog of uploads
+  for a while on a busy node. Anything Vector had already delivered is
+  shipped again: the bucket will hold duplicates for that period. Each line
+  keeps its journal `cursor`, so deduplicate by `cursor` when searching
+  across the upgrade.
 - Vector's leftovers, `/var/lib/vector` and `/var/log/vector`, stay on
   existing nodes. Delete them by hand once the new shipper has uploaded:
   `./infra/up ssh a -- rm -rf /var/lib/vector /var/log/vector`.
