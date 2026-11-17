@@ -134,3 +134,19 @@
 - [ ] **Step 2: Commit** in boost/infra `Log shipper: stack-base's script replaces Vector`.
 - [ ] **Step 3: Operator step (Matt):** stage the bundle (controller) and run `ssh -t boost-prod 'sudo ~/log-shipper-bundle/install'`.
 - [ ] **Step 4:** Controller verifies new objects under `journal/boost-app-26/`, no gap around the switch (newest Vector object's last cursor precedes the first script object's first cursor), then removes the staged bundle.
+
+### Task 7: Ship only listed units (shared hosts)
+
+Added 2026-11-17 (Matt: "Include the filter" in v0.3.0). A shared host such as nixos-ollama runs several projects; only Boost's units may go into Boost's bucket.
+
+**Files:**
+- Modify: `nixos/log-shipper.py` (env `LOGS_INCLUDE_UNITS`: comma-separated unit names or globs; empty/unset = whole journal as today)
+- Modify: `nixos/logs.nix` (option `stackbase.logs.includeUnits`, `listOf str`, default `[]`, passed as `LOGS_INCLUDE_UNITS`)
+- Modify: `tests/test_log_shipper.py`, `tests/test_template.py` (or wherever LogShipperUnitTests live), `README.md` (one paragraph in Logs)
+
+**Design:** filter in journalctl, not in Python: each listed unit becomes one `--unit=<name>` argument (journalctl ORs them, matches globs, and also includes systemd's own start/stop/failure messages about that unit). Cursor handling is unchanged: the saved cursor always belongs to a shipped (matching) entry. The own-unit exclusion still applies. Unit names are validated (`[A-Za-z0-9@:._\-*?\[\]]+`); an invalid name fails the run with a clear error, never passed through a shell.
+
+- [ ] **Step 1: Failing tests:** `test_include_units_become_unit_args` (argv has `--unit=claude-boost-video.service` and `--unit=claude-boost-scrape*` in order); `test_no_include_units_reads_whole_journal` (no `--unit=`); `test_invalid_include_unit_fails_run` (`"a b"` → exit 1, no journalctl call); fake journalctl honours `--unit=` (exact or fnmatch on `_SYSTEMD_UNIT`); module test: option → `LOGS_INCLUDE_UNITS` env, absent when `[]`.
+- [ ] **Step 2:** Implement; run the shipper tests under the default python and once under Python 3.10 (`nix shell github:NixOS/nixpkgs/nixos-24.11#python310`).
+- [ ] **Step 3:** Full suite; `nix build .#checks.x86_64-linux.vm-logs -L` still passes.
+- [ ] **Step 4: Commit** `log-shipper: ship only listed units (includeUnits) for shared hosts`.
