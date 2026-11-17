@@ -73,9 +73,23 @@ for arg in sys.argv[1:]:
         idx = [i for i, e in enumerate(entries) if e["__CURSOR"] == cursor]
         start = idx[0] if idx else 0
 keep = None
+units = []
 for arg in sys.argv[1:]:
     if arg.startswith("--output-fields="):
         keep = set(arg.split("=", 1)[1].split(","))
+    if arg.startswith("--unit="):
+        units.append(arg.split("=", 1)[1])
+if units:
+    import fnmatch
+    entries = [
+        e for e in entries
+        if any(fnmatch.fnmatchcase(e.get("_SYSTEMD_UNIT", ""), u) for u in units)
+    ]
+    start = 0
+    for arg in sys.argv[1:]:
+        if arg.startswith("--cursor="):
+            idx = [i for i, e in enumerate(entries) if e["__CURSOR"] == arg.split("=", 1)[1]]
+            start = idx[0] if idx else 0
 for e in entries[start:]:
     if keep is not None:
         e = {k: v for k, v in e.items() if k in keep or k.startswith("__") or k == "_BOOT_ID"}
@@ -387,6 +401,57 @@ class RunTests(ShipperTestCase):
         self.assertEqual(len(objs), 1)
         self.assertEqual(self.object_lines(objs[0]), [self.mod.slim(entries[0]), self.mod.slim(entries[2])])
         self.assertEqual(self.cursor(), entries[-1]["__CURSOR"])
+
+    def test_include_units_become_unit_args(self) -> None:
+        entries = [
+            _entry(0, _T0, _SYSTEMD_UNIT="claude-boost-video.service"),
+            _entry(1, _T0 + 1, _SYSTEMD_UNIT="other.service"),
+            _entry(2, _T0 + 2, _SYSTEMD_UNIT="claude-boost-scrape-3.service"),
+        ]
+        self.write_journal(entries)
+        units = ("claude-boost-video.service", "claude-boost-scrape*")
+        self.run_quiet(self.cfg(include_units=units))
+        argv = self.calls("journalctl")[0]
+        self.assertEqual([a for a in argv if a.startswith("--unit=")], [f"--unit={u}" for u in units])
+        lines = self.object_lines(self.objects()[0])
+        self.assertEqual(lines, [self.mod.slim(entries[0]), self.mod.slim(entries[2])])
+        self.assertEqual(self.cursor(), entries[2]["__CURSOR"])
+
+    def test_no_include_units_reads_whole_journal(self) -> None:
+        self.write_journal([_entry(0, _T0)])
+        self.run_quiet(self.cfg())
+        self.assertFalse(any(a.startswith("--unit") for a in self.calls("journalctl")[0]))
+
+    def test_invalid_include_unit_fails_run(self) -> None:
+        self.write_journal([_entry(0, _T0)])
+        with self.assertRaises(RuntimeError) as cm:
+            self.run_quiet(self.cfg(include_units=("good.service", "a b")))
+        self.assertIn("a b", str(cm.exception))
+        self.assertEqual(self.calls("journalctl"), [])
+
+    def test_invalid_include_unit_exits_1_from_main(self) -> None:
+        os.environ["LOGS_BUCKET"] = "b"
+        os.environ["LOGS_STATE"] = str(self.state)
+        os.environ["LOGS_INCLUDE_UNITS"] = "good.service,$(reboot)"
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                self.mod.main()
+        finally:
+            os.environ.pop("LOGS_INCLUDE_UNITS", None)
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("$(reboot)", err.getvalue())
+        self.assertEqual(self.calls("journalctl"), [])
+
+    def test_from_env_parses_include_units(self) -> None:
+        os.environ["LOGS_BUCKET"] = "b"
+        os.environ["LOGS_INCLUDE_UNITS"] = " a.service , b*,, "
+        try:
+            self.assertEqual(self.mod.Config.from_env().include_units, ("a.service", "b*"))
+            os.environ["LOGS_INCLUDE_UNITS"] = ""
+            self.assertEqual(self.mod.Config.from_env().include_units, ())
+        finally:
+            os.environ.pop("LOGS_INCLUDE_UNITS", None)
 
     def test_only_excluded_entries_still_advance_cursor(self) -> None:
         entries = [_entry(0, _T0, _SYSTEMD_UNIT="stackbase-logs.service")]

@@ -4,7 +4,8 @@
 Run by a systemd timer (nixos/logs.nix). Each run:
 
 1. Uploads any object spooled by an earlier run that did not verify.
-2. Reads the journal after the saved cursor (`journalctl --output=json`),
+2. Reads the journal after the saved cursor (`journalctl --output=json`;
+   with LOGS_INCLUDE_UNITS, only those units, one `--unit=` each),
    streaming line by line -- a 4 GB backlog is never held in memory.
 3. Slims each entry to the fields a person searching logs needs, groups
    consecutive entries by the UTC hour they happened in, and writes each
@@ -38,6 +39,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -175,6 +177,8 @@ class Config:
     bucket: str
     host: str
     exclude_unit: str
+    # journalctl --unit patterns; empty means the whole journal.
+    include_units: tuple[str, ...] = ()
     max_object_bytes: int = MAX_OBJECT_BYTES
     max_run_seconds: float = MAX_RUN_SECONDS
 
@@ -189,7 +193,19 @@ class Config:
             bucket=bucket,
             host=host,
             exclude_unit=os.environ.get("LOGS_EXCLUDE_UNIT", "").strip() or "stackbase-logs.service",
+            include_units=tuple(
+                u for u in (p.strip() for p in os.environ.get("LOGS_INCLUDE_UNITS", "").split(",")) if u
+            ),
         )
+
+
+_UNIT_RE = re.compile(r"[A-Za-z0-9@:._\-*?\[\]]+")
+
+
+def _check_units(units: tuple[str, ...]) -> None:
+    for u in units:
+        if not _UNIT_RE.fullmatch(u):
+            raise RuntimeError(f"invalid unit name in LOGS_INCLUDE_UNITS: {u!r}")
 
 
 def _fsync_dir(path: Path) -> None:
@@ -352,7 +368,7 @@ def _gap_warning(gaps: list[str], cursor: str, landed: str | None) -> None:
     )
 
 
-def _journal(cursor: str | None, gaps: list[str]) -> Iterator[dict]:
+def _journal(cfg: Config, cursor: str | None, gaps: list[str]) -> Iterator[dict]:
     """Journal entries after `cursor` (or from the oldest), streamed.
 
     Reads with `--cursor`, not `--after-cursor`: for a well-formed cursor
@@ -364,6 +380,7 @@ def _journal(cursor: str | None, gaps: list[str]) -> Iterator[dict]:
     handled by the caller.
     """
     argv = ["journalctl", "--output=json", f"--output-fields={_OUTPUT_FIELDS}", "--no-pager", "--all"]
+    argv.extend(f"--unit={u}" for u in cfg.include_units)
     if cursor:
         argv.append(f"--cursor={cursor}")
     with tempfile.TemporaryFile() as err:
@@ -457,7 +474,7 @@ def _ship_journal(cfg: Config, cursor: str | None, out_of_time: Callable[[], boo
     group: _Group | None = None
     loose_cursor: str | None = None  # excluded entries read while no group was open
     try:
-        for entry in _journal(cursor, gaps):
+        for entry in _journal(cfg, cursor, gaps):
             entry_cursor = _value(entry.get("__CURSOR"))
             if _value(entry.get("_SYSTEMD_UNIT")) == cfg.exclude_unit:
                 if group is not None:
@@ -500,6 +517,7 @@ def run(cfg: Config, now: Callable[[], float] = time.monotonic) -> int:
     saved, `last-success` written) when the saved cursor had been rotated
     away, so main() exits 1 and the loss is reported.
     """
+    _check_units(cfg.include_units)
     start = now()
 
     def out_of_time() -> bool:

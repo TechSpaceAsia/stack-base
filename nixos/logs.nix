@@ -102,6 +102,18 @@ in
         destroyed server can lose.
       '';
     };
+
+    includeUnits = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "claude-boost-video.service" "claude-boost-scrape*" ];
+      description = ''
+        Ship only these systemd units (names or globs, each passed to
+        journalctl as `--unit=`), plus systemd's own messages about them.
+        Empty ships the whole journal. For a host shared with other
+        projects, so only this project's units reach this project's bucket.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -128,7 +140,9 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       path = [ pkgs.systemd pkgs.rclone ];
-      environment = {
+      environment = lib.optionalAttrs (cfg.includeUnits != [ ]) {
+        LOGS_INCLUDE_UNITS = lib.concatStringsSep "," cfg.includeUnits;
+      } // {
         LOGS_BUCKET = cfg.bucket;
         LOGS_STATE = stateDir;
         LOGS_EXCLUDE_UNIT = "${unitName}.service";
