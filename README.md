@@ -959,6 +959,12 @@ the server. If the server is destroyed, you lose at most the last interval
 (about a minute) — plus, if R2 was unreachable at that moment, whatever was
 still waiting to be sent.
 
+**Shared hosts.** By default the whole journal is shipped. On a host that
+runs other projects too, set `stackbase.logs.includeUnits` (a list of unit
+names or globs, e.g. `[ "claude-boost-video.service" "claude-boost-scrape*" ]`)
+and only those units are shipped, together with systemd's own messages about
+them (start, stop, failure). The rest of the host's journal stays on the host.
+
 The script uploads each object with `rclone`, reads it back and compares its
 sha256, and only then saves its position (`/var/lib/stackbase-logs/cursor`).
 Objects that could not be uploaded wait in `/var/lib/stackbase-logs/pending/`

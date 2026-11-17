@@ -796,6 +796,16 @@ class LogShipperUnitTests(unittest.TestCase):
         for value in env.values():
             self.assertNotIn("AWS_", str(value))
 
+    def test_include_units_option_sets_the_env(self) -> None:
+        env = self._eval(self._FACTS)["env"]
+        self.assertNotIn("LOGS_INCLUDE_UNITS", env)
+        env = self._eval(
+            self._FACTS,
+            'stackbase.logs.bucket = "acme-logs";'
+            ' stackbase.logs.includeUnits = [ "a.service" "b-*" ];',
+        )["env"]
+        self.assertEqual(env["LOGS_INCLUDE_UNITS"], "a.service,b-*")
+
     def test_the_timer_runs_every_interval(self) -> None:
         facts = self._eval(self._FACTS)
         self.assertEqual(facts["timer"]["OnBootSec"], "60s")
