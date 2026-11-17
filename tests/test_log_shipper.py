@@ -4,10 +4,11 @@ The script is not a package module (it is installed as a single file by the
 NixOS module), so it is loaded from its path. `journalctl` and `rclone` are
 replaced by small fakes put first on `PATH`:
 
-- `journalctl` replays the JSON-lines file named by `FAKE_JOURNAL`, honouring
-  `--after-cursor` (an unknown cursor exits 1 with "Failed to seek to
-  cursor", like a journal rotated past it), and appends its argv to
-  `journalctl.calls`.
+- `journalctl` replays the JSON-lines file named by `FAKE_JOURNAL` and
+  appends its argv to `journalctl.calls`. Like real journalctl (systemd 262),
+  `--cursor=X` starts AT X when X exists and at the nearest (here: oldest)
+  entry when X is well-formed but rotated away; only a malformed cursor fails
+  with "Failed to seek to cursor". `--after-cursor` is refused.
 - `rclone rcat logs:<bucket>/<key>` stores stdin under `r2/<key>`;
   `rclone cat` serves it back. `FAKE_RCAT_FAIL=1` makes `rcat` fail and
   `FAKE_CAT_CORRUPT=1` makes `cat` return different bytes. Every argv is
@@ -56,13 +57,16 @@ if os.path.exists(path):
         entries = [json.loads(line) for line in f if line.strip()]
 start = 0
 for arg in sys.argv[1:]:
-    if arg.startswith("--after-cursor="):
+    if arg.startswith("--after-cursor"):
+        sys.stderr.write("fake: use --cursor\\n")
+        sys.exit(2)
+    if arg.startswith("--cursor="):
         cursor = arg.split("=", 1)[1]
-        idx = [i for i, e in enumerate(entries) if e["__CURSOR"] == cursor]
-        if not idx:
+        if not cursor.startswith("s="):
             sys.stderr.write("Failed to seek to cursor: Invalid argument\\n")
             sys.exit(1)
-        start = idx[0] + 1
+        idx = [i for i, e in enumerate(entries) if e["__CURSOR"] == cursor]
+        start = idx[0] if idx else 0
 for e in entries[start:]:
     sys.stdout.write(json.dumps(e) + "\\n")
 """
@@ -253,7 +257,7 @@ class RunTests(ShipperTestCase):
         argv = self.calls("journalctl")[0]
         self.assertIn("--output=json", argv)
         self.assertIn("--no-pager", argv)
-        self.assertFalse(any(a.startswith("--after-cursor") for a in argv))
+        self.assertFalse(any(a.startswith(("--after-cursor", "--cursor")) for a in argv))
         self.assertFalse(any(a.startswith("--boot") or a == "-b" for a in argv))
 
     def test_entries_split_by_event_hour(self) -> None:
@@ -275,9 +279,13 @@ class RunTests(ShipperTestCase):
         self.run_quiet(self.cfg())
         second = [_entry(i, _T0 + i) for i in range(3, 5)]
         self.write_journal(second, append=True)
-        n, _ = self.run_quiet(self.cfg())
+        n, err = self.run_quiet(self.cfg())
         self.assertEqual(n, 1)
-        self.assertIn(f"--after-cursor={first[-1]['__CURSOR']}", self.calls("journalctl")[1])
+        self.assertNotIn("cursor no longer in the journal", err)
+        # Read starts AT the saved entry (--cursor); that entry is not re-shipped.
+        self.assertIn(f"--cursor={first[-1]['__CURSOR']}", self.calls("journalctl")[1])
+        shipped = [line["cursor"] for o in self.objects() for line in self.object_lines(o)]
+        self.assertEqual(sorted(shipped), sorted(e["__CURSOR"] for e in first + second))
         new = [o for o in self.objects() if self.object_lines(o)[0]["cursor"] == second[0]["__CURSOR"]]
         self.assertEqual(len(new), 1)
         self.assertEqual(self.object_lines(new[0]), [self.mod.slim(e) for e in second])
@@ -324,7 +332,7 @@ class RunTests(ShipperTestCase):
         self.assertEqual(self.object_lines(key), [self.mod.slim(e) for e in entries])
         self.assertEqual(self.pending(), [])
         self.assertEqual(self.cursor(), entries[-1]["__CURSOR"])
-        self.assertIn(f"--after-cursor={entries[-1]['__CURSOR']}", self.calls("journalctl")[-1])
+        self.assertIn(f"--cursor={entries[-1]['__CURSOR']}", self.calls("journalctl")[-1])
 
     def test_readback_mismatch_keeps_cursor(self) -> None:
         self.write_journal([_entry(i, _T0 + i) for i in range(3)])
@@ -364,6 +372,26 @@ class RunTests(ShipperTestCase):
         self.state.mkdir(parents=True)
         (self.state / "cursor").write_text("s=rotated;i=ffff\n", encoding="utf-8")
         n, err = self.run_quiet(self.cfg())
+        # Real journalctl does not fail on a rotated-away cursor: it lands on
+        # the nearest entry. The first entry is not the saved one, so the gap
+        # is named and that entry is shipped too.
+        self.assertEqual(self.calls("journalctl"), [["--output=json", "--no-pager", "--all", "--cursor=s=rotated;i=ffff"]])
+        self.assertIn("cursor no longer in the journal", err)
+        self.assertIn("s=rotated;i=ffff", err)
+        self.assertEqual(n, 1)
+        self.assertEqual(self.object_lines(self.objects()[0]), [self.mod.slim(e) for e in entries])
+        self.assertEqual(self.cursor(), entries[-1]["__CURSOR"])
+
+    def test_malformed_cursor_restarts_from_oldest(self) -> None:
+        entries = [_entry(i, _T0 + i) for i in range(3)]
+        self.write_journal(entries)
+        self.state.mkdir(parents=True)
+        (self.state / "cursor").write_text("garbage\n", encoding="utf-8")
+        n, err = self.run_quiet(self.cfg())
+        argvs = self.calls("journalctl")
+        self.assertEqual(len(argvs), 2)
+        self.assertIn("--cursor=garbage", argvs[0])
+        self.assertFalse(any(a.startswith("--cursor") for a in argvs[1]))
         self.assertIn("cursor no longer in the journal", err)
         self.assertEqual(n, 1)
         self.assertEqual(self.object_lines(self.objects()[0]), [self.mod.slim(e) for e in entries])

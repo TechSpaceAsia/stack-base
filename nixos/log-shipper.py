@@ -304,11 +304,28 @@ class _CursorGone(Exception):
     pass
 
 
+def _gap_warning(cursor: str, landed: str | None) -> None:
+    _log(
+        f"saved cursor no longer in the journal ({cursor}): the journal was rotated or the "
+        "cursor is unreadable, so entries between it and where reading resumes may be lost; "
+        f"resuming from {landed or 'the oldest entry'}"
+    )
+
+
 def _journal(cursor: str | None) -> Iterator[dict]:
-    """Journal entries after `cursor` (or from the oldest), streamed."""
+    """Journal entries after `cursor` (or from the oldest), streamed.
+
+    Reads with `--cursor`, not `--after-cursor`: for a well-formed cursor
+    that has been rotated away, journalctl does not fail -- it seeks to the
+    nearest entry and prints from there. Starting AT the cursor shows which
+    happened: the first entry is the saved one (dropped, it was shipped) or
+    it is not (the gap is logged and that entry is shipped too). A cursor
+    journalctl cannot parse fails with "Failed to seek to cursor" and is
+    handled by the caller.
+    """
     argv = ["journalctl", "--output=json", "--no-pager", "--all"]
     if cursor:
-        argv.append(f"--after-cursor={cursor}")
+        argv.append(f"--cursor={cursor}")
     with tempfile.TemporaryFile() as err:
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=err)
         assert proc.stdout is not None
@@ -326,6 +343,11 @@ def _journal(cursor: str | None) -> Iterator[dict]:
                 if not isinstance(entry, dict):
                     continue
                 read += 1
+                if cursor and read == 1:
+                    first = _value(entry.get("__CURSOR"))
+                    if first == cursor:
+                        continue
+                    _gap_warning(cursor, first)
                 yield entry
             finished = True
         finally:
@@ -448,11 +470,7 @@ def run(cfg: Config, now: Callable[[], float] = time.monotonic) -> int:
         try:
             shipped += _ship_journal(cfg, cursor, out_of_time)
         except _CursorGone:
-            _log(
-                f"saved cursor no longer in the journal ({cursor}): it was rotated away before "
-                "being shipped, so entries between it and the oldest one left are lost; "
-                "restarting from the oldest entry"
-            )
+            _gap_warning(cursor or "", None)
             shipped += _ship_journal(cfg, None, out_of_time)
 
     _write_atomic(cfg.state / "last-success", f"{int(time.time())}\n")
