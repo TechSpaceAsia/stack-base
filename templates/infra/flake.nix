@@ -46,7 +46,7 @@
   # (or run `nix flake lock --update-input stack-base` if you have Nix
   # installed locally) and run ./infra/up -- it re-resolves the new ref and
   # writes a fresh lock.
-  inputs.stack-base.url = "github:TechSpaceAsia/stack-base/v0.2.0";
+  inputs.stack-base.url = "github:TechSpaceAsia/stack-base/v0.3.0";
 
   outputs = { self, stack-base }:
     let
@@ -135,7 +135,7 @@
         // (if backupsConfig ? on_calendar then { onCalendar = backupsConfig.on_calendar; } else { });
 
       # The optional [logs] table -> nixos/logs.nix's stackbase.logs.*
-      # options, merged the same way: naming a bucket turns Vector on, and
+      # options, merged the same way: naming a bucket turns the log shipper on, and
       # `enabled = false` turns it off even with one. retention_days is the
       # bucket's lifecycle rule, which `./infra/up` sets -- not a node option.
       logsOptions = env:

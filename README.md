@@ -129,7 +129,7 @@ Then commit what it wrote back: `infra/stack.state.json`,
 | creating the origin certificate | Gets a TLS certificate from Cloudflare for your domain |
 | uploading | Copies `infra/` and the certificate onto the server |
 | rebuilding NixOS | Applies the configuration (this is the slow one — minutes) |
-| updating the log shipping credentials | Pushes the logs bucket's R2 credentials before the rebuild that starts Vector (see [Logs](#logs)) |
+| updating the log shipping credentials | Pushes the logs bucket's R2 credentials before the rebuild that turns on the log shipper (see [Logs](#logs)) |
 | updating the application's environment file | Pushes `app_env` from `secrets.age` to the server and restarts the running release (see [The app's environment](#the-apps-environment-app_env) below) |
 | pointing the domain | Points your domain at the server in Cloudflare |
 | creating the R2 bucket / setting the retention rule / setting the bucket-lock rule | See [R2 buckets](#r2-buckets-logs-and-files) |
@@ -941,24 +941,39 @@ printf '%s' "$R2_ENDPOINT"            | ./infra/up secrets set r2_endpoint
 ```
 
 (add `--env <name>` to each command once you have environments). With logs on
-and any of the three missing, `up` and `--plan` stop and name them: Vector
-cannot start without its credentials, and a service that fails to start
-fails the whole rebuild. `up` pushes them to `/var/lib/stackbase/logs.env`
-(0600, root) **before** the rebuild that starts Vector, and restarts Vector
-when they change.
+and any of the three missing, `up` and `--plan` stop and name them: the
+shipper cannot upload without its credentials, and a unit that fails on
+every run would mail you. `up` pushes them to `/var/lib/stackbase/logs.env`
+(0600, root) **before** the rebuild. Nothing is restarted when they change;
+the next run (within a minute) reads them.
 
-**What is shipped, and when.** [Vector](https://vector.dev) reads the whole
-persistent journal and keeps nine fields per entry — `timestamp`, `host`,
-`unit`, `ident`, `pid`, `priority`, `message`, `boot_id`, `cursor` — and
-uploads a batch at least every 15 seconds. Command lines, executable paths
-and the rest of journald's metadata stay on the server. If the server is
-destroyed, you lose at most the last ~15 seconds — plus, if R2 was
-unreachable at that moment, whatever was still waiting to be sent.
+**What is shipped, and when.** A small script, `nixos/log-shipper.py`, runs
+from `stackbase-logs.service` (a oneshot unit, its own user `stackbase-logs`)
+every minute, started by `stackbase-logs.timer`. Change the interval with
+`stackbase.logs.intervalSeconds` (default 60). It reads the journal after its
+saved position and keeps nine fields per entry — `timestamp`, `host`,
+`unit`, `ident`, `pid`, `priority`, `message`, `boot_id`, `cursor` (plus
+`CONTAINER_NAME`, `CONTAINER_ID` and `IMAGE_NAME` when an entry has them).
+Command lines, executable paths and the rest of journald's metadata stay on
+the server. If the server is destroyed, you lose at most the last interval
+(about a minute) — plus, if R2 was unreachable at that moment, whatever was
+still waiting to be sent.
 
-**Key layout.** One gzipped, newline-delimited JSON object per batch:
+The script uploads each object with `rclone`, reads it back and compares its
+sha256, and only then saves its position (`/var/lib/stackbase-logs/cursor`).
+Objects that could not be uploaded wait in `/var/lib/stackbase-logs/pending/`
+and are retried first on the next run.
+
+Why not Vector, which earlier releases used: from version 0.46 its S3 sink
+sends two checksums and R2 rejects every upload
+([vector#23029](https://github.com/vectordotdev/vector/issues/23029)), while
+its own healthcheck still passes.
+
+**Key layout.** One gzipped, newline-delimited JSON object per hour of
+events in each run:
 
 ```
-journal/<host>/<YYYY>/<MM>/<DD>/<HH>/<uuid>.ndjson.gz
+journal/<host>/<YYYY>/<MM>/<DD>/<HH>/<first-event-unix-seconds>-<uuid>.ndjson.gz
 ```
 
 `<host>` is the server's hostname (`a`, or `staging-a` with environments),
@@ -980,29 +995,28 @@ aws s3 cp --recursive --endpoint-url "$R2_ENDPOINT" "s3://$BUCKET/journal/$HOST/
 fd -e gz . ./logs -x zcat -f | jq -c -s 'unique_by(.cursor) | sort_by(.timestamp)[]' | rg 'panicked'
 ```
 
-On the server itself, the last 3 days are plain text under `/var/log/vector`,
-and the journal keeps 7:
+On the server itself, the journal keeps the last 7 days:
 
 ```bash
-./infra/up ssh a -- rg 'panicked' /var/log/vector
 ./infra/up ssh a -- journalctl -u acme@blue --since -2h
+./infra/up ssh a -- journalctl --since -1d --grep panicked
 ```
 
-**Outages.** Vector keeps unsent batches in a 1 GiB buffer on disk that
-survives restarts, and only moves its journal bookmark once an entry is in
-that buffer. When the buffer is full it waits, and the journal itself holds
-the rest — so an R2 outage of up to **7 days** (the local journal's
-retention) loses nothing, and Vector catches up on its own afterwards. That
-holds as long as the journal stays inside its size caps (`SystemMaxUse=2G`,
-`SystemKeepFree=4G`): a very chatty server can reach them sooner, and
-journald then drops its oldest files, read by Vector or not. A sudden power
-cut can also take the last few seconds, because journald syncs to disk every
-5 seconds and Vector's buffer does not wait for an fsync.
-Delivery is **at least once**: after a restart or a retry the same entry
-can be uploaded twice. Every entry carries its journal `cursor`, which is
-unique — dedupe on it (as the `jq` line above does). A full local disk
-never holds up R2: the local copy is best effort and simply skips entries it
-cannot write.
+**Outages.** The journal is the buffer. The script moves its position only
+after an object is verified in R2, so while R2 is unreachable it simply
+stays where it was, and the journal holds the rest — an R2 outage of up to
+**7 days** (the journal's retention) loses nothing, and the script catches up
+on its own afterwards. That holds as long as the journal stays inside its
+size caps (`SystemMaxUse=2G`, `SystemKeepFree=4G`): a very chatty server can
+reach them sooner, and journald then drops its oldest files, shipped or not.
+If the saved position has been rotated out of the journal, the script logs
+`saved cursor no longer in the journal` and resumes from the oldest entry
+left; that run then exits with an error, so the failure alert mails you
+about the lost logs (the next run is back to normal). A sudden power cut can take the last few seconds, because journald
+syncs to disk every 5 seconds.
+Delivery is **at least once**: after a retry the same entry can be uploaded
+twice. Every entry carries its journal `cursor`, which is unique — dedupe on
+it (as the `jq` line above does).
 
 **Retention** is the bucket's lifecycle rule (see
 [R2 buckets](#r2-buckets-logs-and-files)): objects under `journal/` are
@@ -1012,17 +1026,17 @@ a log object.
 **Checking it works** (on the server, `./infra/up ssh a`):
 
 ```bash
-# the config Vector is running, with a dummy endpoint (nothing is contacted)
-CONFIG=$(systemctl show -p ExecStart --value vector.service | grep -o '/nix/store/[^ ]*vector.toml')
-LOGS_ENDPOINT=https://validate.invalid vector validate --no-environment "$CONFIG"
-vector top                      # live throughput per component (API on 127.0.0.1:8686)
-vector tap slim                 # watch entries as they leave the journal
-curl -s http://127.0.0.1:9598/metrics | rg 'vector_component_sent_events_total|vector_buffer_byte_size'
+systemctl list-timers stackbase-logs     # next and last run
+journalctl -u stackbase-logs -n 20       # what the last runs did
+cat /var/lib/stackbase-logs/last-success # unix seconds of the last run that exited 0
+date +%s
+ls /var/lib/stackbase-logs/pending       # empty unless R2 is behind
 ```
 
-`vector_buffer_byte_size` for the `r2` sink climbing and staying up means R2
-has been unreachable for a while; `vector_component_sent_events_total` for
-`r2` should keep rising. Both endpoints listen on 127.0.0.1 only.
+A `last-success` that stays far behind the clock, or files piling up in
+`pending/`, means R2 is not accepting uploads; the usual causes are a wrong
+token or a bucket that does not exist. A failing run also emails the
+`[alerts]` addresses.
 
 ## Alerts
 
@@ -1081,12 +1095,12 @@ mails — when:
 
 - backups are on and the newest successful backup is more than 36 hours old
   (before the first one, counted from when backups were turned on);
-- logs are on and `vector.service` is not running;
-- Vector's R2 buffer holds more than 256 MiB, meaning R2 has been unreachable
-  for a while;
-- Vector has sent nothing to R2 for 2 hours although new entries came in.
+- logs are on and no log upload has succeeded for 15 minutes
+  (`/var/lib/stackbase-logs/last-success` is older than
+  `stackbase.alerts.logsMaxAgeSeconds`, default 900). The message starts
+  `logs: no log upload has succeeded since`.
 
-It checks nothing during the first hour after a boot, while Vector and the
+It checks nothing during the first hour after a boot, while the log shipper and the
 first backup catch up. A check whose feature is off (`[logs] enabled = false`,
 `[backups] enabled = false`) is skipped.
 
@@ -1292,6 +1306,30 @@ the `[logs]` choice.
   environment, set them with `./infra/up --env "$ENV" secrets set <key>`.
   See "Logs", "Alerts", "Mesh" and "R2 buckets".
 
+## Upgrading to v0.3.0
+
+v0.3.0 replaces Vector with a small log-shipper script on a systemd timer
+(see [Logs](#logs)). The bucket, key layout, fields and credentials are
+unchanged, so nothing in `stack.toml` or the secrets changes; move the pin
+(`stack-base/v0.3.0` in `infra/flake.nix`, then re-lock as above) and run
+`./infra/up`.
+
+- The options `stackbase.logs.bufferBytes`, `batchSeconds`, `localDays` and
+  `stackbase.alerts.bufferAlertBytes` no longer exist; a project that sets
+  one gets an error pointing here. Delete the line.
+- The plain-text copy under `/var/log/vector` is gone. On the server use
+  `journalctl` (7 days).
+- The first run after the upgrade has no cursor, so it ships the whole
+  persisted journal (up to journald's 2 GiB cap). That takes several runs
+  of at most 240 s each, one minute apart, so expect a backlog of uploads
+  for a while on a busy node. Anything Vector had already delivered is
+  shipped again: the bucket will hold duplicates for that period. Each line
+  keeps its journal `cursor`, so deduplicate by `cursor` when searching
+  across the upgrade.
+- Vector's leftovers, `/var/lib/vector` and `/var/log/vector`, stay on
+  existing nodes. Delete them by hand once the new shipper has uploaded:
+  `./infra/up ssh a -- rm -rf /var/lib/vector /var/log/vector`.
+
 ## Things to watch
 
 Three ways to hurt yourself that no amount of code can prevent.
@@ -1363,8 +1401,7 @@ Every failure is one line: what went wrong, then what to check.
 | `… turns logs on but names no [logs] bucket` | Set `bucket` in `[logs]` (or `logs.bucket` in that environment), or `enabled = false` to leave logs off — see [Logs](#logs) |
 | `backups are required but no [backups] bucket is set` (or the same for logs) | Set `bucket = "…"` in that table, or opt out with `enabled = false`; see [Upgrading to v0.2.0](#upgrading-to-v020) |
 | `[logs] bucket = "…" is set but … has no complete set of logs credentials` | Set `logs_access_key_id`, `logs_secret_access_key` and `r2_endpoint` as in [Logs](#logs) |
-| `Invalid record from journald, discarding … text=-- cursor: s=…` in `journalctl -u vector` | Harmless: right after a restart Vector reads journalctl's own cursor trailer line, which is not a log entry. Nothing is lost |
-| Nothing new in the logs bucket | `./infra/up ssh a -- systemctl status vector` and `-- journalctl -u vector -n 50`; the usual causes are a wrong token or a bucket that does not exist |
+| Nothing new in the logs bucket | `./infra/up ssh a -- systemctl list-timers stackbase-logs` and `-- journalctl -u stackbase-logs -n 50`; the usual causes are a wrong token or a bucket that does not exist |
 | `[alerts] sends to … but … has no complete set of SMTP settings` | Set `smtp_host`, `smtp_port`, `smtp_user`, `smtp_password` and `smtp_from` as in [Alerts](#alerts), or remove `[alerts]` |
 | `the secret 'smtp_…' contains whitespace, a character a shell would reinterpret, or is not the right shape` | Set it again with `./infra/up secrets set smtp_…`; the message gives the allowed shape |
 | `the test alert was not queued on node a` | `./infra/up ssh a -- journalctl -u 'stackbase-alert@*' -u nullmailer -n 50`; run `up` first if the server predates `[alerts]` |
@@ -1495,11 +1532,18 @@ local clone instead so a consuming project runs it directly:
 STACKBASE_SRC=~/code/stack-base ./infra/up --plan
 ```
 
+The log shipper has an opt-in test against a real R2 bucket (a fake S3
+cannot catch what R2 rejects): `tests/test_log_shipper_r2.py`. Set
+`STACKBASE_R2_TEST_ENDPOINT`, `STACKBASE_R2_TEST_BUCKET`,
+`STACKBASE_R2_TEST_ACCESS_KEY_ID` and `STACKBASE_R2_TEST_SECRET_ACCESS_KEY`
+(a throwaway bucket) and run it under `nix shell nixpkgs#rclone`; without
+them it skips.
+
 In this mode the local checkout is uploaded to the server alongside your
 config and used directly, so edits to stack-base take effect on the next run.
 
 > `templates/infra/flake.nix` pins `inputs.stack-base.url` to
-> `github:TechSpaceAsia/stack-base/v0.1.0` — the third path segment is the
+> `github:TechSpaceAsia/stack-base/v0.3.0` — the third path segment is the
 > release every new project starts on. To move a project to a newer release,
 > change that segment and delete `infra/flake.lock` (or run `nix flake lock
 > --update-input stack-base` if Nix is installed locally), then run

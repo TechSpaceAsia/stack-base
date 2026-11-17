@@ -1,31 +1,41 @@
-# Logs off-box: the node's journal streamed to an S3-compatible bucket
-# (Cloudflare R2) by Vector, plus a short plain-text local copy.
+# Logs off-box: the node's journal shipped to an S3-compatible bucket
+# (Cloudflare R2) by nixos/log-shipper.py, a stdlib Python script run by a
+# systemd timer every `intervalSeconds` (60 s).
 #
-#   journald -> remap (nine fields) -> aws_s3  (disk buffer, end-to-end acks)
-#                                   -> file    /var/log/vector, 3 days
+#   stackbase-logs.timer -> stackbase-logs.service (oneshot)
+#     journalctl -o json after the saved cursor -> nine fields per entry
+#     -> one gzipped NDJSON object per event-hour -> rclone copyto (one PUT)
+#     -> rclone cat + sha256 compare -> only then the cursor moves
 #
-# What survives losing the server is what reached the bucket, so the R2
-# sink's batch timeout (`batchSeconds`, 15 s) is the loss window. Nothing
-# else is lost to an R2 outage shorter than the local journal's 7 days
-# (base.nix) -- provided the journal does not hit its SystemMaxUse=2G /
-# SystemKeepFree=4G caps first, which a very chatty node can: journald then
-# drops its oldest files, even ones Vector has not read yet. Vector's
-# journald checkpoint only moves once an event is in the disk buffer, and
-# the buffer blocks (rather than drops) when full, so the journal itself is
-# the overflow. One more small window: the disk buffer acknowledges on
-# write, not fsync, and journald syncs every 5 s, so a power cut can take
-# the last few seconds. Delivery is at-least-once -- every event keeps its
-# journal `cursor` so duplicates can be removed.
+# Objects land under `journal/<host>/%Y/%m/%d/%H/`, with the same fields
+# Vector wrote, so older archives and the README's search commands keep
+# working. Delivery is at-least-once: every line keeps its journal `cursor`
+# so duplicates can be removed.
 #
-# After a restart Vector may log one "Invalid record from journald ...
-# text=-- cursor: s=..." error. It is benign: that is journalctl's own
-# --show-cursor trailer line, which Vector reads but is not an entry.
+# What survives losing the server is what reached the bucket, so the timer
+# interval is the loss window. Nothing else is lost to an R2 outage shorter
+# than the local journal's 7 days (base.nix) -- provided the journal does
+# not hit its SystemMaxUse=2G / SystemKeepFree=4G caps first: journald then
+# drops its oldest files, shipped or not. The script detects a cursor that
+# was rotated away: it logs the gap, ships everything still readable, saves
+# its state, and then exits 1 for that one run, so the unit fails and the
+# OnFailure alert reports the lost logs. The next run exits 0 again.
+#
+# Why not Vector (what this module ran until v0.3.0): from 0.46 its S3 sink
+# sends two checksums and R2 rejects every upload
+# (https://github.com/vectordotdev/vector/issues/23029), while its
+# healthcheck still passes -- 0.55 failed exactly like that on a live host.
+# The VM test used MinIO, which cannot catch it. The script reads every
+# object back before it moves the cursor, so a silently rejected upload can
+# never be mistaken for a shipped one.
 #
 # Credentials come from /var/lib/stackbase/logs.env (written by
 # `./infra/up`'s ENSURE_LOGS_ENV step from the environment's logs_* secrets
-# and r2_endpoint) through systemd's EnvironmentFile. The config only says
-# `${LOGS_ENDPOINT}`, which Vector interpolates at start-up, and the key
-# pair is picked up by Vector's AWS credential chain -- no key value ever
+# and r2_endpoint) through systemd's EnvironmentFile, read by PID 1 before
+# the unit drops to its user. rclone is configured purely from the
+# environment (remote `logs`, RCLONE_CONFIG_LOGS_*): the key pair through
+# its AWS env-auth, the endpoint exported by the small wrapper below --
+# systemd does not expand variables inside Environment=. No key value ever
 # enters the Nix store, which is world-readable.
 #
 # Retention is NOT here: the bucket's lifecycle rule (stackbase/r2.py)
@@ -36,123 +46,31 @@ let
   cfg = config.stackbase.logs;
 
   logsEnvFile = "/var/lib/stackbase/logs.env";
-  localDir = "/var/log/vector";
-  dataDir = "/var/lib/vector";
+  stateDir = "/var/lib/stackbase-logs";
+  unitName = "stackbase-logs";
+  interval = "${toString cfg.intervalSeconds}s";
 
-  settings = {
-    data_dir = dataDir;
+  removedMessage = "Vector was replaced by the stackbase-logs timer in v0.3.0; see README Logs.";
 
-    # Local only: `vector top` and `vector tap` talk to it.
-    api = {
-      enabled = true;
-      address = "127.0.0.1:8686";
-    };
-
-    sources.journal = {
-      type = "journald";
-      # The whole persistent journal, from wherever the checkpoint in
-      # data_dir says shipping stopped -- a reboot or a long outage must
-      # not skip anything still on disk.
-      current_boot_only = false;
-      since_now = false;
-      # Vector's own complaints about an unreachable bucket would otherwise
-      # be shipped to that same bucket, feeding themselves.
-      exclude_units = [ "vector.service" ];
-      # Vector 0.55 drops __CURSOR unless asked; the remap below keeps it
-      # so at-least-once duplicates can be removed downstream.
-      emit_cursor = true;
-    };
-
-    sources.vector_metrics.type = "internal_metrics";
-
-    # Keep only what a person searching logs needs. Everything else
-    # journald attaches (_CMDLINE, _EXE, _CAP_EFFECTIVE, ...) stays on the
-    # node. `compact` drops the fields a given entry does not have.
-    transforms.slim = {
-      type = "remap";
-      inputs = [ "journal" ];
-      source = ''
-        . = compact({
-          "timestamp": .timestamp,
-          "host": .host,
-          "unit": ._SYSTEMD_UNIT,
-          "ident": .SYSLOG_IDENTIFIER,
-          "pid": ._PID,
-          "priority": .PRIORITY,
-          "message": .message,
-          "boot_id": ._BOOT_ID,
-          "cursor": .__CURSOR
-        })
-      '';
-    };
-
-    sinks.r2 = {
-      type = "aws_s3";
-      inputs = [ "slim" ];
-      inherit (cfg) bucket;
-      region = "auto";
-      endpoint = "\${LOGS_ENDPOINT}";
-      force_path_style = true;
-      key_prefix = "journal/{{ host }}/%Y/%m/%d/%H/";
-      filename_append_uuid = true;
-      filename_extension = "ndjson.gz";
-      compression = "gzip";
-      encoding.codec = "json";
-      framing.method = "newline_delimited";
-      # One object per batch, not multipart: parts stay invisible until the
-      # upload completes and must each be >= 5 MiB, so a server lost
-      # mid-upload would lose all of it. ~170k PUTs per server per month.
-      batch = {
-        timeout_secs = cfg.batchSeconds;
-        max_bytes = 67108864;
-      };
-      buffer = {
-        type = "disk";
-        max_size = cfg.bufferBytes;
-        when_full = "block";
-      };
-      acknowledgements.enabled = true;
-      request.concurrency = "adaptive";
-      healthcheck.enabled = true;
-      # Deliberately no storage_class, ACL or server-side encryption
-      # option: R2 rejects or ignores them, and the bucket decides.
-    };
-
-    # Best effort by design: a small memory buffer that drops when full, so
-    # a full local disk (or a slow one) can never back-pressure the R2 sink.
-    sinks.local = {
-      type = "file";
-      inputs = [ "slim" ];
-      path = "${localDir}/%Y-%m-%d/%H.ndjson";
-      encoding.codec = "json";
-      framing.method = "newline_delimited";
-      buffer = {
-        type = "memory";
-        max_events = 10000;
-        when_full = "drop_newest";
-      };
-    };
-
-    sinks.metrics = {
-      type = "prometheus_exporter";
-      inputs = [ "vector_metrics" ];
-      address = "127.0.0.1:9598";
-    };
+  # Exports the one rclone setting that has to come from logs.env, then
+  # runs its arguments. Fails (and so the unit fails and alerts) when
+  # logs.env lacks the endpoint, instead of rclone guessing AWS.
+  withEndpoint = pkgs.writeShellApplication {
+    name = "stackbase-logs-with-endpoint";
+    text = ''
+      : "''${LOGS_ENDPOINT:?LOGS_ENDPOINT is not set -- see ${logsEnvFile}}"
+      export RCLONE_CONFIG_LOGS_ENDPOINT="$LOGS_ENDPOINT"
+      exec "$@"
+    '';
   };
-
-  # The nixpkgs module's own build-time `vector validate` cannot see
-  # ${LOGS_ENDPOINT} and fails on it, so it is turned off and replaced by
-  # this one, which supplies a dummy endpoint. It validates the MERGED
-  # services.vector.settings -- the exact file the unit runs, including
-  # anything infra/conf.d added -- so a typo in any option name still fails
-  # the build, never the server.
-  configFile = (pkgs.formats.toml { }).generate "vector.toml" config.services.vector.settings;
-  validated = pkgs.runCommand "stackbase-vector-validate" { nativeBuildInputs = [ config.services.vector.package ]; } ''
-    LOGS_ENDPOINT=https://validate.invalid vector validate --no-environment ${configFile}
-    touch "$out"
-  '';
 in
 {
+  imports = [
+    (lib.mkRemovedOptionModule [ "stackbase" "logs" "bufferBytes" ] removedMessage)
+    (lib.mkRemovedOptionModule [ "stackbase" "logs" "batchSeconds" ] removedMessage)
+    (lib.mkRemovedOptionModule [ "stackbase" "logs" "localDays" ] removedMessage)
+  ];
+
   options.stackbase.logs = {
     enable = lib.mkOption {
       type = lib.types.bool;
@@ -175,31 +93,13 @@ in
       '';
     };
 
-    bufferBytes = lib.mkOption {
+    intervalSeconds = lib.mkOption {
       type = lib.types.ints.positive;
-      default = 1073741824;
+      default = 60;
       description = ''
-        Size of Vector's on-disk buffer for the R2 sink. When it is full the
-        sink blocks and the journal holds the rest, so this bounds disk use,
-        not what an outage can lose. Vector refuses less than 256 MiB.
-      '';
-    };
-
-    batchSeconds = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 15;
-      description = ''
-        Longest an event waits before its batch is uploaded -- and so the
-        most a destroyed server can lose.
-      '';
-    };
-
-    localDays = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 3;
-      description = ''
-        Days the plain-text local copy under ${localDir} is kept
-        (systemd-tmpfiles ages it out).
+        Seconds between the end of one shipper run and the start of the
+        next (and after boot before the first) -- and so roughly the most a
+        destroyed server can lose.
       '';
     };
   };
@@ -212,59 +112,72 @@ in
       }
     ];
 
-    services.vector = {
-      enable = true;
-      journaldAccess = true;
-      validateConfig = false;
-      inherit settings;
-    };
-
-    system.checks = [ validated ];
-
-    # Searching the plain-text local copy is the README's first suggestion
-    # (`rg ... /var/log/vector`); the vector CLI itself (validate, top, tap)
-    # comes with services.vector.
-    environment.systemPackages = [ pkgs.ripgrep ];
-
-    # A static user rather than the module's DynamicUser: the local copy's
-    # directory is created and aged out by systemd-tmpfiles, which runs
-    # before Vector does and must name an owner that exists at boot -- a
-    # dynamic user only exists while its unit is running. logs.env stays
-    # root:root 0600 all the same: systemd reads an EnvironmentFile as
-    # PID 1, before dropping to this user, so Vector never opens it itself.
-    users.users.vector = {
+    # A static user rather than DynamicUser: /var/lib/stackbase-logs must be
+    # a real directory with a stable owner, which other units (the alert
+    # watchdog reads `last-success`) can rely on between runs. logs.env stays
+    # root:root 0600: systemd reads an EnvironmentFile as PID 1, before
+    # dropping to this user, so the script never opens it itself.
+    users.users.${unitName} = {
       isSystemUser = true;
-      group = "vector";
+      group = unitName;
     };
-    users.groups.vector = { };
+    users.groups.${unitName} = { };
 
-    systemd.tmpfiles.rules = [
-      "d ${localDir} 0750 vector vector ${toString cfg.localDays}d"
-    ];
-
-    systemd.services.vector = {
-      # The credentials file arrives before the rebuild that first starts
-      # Vector (see the ENSURE_LOGS_ENV step), so it is required, not "-":
-      # without it ${LOGS_ENDPOINT} is unset and Vector would not start.
+    systemd.services.${unitName} = {
+      description = "Ship the journal to R2";
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      path = [ pkgs.systemd pkgs.rclone ];
+      environment = {
+        LOGS_BUCKET = cfg.bucket;
+        LOGS_STATE = stateDir;
+        LOGS_EXCLUDE_UNIT = "${unitName}.service";
+        RCLONE_CONFIG = "/dev/null";
+        RCLONE_CONFIG_LOGS_TYPE = "s3";
+        RCLONE_CONFIG_LOGS_PROVIDER = "Cloudflare";
+        RCLONE_CONFIG_LOGS_ENV_AUTH = "true";
+        RCLONE_CONFIG_LOGS_REGION = "auto";
+        RCLONE_CONFIG_LOGS_NO_CHECK_BUCKET = "true";
+      };
       serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${withEndpoint}/bin/stackbase-logs-with-endpoint ${pkgs.python3}/bin/python3 ${./log-shipper.py}";
+        # Required, not "-": the ENSURE_LOGS_ENV step pushes it before the
+        # rebuild that installs this unit.
         EnvironmentFile = logsEnvFile;
-        DynamicUser = lib.mkForce false;
-        User = "vector";
-        Group = "vector";
-        # What DynamicUser implied, kept: read-only system, with only the
-        # buffer/checkpoint directory (StateDirectory) and the local copy
-        # writable.
+        User = unitName;
+        Group = unitName;
+        SupplementaryGroups = [ "systemd-journal" ];
+        StateDirectory = unitName;
+        StateDirectoryMode = "0700";
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;
         NoNewPrivileges = true;
-        # LogsDirectory as well as the tmpfiles rule: tmpfiles runs at boot,
-        # but the first switch that turns logs on starts Vector straight
-        # away, and a ReadWritePaths entry that does not exist yet fails the
-        # unit. systemd creates (and chowns) this one before every start.
-        LogsDirectory = "vector";
-        LogsDirectoryMode = "0750";
-        ReadWritePaths = [ localDir ];
+        # The script's 240 s run budget is checked only between objects, so
+        # one 64 MiB upload plus read-back can run past it.
+        TimeoutStartSec = 600;
+        Nice = 10;
+        IOSchedulingClass = "idle";
+      };
+    };
+
+    # enabled-at: when shipping was turned on, which the alert watchdog
+    # (nixos/alerts.nix) counts from until the first `last-success`.
+    # Created once, never touched again. The directory line repeats the
+    # unit's StateDirectory owner and mode exactly, so tmpfiles and systemd
+    # never correct each other.
+    systemd.tmpfiles.rules = [
+      "d ${stateDir} 0700 ${unitName} ${unitName} -"
+      "f ${stateDir}/enabled-at 0600 ${unitName} ${unitName} -"
+    ];
+
+    systemd.timers.${unitName} = {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnBootSec = interval;
+        OnUnitInactiveSec = interval;
+        AccuracySec = "5s";
       };
     };
   };

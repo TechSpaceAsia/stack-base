@@ -87,7 +87,7 @@ role = "primary"
 # on_calendar = "03:00"
 
 # REQUIRED (since v0.2.0; uncomment one choice): the servers' journal,
-# shipped off-box to R2 by Vector. Name a bucket (its own R2 token:
+# shipped off-box to R2 by the stackbase-logs timer. Name a bucket (its own R2 token:
 # logs_access_key_id and logs_secret_access_key in the secrets) or opt out
 # with `enabled = false`. Needs the cloudflare_account_id secret, to set the
 # retention rule. retention_days defaults to 90.

@@ -1,10 +1,14 @@
 # NixOS VM test wired as `checks.x86_64-linux.vm-logs` in flake.nix. Boots
 # one stackbase node with nixos/logs.nix shipping its journal to a MinIO
 # bucket on the same machine (tests/minio.nix, standing in for R2), and
-# proves the properties the design rests on: entries arrive within one
-# batch, slimmed to nine fields; an S3 outage plus a Vector restart loses
-# nothing; a full local disk never holds up the bucket; Vector does not
+# proves the properties the design rests on: entries arrive within two
+# timer intervals, slimmed to the nine fields; an S3 outage loses nothing
+# once the bucket is back; a run killed mid-upload leaves no gap, and any
+# duplicate is the same journal entry (same cursor); the shipper does not
 # ship its own logs.
+#
+# MinIO cannot catch an R2-only rejection (what retired Vector); that is
+# tests/test_log_shipper_r2.py's job, against a real bucket.
 #
 # Iterate on it alone with:
 #   nix build .#checks.x86_64-linux.vm-logs -L
@@ -16,9 +20,9 @@ let
   adminKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJBDGmdzpEogrHBnAP+a1MKjbV+D9E9nQOVx8m2wcmt3 vm-test-admin";
 
   bucket = "logs";
-  # Shorter than production's 15 s so the test does not idle; the
+  # Shorter than production's 60 s so the test does not idle; the
   # behaviour under test does not depend on the value.
-  batchSeconds = 5;
+  interval = 5;
 in
 pkgs.testers.runNixOSTest {
   name = "stackbase-vm-logs";
@@ -36,14 +40,14 @@ pkgs.testers.runNixOSTest {
       stackbase.admins.deploy = adminKey;
 
       stackbase.logs.bucket = bucket;
-      stackbase.logs.batchSeconds = batchSeconds;
+      stackbase.logs.intervalSeconds = interval;
 
       # What `./infra/up`'s ENSURE_LOGS_ENV puts on a real node: the same
-      # path, owner and mode, written before Vector first starts.
+      # path, owner and mode, written before the shipper first runs.
       systemd.services.stackbase-test-logs-env = {
         wantedBy = [ "multi-user.target" ];
-        before = [ "vector.service" ];
-        requiredBy = [ "vector.service" ];
+        before = [ "stackbase-logs.service" ];
+        requiredBy = [ "stackbase-logs.service" ];
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
@@ -55,14 +59,20 @@ pkgs.testers.runNixOSTest {
       };
 
       environment.systemPackages = [
-        pkgs.curl
         pkgs.gzip
-        # Every event in the bucket, one JSON object per line, decompressed
-        # whichever way an object was stored (zcat -f passes plain through).
+        # Every event in the bucket, one JSON object per line.
         (pkgs.writeShellScriptBin "dump-journal" ''
           rm -rf /tmp/dl && mkdir -p /tmp/dl
           s3 cp --recursive s3/${bucket}/journal/ /tmp/dl/ >/dev/null 2>&1 || true
-          find /tmp/dl -type f -name '*.ndjson.gz' -exec zcat -f {} +
+          find /tmp/dl -type f -name '*.ndjson.gz' -exec zcat {} +
+        '')
+        # Like dump-journal, prefixed with the object key: "<key>\t<line>".
+        (pkgs.writeShellScriptBin "dump-journal-keys" ''
+          rm -rf /tmp/dlk && mkdir -p /tmp/dlk
+          s3 cp --recursive s3/${bucket}/journal/ /tmp/dlk/ >/dev/null 2>&1 || true
+          cd /tmp/dlk && find . -type f -name '*.ndjson.gz' | while read -r f; do
+            zcat "$f" | sed "s|^|journal/''${f#./}\t|"
+          done
         '')
       ];
       virtualisation.diskSize = 4096;
@@ -70,16 +80,20 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     import json
+    import re
     import time
     import uuid
+    from datetime import datetime, timezone
 
     start_all()
     node.wait_for_unit("multi-user.target")
     ${minio.createBucket "node" bucket}
-    node.wait_for_unit("vector.service")
-    node.wait_for_open_port(9598)
+    node.wait_for_unit("stackbase-logs.timer")
 
+    INTERVAL = ${toString interval}
+    STATE = "/var/lib/stackbase-logs"
     KEEP = {"timestamp", "host", "unit", "ident", "pid", "priority", "message", "boot_id", "cursor"}
+    NAME = re.compile(r"(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}\.ndjson\.gz")
 
 
     def keys():
@@ -92,128 +106,142 @@ pkgs.testers.runNixOSTest {
         return [json.loads(line) for line in out.splitlines() if line.strip()]
 
 
-    def messages():
-        return {e.get("message") for e in events()}
+    def wait_all(want, what, timeout=300):
+        """Until every message in `want` is in the bucket; returns the events."""
+        deadline = time.monotonic() + timeout
+        while True:
+            evs = events()
+            got = want & {e.get("message") for e in evs}
+            if got == want:
+                return evs
+            assert time.monotonic() < deadline, f"only {len(got)} of {len(want)} {what} arrived"
+            time.sleep(INTERVAL)
+
+
+    def assert_no_gap_and_dup_by_cursor(evs, want, what):
+        cursors = {}
+        for e in evs:
+            if e.get("message") in want:
+                cursors.setdefault(e["message"], set()).add(e["cursor"])
+        assert set(cursors) == want, f"{len(want - set(cursors))} {what} missing"
+        # A message shipped twice must be the same journal entry twice.
+        bad = {m: c for m, c in cursors.items() if len(c) != 1}
+        assert not bad, f"{what} with more than one cursor: {list(bad.items())[:3]}"
+        dups = sum(1 for e in evs if e.get("message") in want) - len(want)
+        print(f"{len(want)} {what}: none missing, {dups} duplicate line(s), all same-cursor")
 
 
     with subtest("test_logs_reach_s3"):
+        # Let the first (boot) run finish, so the probe is timed against a
+        # steady timer, as on a running server.
+        node.wait_until_succeeds(f"test -s {STATE}/last-success", timeout=120)
         probe = str(uuid.uuid4())
         started = time.monotonic()
         node.succeed(f"logger -t probe {probe}")
-        node.wait_until_succeeds(f"dump-journal | grep -q {probe}", timeout=${toString (batchSeconds * 4)})
-        print(f"probe reached the bucket after {time.monotonic() - started:.1f}s (batch {${toString batchSeconds}}s)")
+        # Two intervals, plus the timer's 5 s AccuracySec and one run.
+        # Not grep -q: the driver runs with pipefail, and zcat's SIGPIPE
+        # would fail the match it found.
+        node.wait_until_succeeds(f"dump-journal | grep {probe} >/dev/null", timeout=2 * INTERVAL + 15)
+        print(f"probe reached the bucket after {time.monotonic() - started:.1f}s (interval {INTERVAL}s)")
 
         layout = [k for k in keys() if k.startswith("journal/node/")]
         assert layout, keys()
         for key in layout:
-            # journal/<host>/%Y/%m/%d/%H/<uuid>.ndjson.gz
+            # journal/<host>/%Y/%m/%d/%H/<first-event-unix-seconds>-<uuid4>.ndjson.gz
             parts = key.split("/")
-            assert len(parts) == 7 and parts[-1].endswith(".ndjson.gz"), key
+            assert len(parts) == 7, key
             assert all(p.isdigit() for p in parts[2:6]), key
+            m = NAME.fullmatch(parts[6])
+            assert m, key
+            # The hour directory is the UTC hour of the first event's seconds.
+            hour = datetime.fromtimestamp(int(m.group(1)), timezone.utc).strftime("%Y/%m/%d/%H")
+            assert "/".join(parts[2:6]) == hour, key
 
-        found = [e for e in events() if e.get("message") == probe]
-        assert found, "probe not in any object"
-        event = found[0]
+        rows = node.succeed(f"dump-journal-keys | grep {probe}").strip().splitlines()
+        key, line = rows[0].split("\t", 1)
+        event = json.loads(line)
+        assert set(event) == KEEP, sorted(set(event) ^ KEEP)
+        assert all(isinstance(v, str) for v in event.values()), event
+        assert event["message"] == probe, event
         assert event["ident"] == "probe", event
         assert event["unit"], event
         assert event["cursor"].startswith("s="), event
         assert event["host"] == "node", event
-        assert set(event) <= KEEP, sorted(set(event) - KEEP)
-        assert "_CMDLINE" not in event, event
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z", event["timestamp"]), event
+        # The probe's object sits under the probe's own UTC hour.
+        assert key.split("/")[2:6] == [event["timestamp"][0:4], event["timestamp"][5:7], event["timestamp"][8:10], event["timestamp"][11:13]], (key, event)
 
-    with subtest("the plain-text local copy has the probe too"):
-        node.succeed(f"grep -rq {probe} /var/log/vector/")
-        node.succeed("test \"$(stat -c '%U %a' /var/log/vector)\" = 'vector 750'")
+    with subtest("test_shipper_own_logs_excluded"):
+        # The shipper does log under its own unit ("shipped N object(s)")...
+        node.succeed("test -n \"$(journalctl _SYSTEMD_UNIT=stackbase-logs.service --no-pager -o cat)\"")
+        # ...and none of it reaches the bucket.
+        evs = events()
+        units = {e.get("unit") for e in evs}
+        assert "stackbase-logs.service" not in units, units
+        assert not [e for e in evs if (e.get("message") or "").startswith("log-shipper:")]
 
-    with subtest("test_vector_own_logs_excluded"):
-        # Vector does log (its start-up lines at least) -- they just stay home.
-        node.succeed("test -n \"$(journalctl -u vector.service --no-pager -o cat)\"")
-        shipped_units = {e.get("unit") for e in events()}
-        assert "vector.service" not in shipped_units, shipped_units
-
-    with subtest("credentials file, user, metrics and API are as designed"):
+    with subtest("credentials file, user and state are as designed"):
         node.succeed("test \"$(stat -c '%U:%G %a' /var/lib/stackbase/logs.env)\" = 'root:root 600'")
-        node.succeed("test \"$(systemctl show -p User --value vector.service)\" = vector")
-        metrics = node.succeed("curl -sf http://127.0.0.1:9598/metrics")
-        assert "vector_component_sent_events_total" in metrics, metrics[:400]
-        assert "vector_buffer_byte_size" in metrics, metrics[:400]
-        node.succeed("curl -sf http://127.0.0.1:8686/health")
-        # Neither listens beyond loopback.
-        node.fail("ss -ltnH | grep -E ':(9598|8686) ' | grep -v 127.0.0.1")
+        node.succeed("test \"$(systemctl show -p User --value stackbase-logs.service)\" = stackbase-logs")
+        node.succeed(f"test \"$(stat -c '%U %G %a' {STATE})\" = 'stackbase-logs stackbase-logs 700'")
+        node.succeed(f"test -s {STATE}/cursor")
 
     with subtest("test_logs_survive_s3_outage"):
         tag = f"outage-{uuid.uuid4()}"
         node.succeed("systemctl stop minio.service")
+        failed_before = int(node.succeed(
+            "journalctl -u stackbase-logs.service -o cat --no-pager | grep -c '^log-shipper: failed: ' || true"
+        ).strip())
         node.succeed(f"for i in $(seq 1 1000); do logger -t outage {tag}-$i; done")
-        # Let Vector read them and fail at least one upload, so they sit in
-        # its disk buffer rather than only in the journal...
-        time.sleep(${toString (batchSeconds * 3)})
-        # The disk buffer, not the journal, must be what brings them back:
-        # there is data under data_dir's buffer for the R2 sink, and the
-        # journald source's checkpoint (<data_dir>/<source id>/checkpoint.txt
-        # in Vector 0.55) is already past every probe -- so a re-read of the
-        # journal after the restart would not include a single one of them.
-        node.succeed("find /var/lib/vector/buffer -type f -size +1k | grep -q .")
-        checkpoint = "/var/lib/vector/journal/checkpoint.txt"
-        node.succeed(f"test -s {checkpoint}")
-        print("journald checkpoint: " + node.succeed(f"cat {checkpoint}").strip())
-        # A real cursor in this journal, so the --after-cursor count below
-        # cannot be 0 merely because journalctl rejected the cursor.
-        node.succeed(f"journalctl --no-pager -n 1 --cursor=\"$(cat {checkpoint})\" >/dev/null")
+        # At least one run reads them, fails to upload, and keeps them
+        # spooled with the cursor unmoved.
+        node.wait_until_succeeds(
+            "test $(journalctl -u stackbase-logs.service -o cat --no-pager "
+            f"| grep -c '^log-shipper: failed: ' || true) -gt {failed_before}",
+            timeout=120,
+        )
+        node.succeed(f"test -n \"$(ls -A {STATE}/pending)\"")
+        # Runs keep failing for a few intervals; nothing moves meanwhile.
+        time.sleep(3 * INTERVAL)
+        cursor = node.succeed(f"cat {STATE}/cursor").strip()
         logged = node.succeed(f"journalctl -t outage -o cat --no-pager | grep -c '^{tag}-' || true").strip()
-        assert logged == "1000", f"journal has {logged} of the probes before the restart"
+        assert logged == "1000", f"journal has {logged} of the probes"
         after = node.succeed(
-            f"journalctl -t outage -o cat --no-pager --after-cursor=\"$(cat {checkpoint})\" "
-            f"| grep -c '^{tag}-' || true"
+            f"journalctl -t outage -o cat --no-pager --after-cursor='{cursor}' | grep -c '^{tag}-' || true"
         ).strip()
-        print(f"probes in the journal after the checkpoint: {after}")
-        assert after == "0", f"{after} probes are still ahead of the checkpoint"
-        # And remove them from the journal altogether, so nothing but the
-        # buffer could possibly deliver them.
-        node.succeed("journalctl --rotate && journalctl --vacuum-time=1s")
-        gone = node.succeed(f"journalctl -t outage -o cat --no-pager | grep -c '^{tag}-' || true").strip()
-        print(f"probes left in the journal after vacuum: {gone}")
-        assert gone == "0", f"{gone} probes survived the vacuum"
-        # ...then restart it while the bucket is still unreachable: whatever
-        # was buffered must survive the restart.
-        node.succeed("systemctl restart vector.service")
-        node.wait_for_unit("vector.service")
+        assert after == "1000", f"the cursor moved past {1000 - int(after)} unshipped probes"
+
         node.succeed("systemctl start minio.service")
         node.wait_for_open_port(${toString minio.port})
-
         want = {f"{tag}-{i}" for i in range(1, 1001)}
-        deadline = time.monotonic() + 300
-        while True:
-            got = want & messages()
-            if got == want:
-                break
-            assert time.monotonic() < deadline, f"only {len(got)} of 1000 arrived"
-            time.sleep(5)
-        print("all 1000 outage probes arrived")
+        evs = wait_all(want, "outage probes")
+        assert_no_gap_and_dup_by_cursor(evs, want, "outage probes")
+        node.wait_until_succeeds(f"test -z \"$(ls -A {STATE}/pending)\"", timeout=60)
 
-    with subtest("test_local_sink_full_does_not_block_r2"):
-        node.succeed("systemctl stop vector.service")
-        node.succeed(
-            "mount -t tmpfs -o size=1m,mode=0750,uid=$(id -u vector),gid=$(id -g vector) tmpfs /var/log/vector"
+    with subtest("test_restart_mid_backlog_no_gap"):
+        # Freeze MinIO: connections are accepted but never answered, so a
+        # run hangs inside its upload -- then kill that run outright, the
+        # way a crash or an OOM kill would.
+        tag = f"restart-{uuid.uuid4()}"
+        node.succeed("systemctl kill -s SIGSTOP minio.service")
+        node.succeed(f"for i in $(seq 1 1000); do logger -t restart {tag}-$i; done")
+        node.wait_until_succeeds(
+            "test \"$(systemctl show -p ActiveState --value stackbase-logs.service)\" = activating "
+            f"&& pgrep -u stackbase-logs rclone && test -n \"$(ls -A {STATE}/pending)\"",
+            timeout=120,
         )
-        node.succeed("dd if=/dev/zero of=/var/log/vector/fill bs=4k 2>/dev/null || true")
-        node.succeed("test \"$(df --output=avail /var/log/vector | tail -1 | tr -d ' ')\" = 0")
-        node.succeed("systemctl start vector.service")
-        node.wait_for_unit("vector.service")
+        time.sleep(2)
+        node.succeed("systemctl kill -s SIGKILL stackbase-logs.service")
+        node.wait_until_succeeds(
+            "test \"$(systemctl show -p ActiveState --value stackbase-logs.service)\" != activating",
+            timeout=30,
+        )
+        print("killed a run mid-upload; pending: " + node.succeed(f"ls -A {STATE}/pending").strip())
 
-        full = f"full-{uuid.uuid4()}"
-        node.succeed(f"for i in $(seq 1 200); do logger -t full {full}-$i; done")
-        want = {f"{full}-{i}" for i in range(1, 201)}
-        deadline = time.monotonic() + 120
-        while True:
-            got = want & messages()
-            if got == want:
-                break
-            assert time.monotonic() < deadline, f"only {len(got)} of 200 arrived with the local disk full"
-            time.sleep(5)
-        node.fail(f"grep -rq {full} /var/log/vector/")
-
-        node.succeed("systemctl stop vector.service && umount /var/log/vector && systemctl start vector.service")
-        node.wait_for_unit("vector.service")
+        node.succeed("systemctl kill -s SIGCONT minio.service")
+        want = {f"{tag}-{i}" for i in range(1, 1001)}
+        evs = wait_all(want, "restart probes")
+        assert_no_gap_and_dup_by_cursor(evs, want, "restart probes")
+        node.wait_until_succeeds(f"test -z \"$(ls -A {STATE}/pending)\"", timeout=120)
   '';
 }

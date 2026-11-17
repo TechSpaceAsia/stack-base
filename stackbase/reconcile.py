@@ -1176,7 +1176,7 @@ def plan(cfg: StackConfig, state: StackState, observed: Observed, *, env: Enviro
 
     for name in env.nodes:
         # BEFORE the rebuild, unlike the other two env files: the rebuild is
-        # what starts Vector, Vector cannot start without ${LOGS_ENDPOINT},
+        # what turns on the log shipper, which cannot upload without ${LOGS_ENDPOINT},
         # and a unit that fails to start fails the whole `switch`. The step
         # creates /var/lib/stackbase itself, so it needs nothing the rebuild
         # provides. No [logs] (or an opt-out) plans nothing and removes nothing.

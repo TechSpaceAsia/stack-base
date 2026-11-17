@@ -171,12 +171,12 @@ let
   };
 
   # Hourly. Fails (exit 1, so the drop-in mails it) on anything stale;
-  # exits 0 inside the grace after boot, while Vector and the first backup
-  # are still catching up. Tunables arrive as environment variables so the
+  # exits 0 inside the grace after boot, while log shipping and the first
+  # backup are still catching up. Tunables arrive as environment variables so the
   # unit file shows exactly what is being enforced.
   freshness = pkgs.writeShellApplication {
     name = "stackbase-freshness";
-    runtimeInputs = [ pkgs.coreutils pkgs.curl pkgs.gawk pkgs.systemd ];
+    runtimeInputs = [ pkgs.coreutils ];
     text = ''
       uptime=$(cut -d. -f1 /proc/uptime)
       if (( uptime < GRACE_SECONDS )); then
@@ -213,49 +213,29 @@ let
       fi
 
       if [ "$CHECK_LOGS" = 1 ]; then
-        if ! systemctl is-active --quiet vector.service; then
-          problems+=("logs: vector.service is not active -- see journalctl -u vector")
-        elif ! metrics=$(curl -sf --max-time 10 http://127.0.0.1:9598/metrics); then
-          problems+=("logs: could not read Vector's metrics on 127.0.0.1:9598")
+        # The same clock as backups, from the shipper's own stamp:
+        # stackbase-logs.service writes last-success at the end of every run
+        # that exits 0, so it ages only while runs fail (or never start).
+        # Before the first success the age counts from enabled-at (tmpfiles,
+        # nixos/logs.nix), and fails closed the same way: no stamp at all
+        # starts the clock now. The directory is the unit's 0700
+        # StateDirectory, owned by its user -- this watchdog reads it as root.
+        logs=/var/lib/stackbase-logs
+        if [ -r "$logs/last-success" ]; then
+          last=$(cat "$logs/last-success")
+          if [[ ! "$last" =~ ^[0-9]+$ ]]; then last=0; fi
+          what="no log upload has succeeded since $(date -u -d "@$last" -Is)"
         else
-          # The R2 sink's series only (component_id="r2"), summed over
-          # whatever other labels they carry. The value is the first field
-          # after the closing brace of the label set.
-          metric() {
-            printf '%s\n' "$metrics" | awk -v name="$1" '
-              index($0, name "{") == 1 && index($0, "component_id=\"r2\"") {
-                line = $0; sub(/^[^}]*\} */, "", line); split(line, f, " "); sum += f[1]
-              }
-              END { printf "%.0f\n", sum + 0 }'
-          }
-          buffered=$(metric vector_buffer_byte_size)
-          sent=$(metric vector_component_sent_events_total)
-          # What entered the R2 sink's buffer: it keeps rising during an R2
-          # outage (the disk buffer accepts while `sent` stays flat), unlike
-          # the sink's own received counter, which stalls together with sent.
-          received=$(metric vector_buffer_received_events_total)
-
-          if (( buffered > BUFFER_ALERT_BYTES )); then
-            problems+=("logs: $buffered bytes are waiting in Vector's R2 buffer (alert above $BUFFER_ALERT_BYTES) -- R2 has been unreachable for a while; see journalctl -u vector")
+          if [ ! -e "$logs/enabled-at" ]; then
+            install -d -m 0700 -o stackbase-logs -g stackbase-logs "$logs"
+            install -m 0600 -o stackbase-logs -g stackbase-logs /dev/null "$logs/enabled-at"
+            echo "no log upload stamp yet: counting from now ($(date -u -Is))"
           fi
-
-          # Counters reset when Vector restarts, so a sample is only
-          # compared with one taken at least SENT_STALL_SECONDS ago in the
-          # same run of Vector: samples with a counter above today's value
-          # (from before a restart) are dropped first.
-          samples=/var/lib/stackbase-freshness/r2-samples
-          touch "$samples"
-          awk -v sent="$sent" -v received="$received" '$2 <= sent && $3 <= received' "$samples" > "$samples.same-run"
-          mv -f "$samples.same-run" "$samples"
-          old=$(awk -v cutoff=$(( now - SENT_STALL_SECONDS )) '$1 <= cutoff { line = $0 } END { print line }' "$samples")
-          if [ -n "$old" ]; then
-            read -r old_ts old_sent old_received <<<"$old"
-            if (( sent == old_sent && received > old_received )); then
-              problems+=("logs: Vector has sent nothing to R2 since $(date -u -d "@$old_ts" -Is) although $(( received - old_received )) events came in -- see journalctl -u vector")
-            fi
-          fi
-          { awk -v keep=$(( now - 2 * SENT_STALL_SECONDS )) '$1 >= keep' "$samples"; echo "$now $sent $received"; } > "$samples.new"
-          mv -f "$samples.new" "$samples"
+          last=$(stat -c %Y "$logs/enabled-at")
+          what="no log upload has succeeded yet; log shipping was turned on at $(date -u -d "@$last" -Is)"
+        fi
+        if (( now - last > LOGS_MAX_AGE_SECONDS )); then
+          problems+=("logs: $what, more than $(( LOGS_MAX_AGE_SECONDS / 60 )) min ago -- see journalctl -u stackbase-logs")
         fi
       fi
 
@@ -268,6 +248,11 @@ let
   };
 in
 {
+  imports = [
+    (lib.mkRemovedOptionModule [ "stackbase" "alerts" "bufferAlertBytes" ]
+      "Vector was replaced by the stackbase-logs timer in v0.3.0; the watchdog now checks the shipper's last-success stamp (stackbase.alerts.logsMaxAgeSeconds). See README Logs.")
+  ];
+
   options.stackbase.alerts = {
     to = lib.mkOption {
       # One address each, the same shape as smtp_from: these land in a To:
@@ -293,12 +278,13 @@ in
       description = "Journal lines of the failed unit included in the email.";
     };
 
-    bufferAlertBytes = lib.mkOption {
+    logsMaxAgeSeconds = lib.mkOption {
       type = lib.types.ints.positive;
-      default = 268435456;
+      default = 900;
       description = ''
-        The watchdog fails when Vector's R2 disk buffer holds more than this:
-        R2 has then been unreachable for a while. Lowered only by the VM test.
+        The watchdog fails when the log shipper has not completed a run for
+        longer than this (15 min: fifteen missed one-minute runs, so a
+        brief R2 outage or a slow catch-up is not mailed).
       '';
     };
 
@@ -422,8 +408,7 @@ in
       environment = {
         GRACE_SECONDS = toString cfg.graceSeconds;
         BACKUP_MAX_AGE_SECONDS = toString (36 * 3600);
-        BUFFER_ALERT_BYTES = toString cfg.bufferAlertBytes;
-        SENT_STALL_SECONDS = toString (2 * 3600);
+        LOGS_MAX_AGE_SECONDS = toString cfg.logsMaxAgeSeconds;
         # Only what this node has: backups opted out, or logs off, are not
         # checked at all.
         CHECK_BACKUPS = if config.stackbase.backups.enable or false then "1" else "0";
@@ -432,8 +417,6 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${freshness}/bin/stackbase-freshness";
-        StateDirectory = "stackbase-freshness";
-        StateDirectoryMode = "0700";
       };
     };
 

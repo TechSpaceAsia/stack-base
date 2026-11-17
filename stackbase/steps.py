@@ -28,7 +28,7 @@ from typing import Callable
 from stackbase.alerts import ALERT_REMOTES_UNIT, alert_env_content, alert_env_digest
 from stackbase.backups import backup_env_content, backup_env_digest
 from stackbase.files import files_env_digest, storage_env_block, storage_env_lines
-from stackbase.logs import LOGS_UNIT, logs_env_content, logs_env_digest
+from stackbase.logs import logs_env_content, logs_env_digest
 from stackbase.config import save_state
 from stackbase.mesh import (
     CONNECT_CMD,
@@ -915,23 +915,22 @@ def _ensure_backup_env(ctx: Context, step: Step) -> str:
 
 
 # --------------------------------------------------------------------------
-# Log shipping credentials: push logs.env, root-only, restart Vector
+# Log shipping credentials: push logs.env, root-only (the next timer run reads it)
 # --------------------------------------------------------------------------
 
 
 def _ensure_logs_env(ctx: Context, step: Step) -> str:
-    """Push Vector's R2 credentials to /var/lib/stackbase/logs.env, 0600 root:root.
+    """Push the log shipper's R2 credentials to /var/lib/stackbase/logs.env, 0600 root:root.
 
     The same stdin-only, owner-and-mode-first model as `_ensure_backup_env`.
-    root:root is enough even though Vector itself runs as `vector`: systemd
-    reads an `EnvironmentFile` as PID 1, before dropping privileges, so the
-    service user never needs to open the file -- and this step runs before a
-    node's first rebuild, when no `vector` user exists yet to own anything.
+    root:root is enough even though the shipper runs as `stackbase-logs`:
+    systemd reads an `EnvironmentFile` as PID 1, before dropping privileges,
+    so the service user never needs to open the file -- and this step runs
+    before a node's first rebuild, when no such user exists yet.
 
-    A running Vector is restarted so it picks up rotated keys; one that is
-    not running yet (the first push, before the rebuild that installs it)
-    is left alone -- the rebuild starts it with this file already in place.
-    Events waiting in its disk buffer survive the restart.
+    Nothing is restarted: the shipper is a timer-driven oneshot, and its
+    next run reads the new file. Planned before the rebuild all the same, so
+    the first run after the rebuild that installs the timer finds it.
     """
     node = _node(step)
     content = logs_env_content(ctx.secrets)
@@ -948,12 +947,9 @@ def _ensure_logs_env(ctx: Context, step: Step) -> str:
     ssh.run(f"set -eu; install -m 0600 -o root -g root /dev/null {tmp_path}")
     ssh.run(f"set -eu; cat > {tmp_path}", input=content)
     ssh.run(f"set -eu; mv -f {tmp_path} {final_path}")
-    ssh.run(
-        f"set -eu; if systemctl is-active --quiet {LOGS_UNIT}; then systemctl restart {LOGS_UNIT}; fi"
-    )
 
-    # After the restart: a node whose Vector could not come back up with the
-    # new file replans the step next run instead of being called converged.
+    # Only once the file is in place: a failed push replans the step next
+    # run instead of being called converged.
     ctx.node_state(node).logs_env_sha = logs_env_digest(content)
     return f"node {node}: log shipping credentials updated"
 

@@ -388,7 +388,7 @@ def _up(args: argparse.Namespace, infra_dir: Path, secrets: dict[str, str], env_
         secrets_name=env_secrets.name,
         env=None if env.implicit else env.name,
     )
-    # Logs on with no credentials would fail the rebuild that starts Vector,
+    # Logs on with no credentials would fail the rebuild that turns on the log shipper,
     # so it is refused here, before anything is touched.
     check_logs_credentials(env, local.logs_env_sha)
     # Same for alerts: nullmailer cannot start without alert.env.
