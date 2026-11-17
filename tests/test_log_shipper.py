@@ -81,15 +81,18 @@ for arg in sys.argv[1:]:
         units.append(arg.split("=", 1)[1])
 if units:
     import fnmatch
-    entries = [
-        e for e in entries
+    names = {e.get("_SYSTEMD_UNIT", "") for e in entries}
+    # Like real journalctl: globs expand against unit names present in the
+    # journal; a filter that ends up empty is an error.
+    live = [u for u in units if not any(c in u for c in "*?[") or any(fnmatch.fnmatchcase(n, u) for n in names)]
+    if not live:
+        sys.stderr.write("Failed to add filter for units: No data available\\n")
+        sys.exit(1)
+    # Seek by position in the unfiltered journal, then filter.
+    entries = entries[:start] + [
+        e for e in entries[start:]
         if any(fnmatch.fnmatchcase(e.get("_SYSTEMD_UNIT", ""), u) for u in units)
     ]
-    start = 0
-    for arg in sys.argv[1:]:
-        if arg.startswith("--cursor="):
-            idx = [i for i, e in enumerate(entries) if e["__CURSOR"] == arg.split("=", 1)[1]]
-            start = idx[0] if idx else 0
 for e in entries[start:]:
     if keep is not None:
         e = {k: v for k, v in e.items() if k in keep or k.startswith("__") or k == "_BOOT_ID"}
@@ -412,10 +415,34 @@ class RunTests(ShipperTestCase):
         units = ("claude-boost-video.service", "claude-boost-scrape*")
         self.run_quiet(self.cfg(include_units=units))
         argv = self.calls("journalctl")[0]
-        self.assertEqual([a for a in argv if a.startswith("--unit=")], [f"--unit={u}" for u in units])
+        self.assertEqual([a for a in argv if a.startswith("--unit=")], [f"--unit={u}" for u in units] + ["--unit=stackbase-logs.service"])
         lines = self.object_lines(self.objects()[0])
         self.assertEqual(lines, [self.mod.slim(entries[0]), self.mod.slim(entries[2])])
         self.assertEqual(self.cursor(), entries[2]["__CURSOR"])
+
+    def test_glob_only_filter_with_no_matching_unit_exits_0(self) -> None:
+        self.write_journal([_entry(0, _T0, _SYSTEMD_UNIT="other.service")])
+        n, _ = self.run_quiet(self.cfg(include_units=("zzz-nonexistent-*",)))
+        self.assertEqual(n, 0)
+        self.assertIn("--unit=stackbase-logs.service", self.calls("journalctl")[0])
+        self.assertEqual(self.objects(), [])
+
+    def test_changing_the_filter_is_not_a_gap(self) -> None:
+        entries = [
+            _entry(0, _T0, _SYSTEMD_UNIT="other.service"),
+            _entry(1, _T0 + 1, _SYSTEMD_UNIT="a.service"),
+        ]
+        self.write_journal(entries[:1])
+        self.run_quiet(self.cfg())
+        self.write_journal(entries)
+        n, err = self.run_quiet(self.cfg(include_units=("a.service",)))
+        self.assertEqual(n, 1)
+        self.assertIn("unit filter changed", err)
+        self.assertEqual(self.cursor(), entries[1]["__CURSOR"])
+        # Unchanged filter, rotated cursor: still a gap.
+        self.write_journal([_entry(5, _T0 + 5, _SYSTEMD_UNIT="a.service")])
+        (self.state / "cursor").write_text("s=rotated;i=ffff\\n")
+        self.run_gap(self.cfg(include_units=("a.service",)))
 
     def test_no_include_units_reads_whole_journal(self) -> None:
         self.write_journal([_entry(0, _T0)])

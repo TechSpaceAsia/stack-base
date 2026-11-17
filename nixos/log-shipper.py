@@ -234,8 +234,28 @@ def _read_cursor(cfg: Config) -> str | None:
     return c or None
 
 
+def _filter_key(cfg: Config) -> str:
+    return "\n".join(cfg.include_units)
+
+
+def _read_filter(cfg: Config) -> str:
+    """The unit filter the saved cursor was shipped under.
+
+    An absent file means the whole journal (what every cursor saved before
+    includeUnits existed was), so an empty filter on an old state is not a
+    change.
+    """
+    try:
+        return (cfg.state / "cursor-units").read_text(encoding="utf-8").rstrip("\n")
+    except FileNotFoundError:
+        return ""
+
+
 def _save_cursor(cfg: Config, cursor: str) -> None:
+    # Cursor first: a crash between the two files leaves the old filter on a
+    # new cursor, which only makes the next run treat a mismatch leniently.
     _write_atomic(cfg.state / "cursor", cursor + "\n")
+    _write_atomic(cfg.state / "cursor-units", _filter_key(cfg) + "\n")
 
 
 def _pending_dir(cfg: Config) -> Path:
@@ -380,7 +400,13 @@ def _journal(cfg: Config, cursor: str | None, gaps: list[str]) -> Iterator[dict]
     handled by the caller.
     """
     argv = ["journalctl", "--output=json", f"--output-fields={_OUTPUT_FIELDS}", "--no-pager", "--all"]
-    argv.extend(f"--unit={u}" for u in cfg.include_units)
+    if cfg.include_units:
+        argv.extend(f"--unit={u}" for u in cfg.include_units)
+        # journalctl refuses a filter whose globs match no unit in the
+        # journal ("No data available"); an exact name always counts. Our
+        # own unit's entries are dropped (and skipped over) anyway.
+        argv.append(f"--unit={cfg.exclude_unit}")
+    filter_changed = bool(cursor) and _read_filter(cfg) != _filter_key(cfg)
     if cursor:
         argv.append(f"--cursor={cursor}")
     with tempfile.TemporaryFile() as err:
@@ -404,7 +430,12 @@ def _journal(cfg: Config, cursor: str | None, gaps: list[str]) -> Iterator[dict]
                     first = _value(entry.get("__CURSOR"))
                     if first == cursor:
                         continue
-                    _gap_warning(gaps, cursor, first)
+                    if filter_changed:
+                        # The cursor's entry is not in the new filter, so
+                        # journalctl started at the next matching entry.
+                        _log(f"unit filter changed; resuming at the first matching entry {first}")
+                    else:
+                        _gap_warning(gaps, cursor, first)
                 yield entry
             finished = True
         finally:
