@@ -251,10 +251,15 @@ def _read_filter(cfg: Config) -> str:
         return ""
 
 
-def _save_cursor(cfg: Config, cursor: str) -> None:
+def _save_cursor(cfg: Config, cursor: str, keep_filter: bool = False) -> None:
     # Cursor first: a crash between the two files leaves the old filter on a
     # new cursor, which only makes the next run treat a mismatch leniently.
+    # keep_filter: the cursor comes from a spool read under the filter that
+    # was current when it was written, not this run's, so cursor-units must
+    # keep saying so until a cursor read under the current filter is saved.
     _write_atomic(cfg.state / "cursor", cursor + "\n")
+    if keep_filter:
+        return
     _write_atomic(cfg.state / "cursor-units", _filter_key(cfg) + "\n")
 
 
@@ -349,7 +354,7 @@ def _ship_pending(cfg: Config) -> int:
         # Cursor first: a crash before the unlink re-uploads the same key
         # (idempotent) rather than shipping the entries again under a new one.
         if cursor:
-            _save_cursor(cfg, cursor)
+            _save_cursor(cfg, cursor, keep_filter=True)
         p.unlink()
         _fsync_dir(pdir)
         shipped += 1

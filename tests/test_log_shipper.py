@@ -444,6 +444,28 @@ class RunTests(ShipperTestCase):
         (self.state / "cursor").write_text("s=rotated;i=ffff\\n")
         self.run_gap(self.cfg(include_units=("a.service",)))
 
+    def test_pending_spool_then_filter_change_is_not_a_gap(self) -> None:
+        entries = [
+            _entry(0, _T0, _SYSTEMD_UNIT="other.service"),
+            _entry(1, _T0 + 1, _SYSTEMD_UNIT="other.service"),
+            _entry(2, _T0 + 2, _SYSTEMD_UNIT="a.service"),
+        ]
+        self.write_journal(entries[:1])
+        self.run_quiet(self.cfg())
+        self.write_journal(entries[:2])
+        os.environ["FAKE_UPLOAD_FAIL"] = "1"
+        with self.assertRaises(Exception):
+            self.run_quiet(self.cfg())
+        del os.environ["FAKE_UPLOAD_FAIL"]
+        self.assertEqual(len(self.pending()), 1)
+        self.write_journal(entries)
+        n, err = self.run_quiet(self.cfg(include_units=("a.service",)))
+        self.assertEqual(n, 2)
+        self.assertEqual(self.pending(), [])
+        self.assertIn("unit filter changed", err)
+        self.assertEqual(self.cursor(), entries[2]["__CURSOR"])
+        self.assertEqual((self.state / "cursor-units").read_text().strip(), "a.service")
+
     def test_no_include_units_reads_whole_journal(self) -> None:
         self.write_journal([_entry(0, _T0)])
         self.run_quiet(self.cfg())
@@ -566,9 +588,9 @@ class RunTests(ShipperTestCase):
         seen = []
         real = self.mod._save_cursor
 
-        def spy(cfg, cursor):
+        def spy(cfg, cursor, **kw):
             seen.append((cursor, self.pending()))
-            real(cfg, cursor)
+            real(cfg, cursor, **kw)
 
         self.mod._save_cursor = spy
         first = [_entry(0, _T0)]
